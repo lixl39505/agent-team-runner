@@ -1,0 +1,32 @@
+{
+  "name": "agent-team-runner",
+  "version": "0.1.0",
+  "description": "Reusable local orchestrator for Lead/Worker/Reviewer/Integrator coding agents with Git worktrees and SQLite.",
+  "type": "module",
+  "bin": {
+    "agent-team": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "skills",
+    "templates",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "check": "npm run build && npm test"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.0"
+  },
+  "license": "MIT"
+}
