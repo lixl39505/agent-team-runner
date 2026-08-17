@@ -3,17 +3,38 @@ import { appendFileSync, mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
-import { initConfig, loadConfig } from './core/config.js';
+import { applyOverrides, initConfig, loadConfig } from './core/config.js';
+import type { ConfigOverride } from './core/config.js';
 import { StateDatabase } from './core/db.js';
 import { ensureGitignore, syncSkills } from './core/files.js';
 import { planRun } from './core/planner.js';
 import { runOrchestrator } from './core/orchestrator.js';
 import { formatRunStatus } from './core/status.js';
 import { execFile, ensureGitRepo } from './core/git.js';
-import type { AdapterName } from './core/types.js';
+import { snapshotRoles, validateProfiles } from './core/profiles.js';
+import { checkProfileAvailability } from './core/preflight.js';
+import type { AdapterName, ResolvedProfile, RunnerConfig } from './core/types.js';
 
 const argv = process.argv.slice(2);
 const command = argv.shift();
+
+const rawConfigOverrides: string[] = [];
+while (true) {
+  const index = argv.indexOf('-c');
+  if (index < 0) break;
+  const value = argv[index + 1];
+  if (!value || value.startsWith('--')) throw new Error('-c requires a value like roles.lead=codex.terra');
+  argv.splice(index, 2);
+  rawConfigOverrides.push(value);
+}
+
+function configOverrides(): ConfigOverride[] {
+  return rawConfigOverrides.map((entry) => {
+    const eq = entry.indexOf('=');
+    if (eq <= 0) throw new Error(`Invalid -c override "${entry}": expected <path>=<value>`);
+    return { key: entry.slice(0, eq), value: entry.slice(eq + 1) };
+  });
+}
 
 function option(name: string): string | undefined {
   const index = argv.indexOf(name);
@@ -35,10 +56,22 @@ function repoOption(): string {
   return resolve(option('--repo') ?? process.cwd());
 }
 
-function database(repoRoot: string): { config: ReturnType<typeof loadConfig>; db: StateDatabase } {
-  const config = loadConfig(repoRoot);
+function database(repoRoot: string): { config: RunnerConfig; db: StateDatabase } {
+  const config = applyOverrides(loadConfig(repoRoot), configOverrides());
   mkdirSync(config.stateDir, { recursive: true });
   return { config, db: new StateDatabase(join(config.stateDir, 'state.sqlite')) };
+}
+
+async function preflight(config: RunnerConfig, profiles: ResolvedProfile[], validateSyntax: boolean): Promise<void> {
+  if (validateSyntax) {
+    const syntax = validateProfiles(config);
+    if (!syntax.ok) throw new Error(`Invalid agent profile config:\n  - ${syntax.errors.join('\n  - ')}`);
+  }
+  const availability = await checkProfileAvailability(config, profiles);
+  for (const warning of availability.warnings) console.error(`warning: ${warning}`);
+  if (!availability.ok) {
+    throw new Error(`Agent profile preflight failed:\n  - ${availability.errors.join('\n  - ')}`);
+  }
 }
 
 async function main(): Promise<void> {
@@ -79,6 +112,15 @@ async function main(): Promise<void> {
         const result = await execFile(adapter.command, ['--version'], config.repoRoot).catch((error) => ({ code: 127, stdout: '', stderr: String(error) }));
         console.log(`${name}: ${result.code === 0 ? result.stdout.trim() || 'available' : `unavailable (${result.stderr.trim()})`}`);
       }
+      const roles = snapshotRoles(config);
+      const syntax = validateProfiles(config);
+      const availability = await checkProfileAvailability(config, Object.values(roles));
+      console.log('Roles:');
+      for (const [role, profile] of Object.entries(roles)) {
+        console.log(`  ${role}: ${profile.cli}${profile.model ? ` (${profile.model})` : ''} [${profile.source}]`);
+      }
+      for (const error of [...syntax.errors, ...availability.errors]) console.log(`  error: ${error}`);
+      for (const warning of availability.warnings) console.log(`  warn: ${warning}`);
     } finally {
       db.close();
     }
@@ -87,12 +129,14 @@ async function main(): Promise<void> {
 
   if (command === 'plan' || command === 'launch') {
     const goalFile = argv.shift();
-    if (!goalFile) throw new Error(`Usage: agent-team ${command} <goal-file> [--run-id ID] [--adapter claude|codex|opencode] [--repo PATH]`);
+    if (!goalFile) throw new Error(`Usage: agent-team ${command} <goal-file> [--run-id ID] [--adapter claude|codex|opencode] [-c path=value] [--repo PATH]`);
     const runId = option('--run-id');
     const adapter = option('--adapter') as AdapterName | undefined;
     const repoRoot = repoOption();
     const { config, db } = database(repoRoot);
+    if (adapter) config.defaultAdapter = adapter;
     try {
+      await preflight(config, Object.values(snapshotRoles(config)), true);
       const id = await planRun({ config, db, goalFile, ...(runId ? { runId } : {}), ...(adapter ? { adapter } : {}) });
       console.log(`Planned run: ${id}`);
       console.log(formatRunStatus(db.getRun(id), db.listTasks(id)));
@@ -110,11 +154,12 @@ async function main(): Promise<void> {
     const foreground = flag('--foreground');
     const repoRoot = repoOption();
     if (detach && !foreground) {
-      const config = loadConfig(repoRoot);
+      const config = applyOverrides(loadConfig(repoRoot), configOverrides());
       const logPath = join(config.stateDir, 'runs', runId, 'runner.log');
       mkdirSync(join(config.stateDir, 'runs', runId), { recursive: true });
       const cliPath = fileURLToPath(import.meta.url);
-      const child = spawn(process.execPath, [cliPath, 'run', runId, '--foreground', '--repo', repoRoot], {
+      const forwarded = rawConfigOverrides.flatMap((entry) => ['-c', entry]);
+      const child = spawn(process.execPath, [cliPath, 'run', runId, '--foreground', '--repo', repoRoot, ...forwarded], {
         detached: true,
         stdio: ['ignore', 'ignore', 'ignore'],
         env: process.env
@@ -127,6 +172,33 @@ async function main(): Promise<void> {
     }
     const { config, db } = database(repoRoot);
     try {
+      // -c roles.* 视为对当前 run 的人为强制修改：只更新被覆写的角色，其余保留原快照
+      const roleOverrides = configOverrides().filter(({ key }) => key === 'roles' || key.startsWith('roles.'));
+      if (roleOverrides.length > 0) {
+        const record = db.getRun(runId);
+        const base: Record<string, ResolvedProfile> = record.rolesJson
+          ? (JSON.parse(record.rolesJson) as Record<string, ResolvedProfile>)
+          : snapshotRoles(config);
+        const fresh: Record<string, ResolvedProfile> = snapshotRoles(config);
+        for (const { key } of roleOverrides) {
+          const role = key.split('.')[1];
+          if (role && role in fresh) base[role] = fresh[role]!;
+        }
+        db.updateRun(runId, { rolesJson: JSON.stringify(base) });
+      }
+      const run = db.getRun(runId);
+      const profiles: ResolvedProfile[] = run.rolesJson
+        ? Object.values(JSON.parse(run.rolesJson) as Record<string, ResolvedProfile>)
+        : Object.values(snapshotRoles(config));
+      if (run.manifestJson) {
+        const manifest = JSON.parse(run.manifestJson) as { tasks: { adapter?: AdapterName }[] };
+        for (const task of manifest.tasks) {
+          if (task.adapter && !profiles.some((profile) => profile.cli === task.adapter)) {
+            profiles.push({ cli: task.adapter, model: config.adapters[task.adapter].model, source: `task:${task.adapter}` });
+          }
+        }
+      }
+      await preflight(config, profiles, false);
       await runOrchestrator({ config, db, runId });
       console.log(formatRunStatus(db.getRun(runId), db.listTasks(runId)));
     } finally {
@@ -210,6 +282,9 @@ Options:
   --repo PATH
   --run-id ID
   --adapter claude|codex|opencode
+  -c <path>=<value>              Override any config key (repeatable), e.g.
+                                     -c roles.lead=codex.terra -c concurrency=5
+                                 Priority: -c flags > config.yml > defaults
 `);
 }
 

@@ -3,6 +3,7 @@ import { basename, join, resolve } from 'node:path';
 import type { AdapterName, LeadResult, RunnerConfig } from './types.js';
 import { StateDatabase } from './db.js';
 import { createAdapter } from '../adapters/index.js';
+import { resolveRole, snapshotRoles } from './profiles.js';
 import { LEAD_SCHEMA, validateLeadResult } from './validation.js';
 import { ensureGitRepo, revParse } from './git.js';
 import { leadPrompt } from './prompts.js';
@@ -40,7 +41,8 @@ export async function planRun(input: {
   });
 
   try {
-    const adapter = createAdapter(adapterName, input.config);
+    const leadProfile = resolveRole('lead', input.config);
+    const adapter = createAdapter(leadProfile.cli, input.config, leadProfile.model);
     let manifest: LeadResult | null = null;
     let priorError = '';
     for (let attempt = 1; attempt <= input.config.maxPlanAttempts; attempt += 1) {
@@ -84,7 +86,11 @@ Return a corrected full manifest.` : '');
       input.db.insertTask(runId, task);
       writeTaskMarkdown(join(runDir, 'tasks', `${task.id}.md`), task, baseSha);
     }
-    input.db.updateRun(runId, { status: 'planned', manifestJson: JSON.stringify(manifest) });
+    input.db.updateRun(runId, {
+      status: 'planned',
+      manifestJson: JSON.stringify(manifest),
+      rolesJson: JSON.stringify(snapshotRoles(input.config))
+    });
     input.db.addEvent(runId, null, 'PLAN_COMPLETED', { taskCount: manifest.tasks.length });
     return runId;
   } catch (error) {

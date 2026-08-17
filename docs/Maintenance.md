@@ -15,7 +15,11 @@ src/
     codex.ts              Codex CLI adapter
     opencode.ts           OpenCode CLI adapter
   core/
-    config.ts             配置初始化、加载、默认值合并
+    config.ts             配置初始化、加载（YAML/JSON）、默认值合并、-c 覆写
+    profiles.ts           Agent Profile 解析（cli.model）、角色回退、快照
+    codex-config.ts       codex config.toml 子集解析 + model 静态校验
+    claude-config.ts      claude settings.json 解析 + model 静态校验
+    preflight.ts          启动前预检：CLI 可用性 + 各 CLI 的 model 校验
     db.ts                 SQLite 状态数据库（runs / tasks / events 三表）
     types.ts              所有类型定义
     prompts.ts            角色 Prompt 模板（lead/worker/reviewer/integration）
@@ -78,8 +82,8 @@ agent-team launch goal.md
    → git rev-parse --show-toplevel 确认是合法仓库
 
 2. initConfig(repoRoot)
-   → 如果 .agent-team/config.json 不存在，写入 DEFAULT_CONFIG
-   → config.ts:5-47 定义了全部默认值
+   → 如果 .agent-team/config.yml 不存在，写入带注释的 YAML 模板
+   → config.ts 的 DEFAULT_CONFIG 定义了全部默认值
 
 3. ensureGitignore(repoRoot)
    → 追加到 .gitignore:
@@ -171,7 +175,11 @@ for (const task of manifest.tasks) {
   input.db.insertTask(runId, task);
   writeTaskMarkdown(join(runDir, 'tasks', `${task.id}.md`), task, baseSha);
 }
-input.db.updateRun(runId, { status: 'planned', manifestJson: JSON.stringify(manifest) });
+input.db.updateRun(runId, {
+  status: 'planned',
+  manifestJson: JSON.stringify(manifest),
+  rolesJson: JSON.stringify(snapshotRoles(input.config))   // 固化角色快照
+});
 ```
 
 `writeTaskMarkdown` (`files.ts:47-104`) 生成人类可读的任务说明，包含任务元数据、目标、变更范围、验证命令、完成标准。
@@ -535,6 +543,73 @@ db.updateRun(runId, {
 writeFileSync(join(runDir, 'summary.txt'), `...`, 'utf8');
 ```
 
+## Agent Profile 与角色解析
+
+### Profile 格式
+
+`<cli>.<model>` 字符串，按**第一个** `.` 切分（`profiles.ts:parseProfile`）：
+
+```
+codex.gpt-5.6-terra          → cli=codex, model=gpt-5.6-terra
+opencode.deepseek/v4-flash   → cli=opencode, model=deepseek/v4-flash
+opencode.glm52               → 查 models.glm52 别名 → z-ai/glm-5.2
+```
+
+- model 段先查 `config.models` 别名表，未命中按字面量传给 CLI 的 `--model`。
+- cli 段必须是 `claude | codex | opencode` 之一，否则抛错。
+
+### 角色解析回退链（`profiles.ts:resolveRole`）
+
+```
+config.roles.<role> 存在 → parseProfile 解析
+否则                     → defaultAdapter + adapters[defaultAdapter].model（与旧配置兼容）
+```
+
+### plan 快照（`profiles.ts:snapshotRoles` / `resolveRoleWithSnapshot`）
+
+- `planRun` 成功后把全量四角色解析结果写入 `runs.roles_json`（`planner.ts:88-92`）。
+- `run` 阶段 `resolveRoleWithSnapshot` 优先读快照，配置文件后续变化不影响已规划的 run。
+- `agent-team run <id> -c roles.worker=...` 是人为强制修改：只更新被覆写的角色，其余保留快照（`cli.ts` run 分支）。
+
+### 优先级总览
+
+```
+Worker CLI 选择:  task.adapter（Lead manifest） > worker 角色 profile > defaultAdapter
+Lead/Reviewer/Integrator: 角色 profile > defaultAdapter
+model 传递:       角色 profile 的 model > adapters.<cli>.model
+配置值优先级:     -c 命令行 > config.yml > config.yaml > config.json > 内置默认
+```
+
+### 配置加载（`config.ts`）
+
+- 文件优先级：`.agent-team/config.yml` > `config.yaml` > `config.json`（首个存在者）。
+- YAML 用 `yaml` npm 包解析；JSON 走 `JSON.parse`。
+- `applyOverrides(config, entries)` 处理 `-c path=value`：按 `.` 逐层写入，值先尝试 `JSON.parse`（数字/布尔/JSON 结构），失败按字符串。
+- `initConfig` 生成带注释的 `config.yml` 模板（含 roles/models 示例）。
+
+### 预检（`preflight.ts:checkProfileAvailability`）
+
+`plan`/`launch`/`run` 启动前执行，`doctor` 展示结果：
+
+| 检查项 | 结果 |
+|--------|------|
+| profile 语法 / cli 名称（`validateProfiles`） | error，阻止启动 |
+| CLI 可用性（`<command> --version`，10s 超时） | error，阻止启动 |
+| opencode model 在 `opencode models` 列表中（30s 超时） | error，阻止启动 |
+| codex `provider/model`：provider 未在 `[model_providers.<id>]` 声明（config 缺失时同理） | error，阻止启动 |
+| codex provider 的 `env_key` 环境变量缺失 | error，阻止启动 |
+| codex 裸 model 名：与顶层/profile model 一致，或默认 provider 下的 OpenAI 命名（gpt、o、codex 前缀） | ok |
+| codex 其余裸 model 名（无清单可枚举） | warning |
+| claude model：与 settings 的 `model`/`env.ANTHROPIC_MODEL` 一致，或 `claude-*` 默认族命名 | ok |
+| claude 配置了 `ANTHROPIC_BASE_URL` 网关时的其他 model | warning |
+| claude 既非默认族命名、无网关、也未声明 | error，阻止启动 |
+
+codex 校验由 `codex-config.ts` 实现：解析 `$CODEX_HOME/config.toml`（默认 `~/.codex/config.toml`）的 section 头和 `key = "string"` 赋值子集（其余 TOML 语法安全跳过），提取 `model_providers.*`（含 env_key）、顶层 `model`/`model_provider`、`profiles.*.model`，`validateCodexModel` 为纯函数（env 可注入，便于测试）。
+
+claude 校验由 `claude-config.ts` 实现：读取 `$CLAUDE_CONFIG_DIR/settings.json`（默认 `~/.claude/settings.json`）的顶层 `model` 和 `env.ANTHROPIC_MODEL`/`env.ANTHROPIC_BASE_URL`（settings 缺失或解析失败按 null 处理，环境变量兜底），`validateClaudeModel` 同为纯函数。
+
+`run` 命令的预检基于 runs 表快照 + manifest 中出现的 task.adapter，而非当前配置文件。
+
 ## Adapter 层详解
 
 ### 接口定义
@@ -581,15 +656,27 @@ interface AgentRunResult<T> {
 `adapters/index.ts`：
 
 ```typescript
-export function createAdapter(name: AdapterName, config: RunnerConfig): AgentAdapter {
-  if (name === 'claude') return new ClaudeAdapter(config.adapters.claude, config.verification.allowedCommandPrefixes);
-  if (name === 'codex') return new CodexAdapter(config.adapters.codex);
-  return new OpenCodeAdapter(config.adapters.opencode);
+export function createAdapter(name: AdapterName, config: RunnerConfig, modelOverride?: string): AgentAdapter {
+  const base = config.adapters[name];
+  const adapterConfig = modelOverride ? { ...base, model: modelOverride } : base;
+  if (name === 'claude') return new ClaudeAdapter(adapterConfig, config.verification.allowedCommandPrefixes);
+  if (name === 'codex') return new CodexAdapter(adapterConfig);
+  return new OpenCodeAdapter(adapterConfig);
 }
 ```
 
+- `modelOverride` 来自角色 profile 解析结果，存在时覆盖该 CLI 基础配置中的 model
 - Claude adapter 额外接收 `allowedCommandPrefixes`，因为 Claude Code 的 `--allowedTools` 支持精细化的 Bash 命令前缀预批准
 - Codex 和 OpenCode 用更粗粒度的 sandbox 控制
+
+### 三处调用点的角色解析
+
+| 调用点 | 角色 | 解析方式 |
+|--------|------|---------|
+| `planner.ts:44-45` | lead | `resolveRole('lead', config)` |
+| `orchestrator.ts` executeTask | worker | `task.adapter` 优先；否则 `resolveRoleWithSnapshot('worker', ...)` |
+| `orchestrator.ts` executeTask | reviewer | `resolveRoleWithSnapshot('reviewer', ...)` — 独立实例，不复用 Worker 的 adapter |
+| `orchestrator.ts` integrateRun | integrator | `resolveRoleWithSnapshot('integrator', ...)` |
 
 ### Claude Code Adapter
 
@@ -798,6 +885,7 @@ CREATE TABLE runs (
   adapter TEXT NOT NULL,
   status TEXT NOT NULL,
   manifest_json TEXT,
+  roles_json TEXT,
   integration_branch TEXT,
   integration_worktree TEXT,
   integration_commit TEXT,
@@ -851,12 +939,14 @@ CREATE TABLE events (
 
 数据库以 WAL 模式运行 + `busy_timeout = 5000` + `foreign_keys = ON`。
 
+Schema 迁移（`db.ts:addColumnIfMissing`）：构造时用 `PRAGMA table_info` 检查列是否存在，缺失则 `ALTER TABLE ADD COLUMN` 幂等补齐（当前用于 runs.roles_json）。
+
 ## 文件系统布局
 
 ```
 <project>/
   .agent-team/
-    config.json
+    config.yml
     state.sqlite
     state.sqlite-wal
     state.sqlite-shm

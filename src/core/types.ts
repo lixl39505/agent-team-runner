@@ -27,6 +27,14 @@ export interface AdapterConfig {
   model?: string;
 }
 
+/** Agent profile 字符串 "cli.model" 解析结果，如 "codex.terra" → { cli: 'codex', model: 'gpt-5.6-terra' } */
+export interface ResolvedProfile {
+  cli: AdapterName;
+  model?: string | undefined;
+  /** 原始 profile 字符串或回退来源描述 */
+  source: string;
+}
+
 export interface RunnerConfig {
   version: 1;
   repoRoot: string;
@@ -42,6 +50,10 @@ export interface RunnerConfig {
   maxWorkerAttempts: number;
   maxReviewCycles: number;
   branchPrefix: string;
+  /** model 别名表：短名 → 真实 model id（如 terra → gpt-5.6-terra） */
+  models?: Record<string, string>;
+  /** 角色 → Agent profile（"cli.model" 字符串），缺省回退 defaultAdapter */
+  roles?: Partial<Record<AgentRole, string>>;
   verification: {
     allowedCommandPrefixes: string[];
     globalCommands: string[];
@@ -118,6 +130,8 @@ export interface RunRecord {
   adapter: AdapterName;
   status: RunStatus;
   manifestJson: string | null;
+  /** plan 时固化的角色 → profile 快照，保证后续 run 不受配置文件变化影响 */
+  rolesJson: string | null;
   integrationBranch: string | null;
   integrationWorktree: string | null;
   integrationCommit: string | null;

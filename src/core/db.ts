@@ -24,6 +24,7 @@ function mapRun(row: Record<string, unknown>): RunRecord {
     adapter: String(row.adapter) as AdapterName,
     status: String(row.status) as RunStatus,
     manifestJson: row.manifest_json === null ? null : String(row.manifest_json),
+    rolesJson: row.roles_json === null || row.roles_json === undefined ? null : String(row.roles_json),
     integrationBranch: row.integration_branch === null ? null : String(row.integration_branch),
     integrationWorktree: row.integration_worktree === null ? null : String(row.integration_worktree),
     integrationCommit: row.integration_commit === null ? null : String(row.integration_commit),
@@ -84,6 +85,7 @@ export class StateDatabase {
         adapter TEXT NOT NULL,
         status TEXT NOT NULL,
         manifest_json TEXT,
+        roles_json TEXT,
         integration_branch TEXT,
         integration_worktree TEXT,
         integration_commit TEXT,
@@ -129,6 +131,14 @@ export class StateDatabase {
       CREATE INDEX IF NOT EXISTS idx_tasks_run_status ON tasks(run_id, status);
       CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, id);
     `);
+    this.addColumnIfMissing('runs', 'roles_json', 'TEXT');
+  }
+
+  private addColumnIfMissing(table: string, column: string, type: string): void {
+    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (!columns.some((entry) => entry.name === column)) {
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type};`);
+    }
   }
 
   createRun(input: {
@@ -173,6 +183,7 @@ export class StateDatabase {
   updateRun(id: string, patch: Partial<{
     status: RunStatus;
     manifestJson: string;
+    rolesJson: string;
     integrationBranch: string;
     integrationWorktree: string;
     integrationCommit: string;
@@ -184,6 +195,7 @@ export class StateDatabase {
     const columnMap: Record<string, string> = {
       status: 'status',
       manifestJson: 'manifest_json',
+      rolesJson: 'roles_json',
       integrationBranch: 'integration_branch',
       integrationWorktree: 'integration_worktree',
       integrationCommit: 'integration_commit',

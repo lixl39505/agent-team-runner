@@ -22,7 +22,9 @@
   "engines": {
     "node": ">=22.13"
   },
-  "dependencies": {},
+  "dependencies": {
+    "yaml": "^2.9.0"
+  },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "tsx": "^4.20.0",

@@ -12,6 +12,7 @@ import type {
 } from './types.js';
 import { StateDatabase } from './db.js';
 import { createAdapter } from '../adapters/index.js';
+import { resolveRoleWithSnapshot } from './profiles.js';
 import {
   INTEGRATION_SCHEMA,
   REVIEW_SCHEMA,
@@ -131,13 +132,19 @@ async function executeTask(input: {
   const task = taskSpec(record);
   const run = db.getRun(runId);
   const runDir = join(config.stateDir, 'runs', runId);
-  const adapterName: AdapterName = task.adapter ?? run.adapter;
-  const adapter = createAdapter(adapterName, config);
+  // Worker：Lead manifest 的 task.adapter 优先，否则用 plan 时固化的角色快照（回退当前 config）
+  const workerProfile = resolveRoleWithSnapshot('worker', config, run.rolesJson);
+  const adapterName: AdapterName = task.adapter ?? workerProfile.cli;
+  const adapter = createAdapter(adapterName, config, task.adapter ? undefined : workerProfile.model);
   const worktreeInfo = await ensureTaskWorktree({ config, db, runId, record, task, manifest: parseManifest(run.manifestJson) });
   record = db.getTask(runId, task.id);
   const attempts = record.attempts + 1;
   db.updateTask(runId, task.id, { status: 'running', phase: 'worker', attempts, pid: null });
-  db.addEvent(runId, task.id, 'WORKER_STARTED', { attempts, adapter: adapterName });
+  db.addEvent(runId, task.id, 'WORKER_STARTED', {
+    attempts,
+    adapter: adapterName,
+    model: task.adapter ? undefined : workerProfile.model
+  });
 
   const outputPath = join(runDir, 'results', `${task.id}-worker-${attempts}.json`);
   const logPath = join(runDir, 'logs', `${task.id}-worker-${attempts}.log`);
@@ -187,7 +194,10 @@ async function executeTask(input: {
   const reviewOutput = join(runDir, 'reviews', `${task.id}-review-${reviewCycle}.json`);
   const reviewHeadBefore = await currentHead(worktreeInfo.path);
   const reviewStatusBefore = (await git(worktreeInfo.path, ['status', '--porcelain=v1', '-z'])).stdout;
-  const reviewRun = await adapter.run<ReviewResult>({
+  // Reviewer 独立解析角色 profile（plan 快照优先），不再复用 Worker 的 adapter 实例
+  const reviewerProfile = resolveRoleWithSnapshot('reviewer', config, run.rolesJson);
+  const reviewerAdapter = createAdapter(reviewerProfile.cli, config, reviewerProfile.model);
+  const reviewRun = await reviewerAdapter.run<ReviewResult>({
     role: 'reviewer', cwd: worktreeInfo.path,
     prompt: reviewerPrompt({ task, startSha: worktreeInfo.startSha, workerResult }),
     schema: REVIEW_SCHEMA,
@@ -312,7 +322,8 @@ async function integrateRun(input: {
   await createWorktree({ repoRoot: config.repoRoot, path: worktree, branch, baseSha: run.baseSha });
   db.updateRun(runId, { integrationBranch: branch, integrationWorktree: worktree });
   const runDir = join(config.stateDir, 'runs', runId);
-  const adapter = createAdapter(run.adapter, config);
+  const integratorProfile = resolveRoleWithSnapshot('integrator', config, run.rolesJson);
+  const adapter = createAdapter(integratorProfile.cli, config, integratorProfile.model);
 
   for (const task of topologicalTasks(manifest.tasks)) {
     const record = db.getTask(runId, task.id);

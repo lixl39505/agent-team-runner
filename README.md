@@ -53,6 +53,9 @@ Runner 在调用 Agent 时会直接读取打包的 Skill 内容并编译进运�
 - Worker 并发上限
 - 进程 PID、日志心跳、静默超时和硬超时
 - Worker 失败自动重试
+- 每角色独立 Agent Profile（`cli.model`），同一 CLI 可用不同 model
+- YAML 配置文件 + `-c` 命令行任意层级覆写
+- 启动前 profile 有效性预检（CLI 可用性、opencode model 列表）
 - 修改路径 allowlist / blocklist 机械校验
 - 验证命令前缀 allowlist
 - Runner 自己重跑任务验证命令
@@ -101,7 +104,7 @@ agent-team init
 会生成或更新：
 
 ```text
-.agent-team/config.json
+.agent-team/config.yml
 .agents/skills/team-*/SKILL.md
 .claude/skills/team-*/SKILL.md
 .gitignore
@@ -118,53 +121,114 @@ agent-team init
 
 ## 配置
 
-默认 `.agent-team/config.json`：
+配置文件为 `.agent-team/config.yml`（`agent-team init` 自动生成；加载顺序 `config.yml` > `config.yaml` > 旧版 `config.json`，支持注释）：
 
-```json
-{
-  "version": 1,
-  "repoRoot": ".",
-  "stateDir": ".agent-team",
-  "worktreesDir": "../.agent-team-worktrees",
-  "baseRef": "HEAD",
-  "defaultAdapter": "claude",
-  "concurrency": 3,
-  "pollIntervalMs": 2000,
-  "staleAfterMs": 600000,
-  "taskTimeoutMs": 7200000,
-  "maxPlanAttempts": 2,
-  "maxWorkerAttempts": 2,
-  "maxReviewCycles": 2,
-  "branchPrefix": "agent-team",
-  "verification": {
-    "allowedCommandPrefixes": [
-      "pnpm test",
-      "pnpm lint",
-      "pnpm typecheck",
-      "pnpm build",
-      "npm test",
-      "npm run",
-      "yarn test",
-      "yarn lint",
-      "yarn build",
-      "bun test",
-      "go test",
-      "cargo test",
-      "make test"
-    ],
-    "globalCommands": []
-  },
-  "integration": {
-    "allowedPaths": ["specs/**"],
-    "runAgentAfterCherryPick": true
-  },
-  "adapters": {
-    "claude": { "command": "claude", "extraArgs": [] },
-    "codex": { "command": "codex", "extraArgs": [] },
-    "opencode": { "command": "opencode", "extraArgs": [] }
-  }
-}
+```yaml
+version: 1
+repoRoot: .
+stateDir: .agent-team
+worktreesDir: ../.agent-team-worktrees
+baseRef: HEAD
+defaultAdapter: claude
+concurrency: 3
+pollIntervalMs: 2000
+staleAfterMs: 600000
+taskTimeoutMs: 7200000
+maxPlanAttempts: 2
+maxWorkerAttempts: 2
+maxReviewCycles: 2
+branchPrefix: agent-team
+
+# model 别名（可选）：短名 → 真实 model id
+models:
+  terra: gpt-5.6-terra
+  glm52: z-ai/glm-5.2
+
+# 角色 → profile（可选）：未配置的角色回退到 defaultAdapter
+roles:
+  lead: codex.terra
+  worker: opencode.deepseek/v4-flash
+  reviewer: opencode.glm52
+  integrator: codex.gpt-5.6-terra
+
+verification:
+  allowedCommandPrefixes:
+    - pnpm test
+    - pnpm lint
+    - pnpm typecheck
+    - pnpm build
+    - npm test
+    - npm run
+    - yarn test
+    - yarn lint
+    - yarn build
+    - bun test
+    - go test
+    - cargo test
+    - make test
+  globalCommands: []
+
+integration:
+  allowedPaths:
+    - specs/**
+  runAgentAfterCherryPick: true
+
+adapters:
+  claude:
+    command: claude
+    extraArgs: []
+  codex:
+    command: codex
+    extraArgs: []
+  opencode:
+    command: opencode
+    extraArgs: []
 ```
+
+### 角色 Profile 与 model 配置
+
+Profile 格式为 `<cli>.<model>`，按第一个 `.` 切分，model 段可以包含 `.` 和 `/`：
+
+```text
+codex.gpt-5.6-terra          codex CLI + gpt-5.6-terra
+opencode.deepseek/v4-flash   opencode CLI + DeepSeek V4 Flash
+opencode.glm52               opencode CLI + models.glm52 别名 → z-ai/glm-5.2
+```
+
+- `roles.<role>` 未配置时回退 `defaultAdapter`（CLI 用 `adapters.<cli>.command`，model 用 `adapters.<cli>.model`，与旧配置完全兼容）。
+- 同一 CLI 可通过不同 profile 使用不同 model（如 worker 和 reviewer 都用 opencode 但各跑各的 model）。
+- Runner 直接复用本地已安装的 Agent CLI 切换 model（`--model` 传参），不涉及任何模型服务连接配置。
+- Lead 生成的任务级 `adapter` 字段仍最高优先：manifest 指定了 `task.adapter` 的任务使用该 CLI 的基础配置。
+
+### plan 时快照
+
+`plan` 成功后会把解析好的全量角色配置固化到 `runs.roles_json`。之后执行 `agent-team run <runId>` 使用快照，不受配置文件后续修改影响。需要人为强制改某个 run 的角色时，用 `-c roles.*=` 覆写（只更新被覆写的角色，其余保留快照）。
+
+### 命令行覆写 `-c`
+
+`-c <path>=<value>` 可重复使用，支持任意层级路径，值先按 JSON 解析（数字/布尔/数组），失败按字符串。优先级：`-c` > 配置文件 > 内置默认值：
+
+```bash
+agent-team launch specs/goals/order-export.md \
+  -c roles.lead=codex.terra \
+  -c roles.reviewer=opencode.glm52 \
+  -c concurrency=5
+```
+
+### Profile 预检
+
+`plan` / `launch` / `run` 启动前会做预检，`doctor` 展示完整结果：
+
+- profile 语法和 cli 名称校验（如 `badcli.foo` 直接报错）
+- CLI 本地可用性（`<command> --version`）
+- opencode 的 model 通过 `opencode models` 权威列表校验，未列出 → 阻止启动
+- codex 的 model 通过 `~/.codex/config.toml`（或 `$CODEX_HOME/config.toml`）静态校验：
+  - `provider/model` 形式：provider 必须在 `[model_providers.<id>]` 中声明，且 `env_key` 对应的环境变量已设置，否则阻止启动
+  - 裸 model 名：与顶层 `model` 或 `[profiles.<name>]` 的 model 一致则放行；默认 provider 下的 OpenAI 命名（gpt、o、codex 前缀，含 config 缺失时）也放行；其余无法枚举，只输出 warning
+- claude 的 model 通过 `~/.claude/settings.json`（或 `$CLAUDE_CONFIG_DIR/settings.json`）静态校验：
+  - 与 settings 的 `model` 或 `env.ANTHROPIC_MODEL` 一致 → 放行；`claude-*` 默认模型族命名 → 放行
+  - 配置了 `ANTHROPIC_BASE_URL` 网关时，其他 model 只输出 warning（网关后无清单可查）
+  - 既非 claude 命名、无网关、也未在 settings 声明 → 阻止启动（如 `claude.glm5.2` 但没配网关）
 
 ### 验证命令安全策略
 
@@ -215,6 +279,8 @@ agent-team plan specs/goals/order-export.md \
   --run-id order-export \
   --adapter claude
 ```
+
+`--adapter` 设置全局回退 CLI；角色配置了 `roles.<role>` 时 profile 优先。
 
 输出：
 
@@ -390,6 +456,8 @@ npm test
 - blocked path 优先级
 - 验证命令安全解析
 - SQLite 状态持久化
+- Agent Profile 解析（别名、回退、快照）
+- YAML 配置加载与 `-c` 覆写
 
 ## 目录结构
 
@@ -413,7 +481,7 @@ test/
 
 - Web 控制台和 SSE 日志
 - macOS 通知、Slack 或邮件通知
-- 每任务独立模型和预算
+- 每任务独立预算（角色级 model 已支持，见 roles 配置）
 - Token / 成本统计
 - 更严格的命令策略 DSL
 - 自动生成 Pull Request，但仍要求人工合并
