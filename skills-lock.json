@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "git-commit-message": {
+      "source": ".",
+      "sourceType": "local",
+      "computedHash": "eee0ec906d8e5f37ebf0e78ca75e295bb23c69ed1cff83c1ebddabeaec416c6a"
+    }
+  }
+}
