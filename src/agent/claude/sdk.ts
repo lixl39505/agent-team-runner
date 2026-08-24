@@ -22,7 +22,10 @@ export interface ClaudeBackendOptions {
 export class ClaudeBackend implements AgentBackend {
   readonly id: BackendId = 'claude';
 
-  constructor(private readonly options: ClaudeBackendOptions = {}) {}
+  constructor(
+    private readonly options: ClaudeBackendOptions = {},
+    private readonly queryFactory: typeof query = query
+  ) {}
 
   async discover(): Promise<DiscoveryResult> {
     const command = this.options.command ?? 'claude';
@@ -58,7 +61,7 @@ export class ClaudeBackend implements AgentBackend {
 
   /** 通过 SDK 的 supportedModels() 枚举当前登录可用的 model */
   async listModels(): Promise<ModelInfo[]> {
-    const q = query({ prompt: '', options: this.baseOptions({}) });
+    const q = this.queryFactory({ prompt: '', options: this.baseOptions({}) });
     try {
       const models = await q.supportedModels();
       // 同时给出别名（value）与解析后的正式 id（resolvedModel），预检两者都算命中
@@ -78,7 +81,7 @@ export class ClaudeBackend implements AgentBackend {
   async probe(model?: string | undefined): Promise<ProbeResult> {
     const started = Date.now();
     try {
-      const q = query({
+      const q = this.queryFactory({
         prompt: 'Reply with exactly: ok',
         options: this.baseOptions({
           ...(model ? { model } : {}),
@@ -115,6 +118,7 @@ export class ClaudeBackend implements AgentBackend {
     const compiled = compileClaude(spec.policy);
     const controller = new AbortController();
     const options: Options = this.baseOptions({
+      cwd: spec.cwd,
       ...(spec.model !== undefined ? { model: spec.model } : {}),
       permissionMode: compiled.permissionMode,
       allowedTools: compiled.allowedTools,
@@ -139,7 +143,7 @@ export class ClaudeBackend implements AgentBackend {
       abortController: controller,
       ...(spec.resumeSessionId !== undefined ? { resume: spec.resumeSessionId } : {})
     });
-    const q = query({ prompt: spec.prompt, options });
+    const q = this.queryFactory({ prompt: spec.prompt, options });
     return new ClaudeAgentSession(q, controller, spec);
   }
 
