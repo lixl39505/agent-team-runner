@@ -5,7 +5,7 @@ export function formatRunStatus(run: RunRecord, tasks: TaskRecord[]): string {
     `RUN ${run.id}`,
     `Status: ${run.status}`,
     `Base: ${run.baseRef} (${run.baseSha.slice(0, 12)})`,
-    `Adapter: ${run.adapter}`,
+    `Lead backend: ${run.adapter}`,
     ''
   ];
   const width = Math.max(4, ...tasks.map((task) => task.taskId.length));

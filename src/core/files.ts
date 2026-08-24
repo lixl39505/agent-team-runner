@@ -53,7 +53,7 @@ export function writeTaskMarkdown(path: string, task: TaskSpec, baseSha: string)
 - 任务 ID: ${task.id}
 - 基础提交: ${baseSha}
 - 依赖任务: ${task.dependsOn.join(', ') || '无'}
-- Agent: ${task.adapter ?? '继承运行配置'}
+- Agent: ${task.agent ?? '继承 worker 角色配置'}
 
 ## 目标
 

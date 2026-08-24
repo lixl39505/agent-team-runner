@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 
@@ -57,8 +57,28 @@ export async function createWorktree(input: {
   }
 }
 
+// 集成 worktree 是一次性的：无论上次集成停在什么状态（脏文件/冲突/cherry-pick 中断），
+// 都强制清掉 worktree 与分支、从 baseSha 重建，保证 integrateRun 可以安全重跑。
+export async function resetWorktree(input: {
+  repoRoot: string;
+  path: string;
+  branch: string;
+  baseSha: string;
+}): Promise<void> {
+  if (existsSync(input.path)) {
+    await git(input.repoRoot, ['worktree', 'remove', '--force', input.path], true);
+    if (existsSync(input.path)) rmSync(input.path, { recursive: true, force: true });
+  }
+  await git(input.repoRoot, ['worktree', 'prune', input.path], true);
+  await git(input.repoRoot, ['branch', '-D', input.branch], true);
+  mkdirSync(dirname(input.path), { recursive: true });
+  await git(input.repoRoot, ['worktree', 'add', '-b', input.branch, input.path, input.baseSha]);
+}
+
 export async function changedFiles(worktree: string): Promise<string[]> {
-  const result = await git(worktree, ['status', '--porcelain=v1', '-z']);
+  // -uall：未跟踪目录展开为具体文件（默认会把整个未跟踪目录折叠成 "src/" 一条，
+  // 无法与任务级 allowedPaths 的文件/glob 匹配）
+  const result = await git(worktree, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
   if (!result.stdout) return [];
   const entries = result.stdout.split('\0').filter(Boolean);
   const files: string[] = [];

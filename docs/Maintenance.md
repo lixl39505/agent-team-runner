@@ -7,29 +7,41 @@
 ```
 src/
   cli.ts                  CLI 入口，命令解析与路由
-  adapters/
-    index.ts              根据 AdapterName 创建对应的 AgentAdapter 实例
-    types.ts              AgentAdapter 接口定义
-    process.ts            spawn Agent 进程，超时/静默监控，JSON 解析
-    claude.ts             Claude Code CLI adapter
-    codex.ts              Codex CLI adapter
-    opencode.ts           OpenCode CLI adapter
+  agent/                  后端层（取代旧 adapters/）
+    types.ts              AgentBackend / AgentSession / AgentEvent / SessionSpec / AgentRunOutcome
+    registry.ts           buildBackends 工厂；resolveAgent/snapshotAgents/resolveTaskAgent（取代 profiles.ts）
+    supervise.ts          runAgent 监督器：事件泵、日志、心跳、超时/静默、中断与宽限强杀
+    fake.ts               脚本化 AgentBackend（单测核心）
+    env.ts                子进程环境净化（基础变量 + 后端认证变量 allowlist）
+    parse.ts              最终 agent 消息 → JSON 的确定性解析
+    claude/
+      sdk.ts              @anthropic-ai/claude-agent-sdk 传输（query/canUseTool/outputFormat/supportedModels）
+      policy.ts           compileClaude：permissionMode 'default' + 只读 allowedTools + decide
+    codex/
+      jsonrpc.ts          stdio JSON-RPC 客户端（帧编解码纯函数可测）
+      app-server.ts       常驻 codex app-server：initialize 握手、thread/turn、审批应答、model/list
+      policy.ts           compileCodex：sandboxPolicy + approvalPolicy untrusted + decide
+      protocol/           `npm run gen:codex` 生成的协议类型（vendored）
+    opencode/
+      sdk.ts              自管 opencode serve 子进程 + @opencode-ai/sdk client：session.prompt/SSE 权限应答
+      policy.ts           compileOpenCode：服务端 ask 门禁 + 运行时 once/reject
   core/
-    config.ts             配置初始化、加载（YAML/JSON）、默认值合并、-c 覆写
-    profiles.ts           Agent Profile 解析（cli.model）、角色回退、快照
-    codex-config.ts       codex config.toml 子集解析 + model 静态校验
-    claude-config.ts      claude settings.json 解析 + model 静态校验
-    preflight.ts          启动前预检：CLI 可用性 + 各 CLI 的 model 校验
+    config.ts             配置初始化、加载（YAML/JSON）、v2 默认值合并、-c 覆写
+    agent-config.ts       v1→v2 内存迁移、agents 注册表校验、backendCommand
+    policy.ts             PolicySpec：role 权力的唯一定义处 + decideBash/decideWrite/decideTool
+    preflight.ts          闭环预检：discover + listModels + probe（probe-cache 持久缓存）
+    probe-cache.ts        probe 结果持久缓存（backend|model|version 键，TTL）
     db.ts                 SQLite 状态数据库（runs / tasks / events 三表）
     types.ts              所有类型定义
-    prompts.ts            角色 Prompt 模板（lead/worker/reviewer/integration）
+    prompts.ts            角色 Prompt 模板（lead 注入 agents 注册表、worker 厚重试上下文）
     planner.ts            规划阶段：运行 Lead Agent 生成 DAG
-    orchestrator.ts       编排器主循环与单任务执行引擎
-    git.ts                Git 操作封装（worktree / cherry-pick / commit 等）
+    orchestrator.ts       编排器主循环与单任务执行引擎（后端进程池共享）
+    git.ts                Git 操作封装（worktree / cherry-pick / commit / resetWorktree 等）
+    proctree.ts           进程组终止（stop 命令用，SIGTERM→SIGKILL 升级）
     verifier.ts           机械验证：路径策略 + 重跑验证命令
     shell.ts              命令安全解析与执行（不允许 shell 元字符）
-    path-policy.ts         文件路径 Glob 匹配与 allowlist/blocklist 检查
-    status.ts              状态面板格式化
+    path-policy.ts        文件路径 Glob 匹配与 allowlist/blocklist 检查
+    status.ts             状态面板格式化
     files.ts              文件读写、Skill 加载与同步、.gitignore 生成
 skills/
   team-lead/SKILL.md      Lead 角色行为规范
@@ -124,37 +136,38 @@ input.db.createRun({ id: runId, repoRoot, goalFile, baseRef, baseSha, adapter })
 ### 2.3 Lead Agent 调用
 
 ```typescript
-// planner.ts:56-63
-const result = await adapter.run<LeadResult>({
-  role: 'lead',
-  cwd: repoRoot,
-  prompt: leadPrompt({ goal, goalFile, repoRoot, ... }),
-  schema: LEAD_SCHEMA,
-  logPath: join(runDir, 'logs', `lead-${attempt}.log`),
-  outputPath: join(runDir, `lead-result-${attempt}.json`),
-  timeoutMs: config.taskTimeoutMs,
-  staleAfterMs: config.staleAfterMs
+// planner.ts：经 runAgent 监督器调用（见"Agent 后端层详解"）
+const result = await runAgent<LeadResult>({
+  backend: backends[leadBinding.backend],
+  spec: {
+    role: 'lead', cwd: repoRoot,
+    prompt: leadPrompt({ goal, goalFile, repoRoot, agents: 注册表清单, ... }),
+    schema: LEAD_SCHEMA, model: leadBinding.model,
+    policy: readOnlyPolicy(),        // 只读角色：只读 git 命令、禁写、禁网络
+    timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs
+  },
+  logPath, outputPath
 });
 ```
 
-- Lead 的 prompt 模板在 `prompts.ts:4-31`：`loadSkill('lead') + 运行上下文 + 目标`
-- `loadSkill` (`files.ts:29-32`) 从安装目录 `skills/team-lead/SKILL.md` 读取，**去掉 YAML frontmatter**，内容直接拼接到 prompt
-- Lead 以只读模式运行（`--permission-mode dontAsk`，仅 Read/Glob/Grep/只读 Git 工具），不允许修改仓库文件
+- Lead 的 prompt 模板在 `prompts.ts`：`loadSkill('lead') + 运行上下文 + agents 注册表 + 目标 + 验证命令策略`
+- 注册表清单是**人工筛选的能力集合**（name/backend/model/description），Lead 只能从中为任务点名 `agent` 字段
+- 结构化输出走后端原生通道（claude `outputFormat` / codex `outputSchema` / opencode `format`），不再 scrape stdout
 
 ### 2.4 DAG 校验
 
 `validation.ts:16-29` 对 Lead 输出的 JSON 做多层校验：
 
 ```
-validateLeadResult()
-  ├── version === 1
+validateLeadResult(value, validAgentNames)
+  ├── version === 1（Number 收敛——schema 侧放宽为 number，模型常输出 "1" 字符串）
   ├── title, summary 非空字符串
   ├── tasks 非空数组
   ├── 每个 task:
-  │   ├── id 匹配 /^[A-Z][A-Z0-9_-]{1,31}$/
-  │   ├── adapter 在 ['claude', 'codex', 'opencode'] 中（可选）
-  │   ├── allowedPaths/blockedPaths 是相对路径，不含 .. 或 .git
-  │   └── verificationCommands 是字符串数组
+  │   ├── id 匹配 /^[A-Z][A-Z0-9_-]{1,31}$/（pattern 同时写进 LEAD_SCHEMA，让 SDK 的 5 次结构化输出重试兜住）
+  │   ├── agent 是 agents 注册表中的名字（可选；旧 adapter 字段直接报错要求重新 plan）
+  │   ├── allowedPaths/blockedPaths 是相对路径，不含 ..
+  │   └── .git 前缀只约束 allowedPaths（blockedPaths 里的 .git/** 是防御性输出，接受）
   ├── validateTaskGraph()
   │   ├── 无重复 task id
   │   ├── 依赖目标都存在
@@ -178,11 +191,11 @@ for (const task of manifest.tasks) {
 input.db.updateRun(runId, {
   status: 'planned',
   manifestJson: JSON.stringify(manifest),
-  rolesJson: JSON.stringify(snapshotRoles(input.config))   // 固化角色快照
+  rolesJson: JSON.stringify(snapshotAgents(input.config))   // 固化 {version:2, roles, agents} 快照
 });
 ```
 
-`writeTaskMarkdown` (`files.ts:47-104`) 生成人类可读的任务说明，包含任务元数据、目标、变更范围、验证命令、完成标准。
+`writeTaskMarkdown` (`files.ts`) 生成人类可读的任务说明，包含任务元数据（含 task.agent）、目标、变更范围、验证命令、完成标准。
 
 ## 阶段 3：主循环 (`runOrchestrator`)
 
@@ -202,7 +215,7 @@ SELECT task_id FROM tasks
 WHERE run_id = ? AND status IN ('running', 'verifying', 'reviewing')
 ```
 
-> **只修改 DB，不杀进程。** 如果 Runner 崩溃时 Agent 子进程还活着（`process.ts:16` 中 `detached: process.platform !== 'win32'`），这些进程会变成孤儿进程继续在旧 Worktree 中运行。restart 前应当先执行 `agent-team stop <runId>`。
+> **只修改 DB，不杀进程。** 后端子进程（codex app-server / opencode serve）以独立进程组常驻，Runner 崩溃时不会自动退出。Runner 自身在 SIGTERM/SIGINT 时会 `disposeBackends` 释放；崩溃残留用 `agent-team stop <runId>` 清理（读取 runner.log 中的 detached pid 杀进程组）。
 
 ### 3.2 核心事件循环
 
@@ -230,7 +243,7 @@ while (true) {
 
   // 并发启动
   for (const candidate of candidates) {
-    const promise = executeTask({ config, db, runId, record: candidate })
+    const promise = executeTask({ config, db, runId, backends, record: candidate })
       .catch(error => db.updateTask(...))  // 异常 → failed
       .finally(() => active.delete(candidate.taskId));
     active.set(candidate.taskId, promise);
@@ -284,40 +297,50 @@ while (true) {
 ### 步骤 2：运行 Worker Agent
 
 ```typescript
-// orchestrator.ts:145-156
-const worker = await adapter.run<WorkerResult>({
-  role: 'worker',
-  cwd: worktreeInfo.path,
-  prompt: workerPrompt({ task, startSha, runId, priorFeedback }),
-  schema: WORKER_SCHEMA,
-  logPath, outputPath,
-  timeoutMs: config.taskTimeoutMs,
-  staleAfterMs: config.staleAfterMs,
-  onPid: (pid) => db.updateTask(runId, task.id, { pid }),
-  onHeartbeat: () => { /* 每 3 秒更新 phase 为 'worker-active' */ }
+// orchestrator.ts executeTask：后端进程池共享（runOrchestrator 顶部 buildBackends）
+const workerBinding = resolveTaskAgent(task, config, run.rolesJson);   // task.agent 优先（连带 model）
+const worker = await runAgent<WorkerResult>({
+  backend: backends[workerBinding.backend]!,
+  spec: {
+    role: 'worker', cwd: worktreeInfo.path,
+    prompt: workerPrompt({ task, startSha, runId, priorFeedback, retry }),
+    schema: WORKER_SCHEMA, model: workerBinding.model, maxTurns: workerBinding.maxTurns,
+    policy: workerPolicy(task, config),   // 任务 allowedPaths/blockedPaths + 验证命令前缀
+    timeoutMs, staleAfterMs,
+    onEvent: (event) => { /* 节流 3s 更新 phase 为 'worker-active' */ }
+  },
+  logPath, outputPath
 });
+if (!worker.ok || !worker.output) → retryOrFail(...)
 ```
 
-Worker 的 prompt 模板在 `prompts.ts:33-51`：
+Worker 的 prompt 模板在 `prompts.ts`：
 
 ```
 loadSkill('worker')
 + 运行上下文 (runId, startSha)
 + 任务规格 (JSON.stringify(task))
 + 先前的失败或审查反馈 (priorFeedback，可选)
++ 厚重试上下文（retry，可选）：当前 git diff + reviewer 反馈原文 + 上次 worker summary
 + "Runner owns staging and commits. Do not run git add/commit/merge/rebase/push."
 ```
 
-### 步骤 3：进程监控
+厚重试上下文由 orchestrator 在重试时构造（`collectWorktreeDiff` / `readPreviousSummary`）——
+**worktree 是记忆载体**：会话每次全新（避免上下文腐烂），但磁盘状态与反馈原文完整注入 prompt。
 
-`process.ts:6-52` 为 spawned Agent 进程设置双层守护：
+### 步骤 3：会话监督
+
+`agent/supervise.ts` 的 `runAgent` 为会话设置三层守护：
 
 | 守护层 | 触发条件 | 动作 |
 |--------|---------|------|
-| 硬超时 | `timeoutMs`（默认 2 小时）到期 | SIGTERM → 5 秒后 SIGKILL |
-| 静默超时 | stdout/stderr 在 `staleAfterMs`（默认 10 分钟）内无数据 | SIGTERM → 5 秒后 SIGKILL |
+| 硬超时 | `timeoutMs`（默认 2 小时）到期 | `session.interrupt()` → 15s 宽限后 `close()` 强杀 |
+| 静默超时 | 任何 AgentEvent 之外静默 `staleAfterMs`（默认 10 分钟） | 同上 |
+| deny-thrash 熔断 | 连续 10 次 `permission-check` 被拒且中间无放行 | 同上 + 错误提示放宽命令前缀（实测模型会 584 次 Bash/263 次拒绝烧尽上下文） |
 
-`lastActivity` 在每次 stdout/stderr data 事件时更新。`terminateTree` (`process.ts:54-68`) 使用 `kill(-pid, SIGTERM)` 杀死整个进程组。
+- `lastActivity` 在**任何 AgentEvent**（消息增量、工具调用、权限裁决、用量）时重置——"无进展"取代旧"无 stdout"
+- 事件以 JSONL 追加到 logPath；结构化输出落盘 outputPath
+- 传输异常（completion reject）转为 `ok:false` outcome，走既有 retryOrFail
 
 ### 步骤 4：校验 Worker 结果
 
@@ -345,7 +368,8 @@ if (workerResult.status === 'failed')  → retryOrFail()
    → 失败: "Worker changed Git history or committed directly."
 
 2. 文件变更检查
-   changedFiles() (git status --porcelain=v1 -z)
+   changedFiles() (git status --porcelain=v1 -z --untracked-files=all)
+   → -uall 必需：默认会把整个未跟踪目录折叠成 "src/" 一条，无法匹配文件级 allowedPaths
    → 解析 -z 分隔输出，处理重命名/拷贝
    → if 无修改 && !allowNoChanges → 失败
 
@@ -378,18 +402,20 @@ if (workerResult.status === 'failed')  → retryOrFail()
 await stageAll(worktreeInfo.path);  // git add -A
 ```
 
-Reviewer 的 prompt (`prompts.ts:54-71`)：
+Reviewer 的 prompt (`prompts.ts`)：
 
 ```
 loadSkill('reviewer')
 + 任务规格 (JSON)
 + startSha
++ worktree 绝对路径（显式声明审查目录——实测模型会自己 cd 到主仓库得出错误结论）
 + Worker 报告 (JSON)
-+ "The candidate changes are staged. Inspect them with git diff --cached
-   and read the affected files. Do not modify, stage, or commit anything."
++ "The candidate changes are staged by the Runner (git add -A already ran).
+   Inspect them with git diff --cached ... Workers never commit ..."
 ```
 
-Reviewer 以只读模式运行（Lead 同款 `--permission-mode dontAsk` + 只读工具）。
+Reviewer 以 `readOnlyPolicy()` 运行：只读 git/探索命令可用，一切写入被 in-flight 裁决拒绝
+（claude `canUseTool` / codex 审批 decline / opencode reject），外加下方的 git 状态快照兜底。
 
 **安全校验** — Reviewer 不能修改任何东西 (`orchestrator.ts:200-206`)：
 
@@ -444,10 +470,12 @@ if (review.decision === 'approved') {
 ### 5.1 创建 Integration Worktree
 
 ```typescript
-// orchestrator.ts:309-313
+// orchestrator.ts integrateRun 顶部
 const worktree = join(config.worktreesDir, repoName, safeSegment(runId), 'integration');
 const branch = `${config.branchPrefix}/${safeSegment(runId)}/integration`;
-await createWorktree({ repoRoot, path: worktree, branch, baseSha: run.baseSha });
+// resetWorktree：集成 worktree 是一次性的——无论上次集成停在什么状态（脏文件/冲突/
+// cherry-pick 中断），都强制清掉 worktree 与分支、从 baseSha 重建（git.ts，幂等可重跑）
+await resetWorktree({ repoRoot, path: worktree, branch, baseSha: run.baseSha });
 db.updateRun(runId, { integrationBranch: branch, integrationWorktree: worktree });
 ```
 
@@ -465,10 +493,14 @@ for (const task of topologicalTasks(manifest.tasks)) {
   const conflicts = await conflictedFiles(worktree);
   // git diff --name-only --diff-filter=U -z
 
-  const conflictResult = await adapter.run<IntegrationResult>({
-    role: 'integrator',
-    prompt: integrationPrompt({ mode: 'resolve_conflict', conflictFiles: conflicts }),
-    ...
+  const conflictResult = await runAgent<IntegrationResult>({
+    backend: integratorBackend,
+    spec: {
+      role: 'integrator',
+      prompt: integrationPrompt({ mode: 'resolve_conflict', worktreePath: worktree, conflictFiles: conflicts }),
+      policy: integratorPolicy('resolve_conflict', config, conflicts),   // 只能改冲突文件
+      ...
+    }
   });
 
   // 安全校验
@@ -495,12 +527,16 @@ await runGlobalVerification({ worktree, config, logPath });
 ### 5.4 Integrator 最终处理
 
 ```typescript
-// orchestrator.ts:357-375
+// orchestrator.ts integrateRun 尾部
 if (config.integration.runAgentAfterCherryPick) {
-  const integrationRun = await adapter.run<IntegrationResult>({
-    role: 'integrator',
-    prompt: integrationPrompt({ mode: 'finalize', integrationAllowedPaths }),
-    ...
+  const integrationRun = await runAgent<IntegrationResult>({
+    backend: integratorBackend,
+    spec: {
+      role: 'integrator',
+      prompt: integrationPrompt({ manifest, integrationAllowedPaths, mode: 'finalize', worktreePath: worktree }),
+      policy: integratorPolicy('finalize', config),   // 只能改 integration.allowedPaths
+      ...
+    }
   });
 
   // 路径检查
@@ -543,40 +579,48 @@ db.updateRun(runId, {
 writeFileSync(join(runDir, 'summary.txt'), `...`, 'utf8');
 ```
 
-## Agent Profile 与角色解析
+## agents 注册表与角色解析
 
-### Profile 格式
+### config v2 三层结构
 
-`<cli>.<model>` 字符串，按**第一个** `.` 切分（`profiles.ts:parseProfile`）：
-
-```
-codex.gpt-5.6-terra          → cli=codex, model=gpt-5.6-terra
-opencode.deepseek/v4-flash   → cli=opencode, model=deepseek/v4-flash
-opencode.glm52               → 查 models.glm52 别名 → z-ai/glm-5.2
-```
-
-- model 段先查 `config.models` 别名表，未命中按字面量传给 CLI 的 `--model`。
-- cli 段必须是 `claude | codex | opencode` 之一，否则抛错。
-
-### 角色解析回退链（`profiles.ts:resolveRole`）
-
-```
-config.roles.<role> 存在 → parseProfile 解析
-否则                     → defaultAdapter + adapters[defaultAdapter].model（与旧配置兼容）
+```yaml
+version: 2
+backends:                    # 传输层接线
+  claude: {}
+  codex: { command: codex }
+  opencode: {}
+agents:                      # 人工筛选的 agent 注册表
+  lead-agent:     { backend: codex, model: gpt-5.6-terra, description: strong planner, maxTurns: 80 }
+  fast-worker:    { backend: opencode, model: zhipuai-coding-plan/glm-5.2 }
+roles:                       # role → agent 名
+  lead: lead-agent
+  worker: fast-worker
+defaultAgent: <注册表名>     # 未配置角色的回退
 ```
 
-### plan 快照（`profiles.ts:snapshotRoles` / `resolveRoleWithSnapshot`）
+- v1 配置（`adapters`/`defaultAdapter`/`models` 字段）由 `agent-config.ts:migrateV1Fields` **内存内迁移**：roles 字符串物化为注册表条目、别名表展开、打印等价 v2 YAML + 弃用警告，不重写磁盘。
+- 自定义 `agents:` 整体替换默认注册表；用户未显式指定 `defaultAgent` 时自动取注册表第一个条目。
+- `roles.<role>` 也接受内联 `<backend>.<model>` 规格（`-c roles.lead=codex.gpt-5.6-terra` 快速覆写）。
 
-- `planRun` 成功后把全量四角色解析结果写入 `runs.roles_json`（`planner.ts:88-92`）。
-- `run` 阶段 `resolveRoleWithSnapshot` 优先读快照，配置文件后续变化不影响已规划的 run。
-- `agent-team run <id> -c roles.worker=...` 是人为强制修改：只更新被覆写的角色，其余保留快照（`cli.ts` run 分支）。
+### 角色解析回退链（`agent/registry.ts`）
+
+```
+roles.<role> 是注册表名   → 该 agent 条目（backend + model + maxTurns）
+roles.<role> 是内联规格   → 解析 backend.model
+未配置                    → defaultAgent
+```
+
+### plan 快照（`snapshotAgents` / `resolveAgentWithSnapshot`）
+
+- `planRun` 成功后把 `{version: 2, roles: 全部角色绑定, agents: 注册表}` 整体写入 `runs.roles_json`——run 对配置文件后续变化完全 hermetic（含 task.agent 引用的 agent 定义）。
+- `parseSnapshot` 兼容旧 v1 快照形状（`{cli, model}` 逐角色翻译）。
+- `agent-team run <id> -c roles.worker=...` 人为强制修改：只更新被覆写的角色，其余保留快照（`cli.ts` run 分支）。
 
 ### 优先级总览
 
 ```
-Worker CLI 选择:  task.adapter（Lead manifest） > worker 角色 profile > defaultAdapter
-Lead/Reviewer/Integrator: 角色 profile > defaultAdapter
-model 传递:       角色 profile 的 model > adapters.<cli>.model
+Worker agent 选择:  task.agent（Lead manifest，注册表名，连带 model/maxTurns） > worker 角色绑定 > defaultAgent
+Lead/Reviewer/Integrator: 角色绑定 > defaultAgent
 配置值优先级:     -c 命令行 > config.yml > config.yaml > config.json > 内置默认
 ```
 
@@ -585,175 +629,105 @@ model 传递:       角色 profile 的 model > adapters.<cli>.model
 - 文件优先级：`.agent-team/config.yml` > `config.yaml` > `config.json`（首个存在者）。
 - YAML 用 `yaml` npm 包解析；JSON 走 `JSON.parse`。
 - `applyOverrides(config, entries)` 处理 `-c path=value`：按 `.` 逐层写入，值先尝试 `JSON.parse`（数字/布尔/JSON 结构），失败按字符串。
-- `initConfig` 生成带注释的 `config.yml` 模板（含 roles/models 示例）。
+- `initConfig` 生成带注释的 v2 `config.yml` 模板（含 agents/roles 示例）。
 
-### 预检（`preflight.ts:checkProfileAvailability`）
+### 预检闭环（`core/preflight.ts`）
 
-`plan`/`launch`/`run` 启动前执行，`doctor` 展示结果：
+`plan`/`launch`/`run` 启动前执行，`doctor` 展示完整结果，`doctor --probe` 强制真实试跑：
 
 | 检查项 | 结果 |
 |--------|------|
-| profile 语法 / cli 名称（`validateProfiles`） | error，阻止启动 |
-| CLI 可用性（`<command> --version`，10s 超时） | error，阻止启动 |
-| opencode model 在 `opencode models` 列表中（30s 超时） | error，阻止启动 |
-| codex `provider/model`：provider 未在 `[model_providers.<id>]` 声明（config 缺失时同理） | error，阻止启动 |
-| codex provider 的 `env_key` 环境变量缺失 | error，阻止启动 |
-| codex 裸 model 名：与顶层/profile model 一致，或默认 provider 下的 OpenAI 命名（gpt、o、codex 前缀） | ok |
-| codex 其余裸 model 名（无清单可枚举） | warning |
-| claude model：与 settings 的 `model`/`env.ANTHROPIC_MODEL` 一致，或 `claude-*` 默认族命名 | ok |
-| claude 配置了 `ANTHROPIC_BASE_URL` 网关时的其他 model | warning |
-| claude 既非默认族命名、无网关、也未声明 | error，阻止启动 |
+| agents 注册表语法 / roles 引用 / defaultAgent（`validateAgents`） | error，阻止启动 |
+| 后端 `discover()`：未安装 / 未认证 | error，阻止启动 |
+| 后端 `listModels()` 枚举真实可用 model | 枚举失败 → warning，退化到 probe 仲裁 |
+| 注册表 model 不在清单 → `probe()` 1-token 真实试跑 | 试跑失败 → error；成功 → warning（网关/自定义模型放行） |
+| probe 结果按 (backend, model, backendVersion) 持久缓存（`probe-cache.ts`，TTL 24h） | CLI 升级自动失效 |
 
-codex 校验由 `codex-config.ts` 实现：解析 `$CODEX_HOME/config.toml`（默认 `~/.codex/config.toml`）的 section 头和 `key = "string"` 赋值子集（其余 TOML 语法安全跳过），提取 `model_providers.*`（含 env_key）、顶层 `model`/`model_provider`、`profiles.*.model`，`validateCodexModel` 为纯函数（env 可注入，便于测试）。
+model 枚举来源：claude `Query.supportedModels()`、codex app-server `model/list`、opencode `GET /config/providers`。不再解析 `~/.codex/config.toml` / `~/.claude/settings.json`。
 
-claude 校验由 `claude-config.ts` 实现：读取 `$CLAUDE_CONFIG_DIR/settings.json`（默认 `~/.claude/settings.json`）的顶层 `model` 和 `env.ANTHROPIC_MODEL`/`env.ANTHROPIC_BASE_URL`（settings 缺失或解析失败按 null 处理，环境变量兜底），`validateClaudeModel` 同为纯函数。
+`run` 命令的预检基于 runs 表快照 + manifest 中出现的 task.agent，而非当前配置文件。
 
-`run` 命令的预检基于 runs 表快照 + manifest 中出现的 task.adapter，而非当前配置文件。
-
-## Adapter 层详解
+## Agent 后端层详解
 
 ### 接口定义
 
-`adapters/types.ts`：
+`agent/types.ts`：
 
 ```typescript
-export interface AgentAdapter {
-  run<T>(input: AgentInvocation): Promise<AgentRunResult<T>>;
+export interface AgentBackend {
+  readonly id: BackendId;                                   // 'claude' | 'codex' | 'opencode'
+  discover(): Promise<DiscoveryResult>;                     // installed / version / authed
+  listModels(): Promise<ModelInfo[]>;
+  probe(model?: string): Promise<ProbeResult>;              // 1-token 真实试跑
+  openSession(spec: SessionSpec): Promise<AgentSession>;
+}
+
+export interface SessionSpec {
+  role: AgentRole; cwd: string; prompt: string;
+  schema: object;                                           // 结构化输出 JSON Schema
+  model?: string; policy: PolicySpec;                       // 权限规格（唯一事实来源 core/policy.ts）
+  timeoutMs: number; staleAfterMs: number; maxTurns?: number;
+  resumeSessionId?: string;                                 // 实验开关预留
+  onEvent?: (event: AgentEvent) => void;
+}
+
+export interface AgentSession {
+  readonly sessionId?: string;
+  interrupt(): Promise<void>;
+  close(): Promise<void>;                                   // 可重入
+  completion(): Promise<AgentRunOutcome>;
+}
+
+export interface AgentRunOutcome<T> {
+  ok: boolean; output: T | null; error?: string;
+  timedOut: boolean; stalled: boolean;
+  sessionId?: string; usage?: { inputTokens?; outputTokens? };
 }
 ```
 
-输入 (`types.ts:151-162`)：
+`AgentEvent` 联合：`activity | session | message | tool-call | tool-result | permission-check | usage`——事件流同时驱动心跳、日志与静默判断。
 
-```typescript
-interface AgentInvocation {
-  role: AgentRole;          // 'lead' | 'worker' | 'reviewer' | 'integrator'
-  cwd: string;              // 工作目录
-  prompt: string;           // 完整 prompt
-  schema: object;           // JSON Schema
-  logPath: string;          // 日志文件路径
-  outputPath: string;       // 输出文件路径
-  timeoutMs: number;        // 硬超时
-  staleAfterMs: number;     // 静默超时
-  onPid?: (pid: number) => void;
-  onHeartbeat?: () => void;
-}
-```
+### 工厂与进程池
 
-输出 (`types.ts:164-170`)：
+`agent/registry.ts:buildBackends(config)` 实例化三后端。`runOrchestrator` 顶部构建、整个 run 共享（codex app-server / opencode serve 常驻复用），finally 与 SIGTERM/SIGINT 时 `disposeBackends`；`planRun` 独立构建并在结束时释放。
 
-```typescript
-interface AgentRunResult<T> {
-  exitCode: number;
-  output: T | null;         // 解析后的结构化结果
-  rawOutput: string;        // stdout 原始文本
-  timedOut: boolean;
-  stalled: boolean;
-}
-```
+### 监督器（`agent/supervise.ts:runAgent`）
 
-### 工厂函数
+`openSession`（包装 onEvent：记日志 + 重置静默计时 + 转发）→ 并发跑 `completion()` 与两层守护（硬超时 / 静默超时，均 `interrupt()` + 15s 宽限后 `close()` 强杀）→ `close()` → 结构化输出写 outputPath。传输异常转为 `ok:false` outcome。
 
-`adapters/index.ts`：
+### 权限编译（`core/policy.ts` + 各后端 policy.ts）
 
-```typescript
-export function createAdapter(name: AdapterName, config: RunnerConfig, modelOverride?: string): AgentAdapter {
-  const base = config.adapters[name];
-  const adapterConfig = modelOverride ? { ...base, model: modelOverride } : base;
-  if (name === 'claude') return new ClaudeAdapter(adapterConfig, config.verification.allowedCommandPrefixes);
-  if (name === 'codex') return new CodexAdapter(adapterConfig);
-  return new OpenCodeAdapter(adapterConfig);
-}
-```
+`PolicySpec {fs, bash, network}` 是角色权力的唯一定义处；`decideBash`（复用 `shell.assertAllowedCommand` 的 token 前缀语义）与 `decideWrite`（复用 `path-policy.checkPaths` 的 glob 语义）是共用纯函数，**同时**被 in-flight 裁决与事后验证器使用：
 
-- `modelOverride` 来自角色 profile 解析结果，存在时覆盖该 CLI 基础配置中的 model
-- Claude adapter 额外接收 `allowedCommandPrefixes`，因为 Claude Code 的 `--allowedTools` 支持精细化的 Bash 命令前缀预批准
-- Codex 和 OpenCode 用更粗粒度的 sandbox 控制
+| 后端 | sandbox | in-flight 裁决 | 说明 |
+|---|---|---|---|
+| claude | —（SDK 内部） | `canUseTool`：Bash→前缀策略，Edit/Write→路径策略，WebFetch/WebSearch→network，AskUserQuestion→拒（无头） | `permissionMode:'default'` + 只读工具进 allowedTools + `settingSources: []`（用户 settings 的 allow 规则会 shadow 回调）；**Bash/Edit/Write 绝不能进 allowedTools**（绕过回调）——单测有回归守卫。CLI 自身会自动放行部分无害只读命令（如 git status），等价于只读允许清单，无害 |
+| codex | `sandboxPolicy`：readOnly / workspaceWrite(writableRoots=[cwd], networkAccess=false) | `approvalPolicy:'untrusted'` + `item/commandExecution/requestApproval`→decideCommand（allowlisted 给 acceptForSession 减少往返）+ `item/fileChange/requestApproval`→decideFileChange | 诚实不对称：sandbox 粒度是根目录非 glob，任务级 allowedPaths 精细约束由事后验证器兜底 |
+| opencode | — | 服务端 config `permission:{bash/edit/webfetch:'ask'}` 全门禁 + SSE `permission.updated`→decide→`POST /session/:id/permissions/:id` `{once\|reject}` | 未知会话的权限请求 fail-closed 拒绝 |
 
-### 三处调用点的角色解析
+### claude 后端（`agent/claude/sdk.ts`）
 
-| 调用点 | 角色 | 解析方式 |
-|--------|------|---------|
-| `planner.ts:44-45` | lead | `resolveRole('lead', config)` |
-| `orchestrator.ts` executeTask | worker | `task.adapter` 优先；否则 `resolveRoleWithSnapshot('worker', ...)` |
-| `orchestrator.ts` executeTask | reviewer | `resolveRoleWithSnapshot('reviewer', ...)` — 独立实例，不复用 Worker 的 adapter |
-| `orchestrator.ts` integrateRun | integrator | `resolveRoleWithSnapshot('integrator', ...)` |
+- `@anthropic-ai/claude-agent-sdk` 的 `query()`：`outputFormat {type:'json_schema'}` 结构化输出、`includePartialMessages`（delta 事件喂静默计时）、`abortController` + `Query.interrupt()`、`maxTurns`。
+- `listModels()` 经 `supportedModels()`（value + resolvedModel 别名都算命中）；`probe()` 用 maxTurns=1 的微型 turn。
+- SDKMessage→AgentEvent 映射与 result 映射是纯函数（`mapClaudeMessage` / `mapClaudeResult`）。
+- 环境变量经 `agent/env.ts:sanitizedEnv` 净化。
 
-### Claude Code Adapter
+### codex 后端（`agent/codex/`）
 
-生成的命令：
+- `jsonrpc.ts`：stdio 换行分隔 JSON 客户端，帧编解码 `parseFrames` 纯函数可测；服务端主动请求（审批）异步应答；进程以独立进程组 spawn，`close()` 进程组 SIGTERM → **ref'd** 3s SIGKILL 升级（unref 版会在 SIGTERM 被忽略时留下孤儿与未释放的管道句柄）。
+- `app-server.ts`：常驻 `codex app-server` 子进程；`initialize` 握手（clientInfo）→ `thread/start`（cwd/model/approvalPolicy/sandbox）→ `turn/start`（input 文本 + `outputSchema` + per-turn 覆盖）；通知路由：`turn/completed`→完成、`item/completed`（agentMessage/commandExecution）→事件、`item/*/delta`→activity、`thread/tokenUsage/updated`→usage；审批请求→会话级 decide。
+- `protocol/` 是 `npm run gen:codex`（`codex app-server generate-ts`）生成的 vendored 类型；`protocol/GENERATED_FROM` 记录生成时的 CLI 版本，`agent/codex/generated.ts` 在 doctor 中与实际版本比对（不一致 → warn 提示重新生成）。`app-server.ts` / `policy.ts` 窄类型导入实际消费的协议类型（`TurnStartParams`、`SandboxPolicy`、审批 params/response、通知载荷、`ModelListResponse` 等，均为 `import type` 零运行时耦合）——上游破坏性变更在 `npm run check` 直接变成编译错误，升级流程是机械的 `gen:codex` → `check` → 集成测试。
 
-```bash
-claude [extraArgs...] \
-  -p "<prompt>" \
-  --output-format stream-json \
-  --verbose \
-  --json-schema '<schema>' \
-  --permission-mode dontAsk|acceptEdits \
-  --allowedTools "Read,Glob,Grep,Edit,Write,Bash(...),..."
-  [--model <model>]
-```
+### opencode 后端（`agent/opencode/sdk.ts`）
 
-工具列表区分角色：
+- **自管 `opencode serve` 子进程**：自己 spawn（支持 `backends.opencode.command` 覆盖、自选端口、解析 "listening on" 行就绪）+ 只用 SDK 的 `createOpencodeClient({baseUrl})` 连接。不使用 SDK 的 `createOpencode()` 托管模式——其 server 关闭是黑盒（实测残留未销毁的 stdio 管道句柄，宿主进程无法退出）且硬编码命令名。
+- dispose：终结 SSE 订阅流 → 销毁 server 子进程 stdio 流 → 进程组 SIGTERM → ref'd 3s SIGKILL 升级（与 codex jsonrpc 同语义）。
+- `session.create`（directory=cwd）→ `session.prompt`（parts 文本 + model `{providerID, modelID}` + `format {type:'json_schema', retryCount}`，SDK 类型滞后于服务端故用 cast；prompt 同时内嵌 schema 兜底）；响应取 `info.structured` 优先，退回 parts 文本经 `parseAgentJson` 解析。
+- provider 错误（如 401）在 `info.error`——显式转为失败 outcome 并透出明细。
 
-| 角色 | permission-mode | 工具 |
-|------|-----------------|------|
-| Lead / Reviewer | `dontAsk` | Read, Glob, Grep, Bash(git status \*), Bash(git diff \*), Bash(git log \*), Bash(git show \*), Bash(git rev-parse \*), Bash(git ls-files \*) |
-| Worker / Integrator | `acceptEdits` | 上述 + Edit, Write + `Bash(<each allowedCommandPrefix> *)` |
+### JSON 解析（`agent/parse.ts:parseAgentJson`）
 
-输出解析：从 Claude 的 `structured_output` 字段提取 JSON（`claude.ts:30-33`）。
-
-### Codex Adapter
-
-生成的命令：
-
-```bash
-codex exec \
-  --json \
-  --sandbox read-only|workspace-write \
-  --ask-for-approval never \
-  --output-schema /path/to/schema.json \
-  -o /path/to/output.json \
-  [--model <model>] \
-  "<prompt>"
-```
-
-| 角色 | sandbox |
-|------|---------|
-| Lead / Reviewer | `read-only` |
-| Worker / Integrator | `workspace-write` |
-
-Schema 先写入临时文件，再通过 `--output-schema` 传入。
-
-### OpenCode Adapter
-
-生成的命令：
-
-```bash
-opencode run \
-  --dir <cwd> \
-  --format json \
-  --auto \
-  --agent plan|build \
-  [--model <model>] \
-  "<prompt + schema embedded>"
-```
-
-| 角色 | --agent |
-|------|---------|
-| Lead / Reviewer | `plan` |
-| Worker / Integrator | `build` |
-
-OpenCode CLI 不由 Runner 强制 JSON Schema；Schema 直接内嵌到 prompt 中，Runner 在返回后做本地结构校验。
-
-### JSON 解析
-
-`process.ts:70-105` `parseJsonLoose` — 对 Agent 原始输出做多层降级解析：
-
-1. `JSON.parse(trimmed)` — 直接尝试
-2. 提取 markdown code fence 中的 JSON（最后一个 ` ```json ` 块）
-3. 从后往前逐行尝试 `JSON.parse`（适配 Claude stream-json 格式）
-4. 在每行中递归搜索 `structured_output`/`output`/`result`/`text`/`content`/`message` 字段
-5. 从最后一个 `{` 处截取并解析
+确定性三层：`JSON.parse` 整文 → 最后一个 markdown code fence → 从最后一个 `{` 截取。仅用于 codex/opencode 的最终消息通道（claude 走原生 structured_output）。旧 `parseJsonLoose` 五层猜测解析已删除。
 
 ## 命令安全模型
 
@@ -984,6 +958,19 @@ Git 分支:
   agent-team/<runId>/T002
   agent-team/<runId>/integration
 ```
+
+## 测试分层
+
+```
+npm test                  # 48 个单元测试：纯函数，无 CLI / 无网络 / 无密钥（CI 可跑）
+npm run test:protocol     # 协议层集成（AGENT_TEAM_PROTOCOL=1）：discover / model 枚举 /
+                          # app-server 握手与 thread 生命周期 / opencode serve 启动——零推理零 token
+npm run test:integration  # 全会话层（AGENT_TEAM_INTEGRATION=1）：真实推理，需要各 CLI 本地登录
+```
+
+- 两个集成 script 自带 `--test-force-exit`：dispose 后事件循环已排干（handles/requests 均空的诊断结论），但 node:test 子进程在此场景偶发不退出，官方 flag 只影响收尾不影响失败检测。
+- opencode 全会话额外需要 `AGENT_TEAM_OPENCODE_SPIKE=1`（本机 provider 挂起，纯 SDK 复现，非集成问题）。
+- codex 升级验证顺序：`npm run gen:codex` → `npm run check`（窄类型导入让破坏性变更变成编译错误）→ `npm run test:protocol` → 需要时 `npm run test:integration`。
 
 ## 后台运行 (`--detach`)
 

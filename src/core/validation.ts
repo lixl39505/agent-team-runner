@@ -1,4 +1,4 @@
-import type { AdapterName, IntegrationResult, LeadResult, ReviewResult, TaskSpec, WorkerResult } from './types.js';
+import type { IntegrationResult, LeadResult, ReviewResult, TaskSpec, WorkerResult } from './types.js';
 
 function assertObject(value: unknown, label: string): asserts value is Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -13,22 +13,24 @@ function stringArray(value: unknown, label: string): string[] {
   return value;
 }
 
-export function validateLeadResult(value: unknown): LeadResult {
+export function validateLeadResult(value: unknown, validAgentNames?: string[]): LeadResult {
   assertObject(value, 'Lead result');
-  if (value.version !== 1) throw new Error('Lead result version must be 1');
+  // 模型常把 version 写成字符串 "1"——schema 侧放宽为 number，这里收敛校验
+  const version = Number(value.version);
+  if (version !== 1) throw new Error('Lead result version must be 1');
   if (typeof value.title !== 'string' || typeof value.summary !== 'string') {
     throw new Error('Lead result title and summary are required');
   }
   if (!Array.isArray(value.tasks) || value.tasks.length === 0) {
     throw new Error('Lead result must contain at least one task');
   }
-  const tasks = value.tasks.map((task, index) => validateTaskSpec(task, index));
+  const tasks = value.tasks.map((task, index) => validateTaskSpec(task, index, validAgentNames));
   validateTaskGraph(tasks);
   validateParallelPathOwnership(tasks);
   return { version: 1, title: value.title, summary: value.summary, tasks };
 }
 
-function validateTaskSpec(value: unknown, index: number): TaskSpec {
+function validateTaskSpec(value: unknown, index: number, validAgentNames?: string[]): TaskSpec {
   assertObject(value, `Task ${index}`);
   const id = String(value.id ?? '');
   if (!/^[A-Z][A-Z0-9_-]{1,31}$/.test(id)) {
@@ -37,13 +39,28 @@ function validateTaskSpec(value: unknown, index: number): TaskSpec {
   const title = String(value.title ?? '');
   const description = String(value.description ?? '');
   if (!title || !description) throw new Error(`Task ${id} requires title and description`);
-  const adapter = value.adapter;
-  if (adapter !== undefined && !['claude', 'codex', 'opencode'].includes(String(adapter))) {
-    throw new Error(`Task ${id} has unsupported adapter: ${String(adapter)}`);
+  if (value.adapter !== undefined) {
+    throw new Error(`Task ${id} uses the deprecated "adapter" field; v2 manifests select agents by name via "agent" (re-plan with a v2 config)`);
+  }
+  const agent = value.agent;
+  if (agent !== undefined) {
+    if (typeof agent !== 'string' || agent.length === 0) {
+      throw new Error(`Task ${id} has invalid agent: ${String(agent)}`);
+    }
+    if (validAgentNames && !validAgentNames.includes(agent)) {
+      throw new Error(`Task ${id} references unknown agent "${agent}"; choose from: ${validAgentNames.join(', ')}`);
+    }
   }
   const allowedPaths = stringArray(value.allowedPaths, `${id}.allowedPaths`);
   const blockedPaths = stringArray(value.blockedPaths ?? [], `${id}.blockedPaths`);
   for (const pattern of [...allowedPaths, ...blockedPaths]) validateRelativeGlob(pattern, id);
+  // .git 前缀只约束 allowedPaths（拥有 .git 危险）；blockedPaths 里出现 .git/** 是纯增强限制，允许
+  for (const pattern of allowedPaths) {
+    const normalized = pattern.replace(/\\/g, '/');
+    if (normalized === '.git' || normalized.startsWith('.git/')) {
+      throw new Error(`${id} may not own .git paths: ${pattern}`);
+    }
+  }
   const result: TaskSpec = {
     id,
     title,
@@ -55,7 +72,7 @@ function validateTaskSpec(value: unknown, index: number): TaskSpec {
     verificationCommands: stringArray(value.verificationCommands ?? [], `${id}.verificationCommands`)
   };
   if (typeof value.role === 'string') result.role = value.role;
-  if (adapter) result.adapter = adapter as AdapterName;
+  if (typeof agent === 'string' && agent) result.agent = agent;
   if (typeof value.allowNoChanges === 'boolean') result.allowNoChanges = value.allowNoChanges;
   return result;
 }
@@ -107,7 +124,6 @@ function validateRelativeGlob(pattern: string, taskId: string): void {
   }
   const normalized = pattern.replace(/\\/g, '/');
   if (normalized.split('/').includes('..')) throw new Error(`${taskId} path pattern escapes the repository: ${pattern}`);
-  if (normalized === '.git' || normalized.startsWith('.git/')) throw new Error(`${taskId} may not own .git paths`);
 }
 
 function validateParallelPathOwnership(tasks: TaskSpec[]): void {
@@ -207,13 +223,13 @@ export const LEAD_SCHEMA = {
   type: 'object', additionalProperties: false,
   required: ['version', 'title', 'summary', 'tasks'],
   properties: {
-    version: { const: 1 }, title: { type: 'string' }, summary: { type: 'string' },
+    version: { type: 'number' }, title: { type: 'string' }, summary: { type: 'string' },
     tasks: { type: 'array', minItems: 1, items: {
       type: 'object', additionalProperties: false,
       required: ['id', 'title', 'description', 'dependsOn', 'allowedPaths', 'blockedPaths', 'acceptance', 'verificationCommands'],
       properties: {
-        id: { type: 'string' }, title: { type: 'string' }, description: { type: 'string' }, role: { type: 'string' },
-        adapter: { enum: ['claude', 'codex', 'opencode'] }, dependsOn: { type: 'array', items: { type: 'string' } },
+        id: { type: 'string', pattern: '^[A-Z][A-Z0-9_-]{1,31}$' }, title: { type: 'string' }, description: { type: 'string' }, role: { type: 'string' },
+        agent: { type: 'string' }, dependsOn: { type: 'array', items: { type: 'string' } },
         allowedPaths: { type: 'array', minItems: 1, items: { type: 'string' } }, blockedPaths: { type: 'array', items: { type: 'string' } },
         acceptance: { type: 'array', minItems: 1, items: { type: 'string' } }, verificationCommands: { type: 'array', items: { type: 'string' } },
         allowNoChanges: { type: 'boolean' }

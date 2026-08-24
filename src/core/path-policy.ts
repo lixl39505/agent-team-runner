@@ -30,15 +30,30 @@ export function globMatch(path: string, glob: string): boolean {
   return new RegExp(regex).test(normalizedPath);
 }
 
+/**
+ * 模式匹配：glob 语义之外，无通配符且末段不含 "." 的裸目录名（Lead 常见输出，如 `src`）
+ * 视为目录前缀，匹配其整个子树。allowed 与 blocked 对称适用。
+ */
+export function patternMatches(file: string, pattern: string): boolean {
+  if (globMatch(file, pattern)) return true;
+  if (!/[*?]/.test(pattern)) {
+    const lastSegment = pattern.replace(/\\/g, '/').split('/').pop() ?? '';
+    if (!lastSegment.includes('.')) {
+      return file === pattern || file.startsWith(`${pattern}/`) || globMatch(file, `${pattern}/**`);
+    }
+  }
+  return false;
+}
+
 export function checkPaths(files: string[], allowed: string[], blocked: string[]): PathCheckResult {
   const invalid: string[] = [];
   const denied: string[] = [];
   for (const file of files) {
-    if (blocked.some((pattern) => globMatch(file, pattern))) {
+    if (blocked.some((pattern) => patternMatches(file, pattern))) {
       denied.push(file);
       continue;
     }
-    if (!allowed.some((pattern) => globMatch(file, pattern))) invalid.push(file);
+    if (!allowed.some((pattern) => patternMatches(file, pattern))) invalid.push(file);
   }
   return { ok: invalid.length === 0 && denied.length === 0, invalid, blocked: denied };
 }

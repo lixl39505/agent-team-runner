@@ -1,6 +1,13 @@
 import type { ReviewResult, RunManifest, TaskSpec } from './types.js';
 import { loadSkill } from './files.js';
 
+export interface LeadAgentOption {
+  name: string;
+  backend: string;
+  model?: string | undefined;
+  description?: string | undefined;
+}
+
 export function leadPrompt(input: {
   goal: string;
   goalFile: string;
@@ -8,7 +15,17 @@ export function leadPrompt(input: {
   baseRef: string;
   baseSha: string;
   allowedCommandPrefixes: string[];
+  /** agents 注册表（人工筛选的能力清单）：Lead 只能从中为任务点名 agent */
+  agents: LeadAgentOption[];
 }): string {
+  const agents = input.agents.length > 0
+    ? `
+# Agent registry (optional per-task "agent" field)
+
+Tasks may name an agent from this registry via the "agent" field when a task clearly benefits from a specific agent; omit it to inherit the worker role default. Do not invent agent names.
+${input.agents.map((agent) => `- ${agent.name}: ${agent.backend}${agent.model ? ` / ${agent.model}` : ''}${agent.description ? ` — ${agent.description}` : ''}`).join('\n')}
+`
+    : '';
   return `${loadSkill('lead')}
 
 # Runtime context
@@ -21,39 +38,71 @@ Goal file: ${input.goalFile}
 # Initial goal
 
 ${input.goal}
-
+${agents}
 # Verification command policy
 
 Every verification command must begin with one of these allowlisted prefixes:
 ${input.allowedCommandPrefixes.map((value) => `- ${value}`).join('\n')}
 
+# Path policy for task allowedPaths
+
+Every task's allowedPaths entries must be glob patterns relative to the repository root:
+use "src/**" (or "src/**/*") to own a directory tree and "src/file.ts" for a single file.
+Never use a bare directory name like "src" — write "src/**" instead.
+
 Inspect the repository before decomposing the work. Return only the structured task manifest. Do not modify repository files.`;
+}
+
+const DIFF_LIMIT = 24_000;
+
+export interface WorkerRetryContext {
+  /** 当前 worktree 相对 startSha 的未提交改动（截断保护） */
+  diff?: string | undefined;
+  /** 上一轮 reviewer 的完整 JSON 结论 */
+  review?: string | undefined;
+  /** 上一轮 worker 的 summary */
+  previousSummary?: string | undefined;
 }
 
 export function workerPrompt(input: {
   task: TaskSpec;
   startSha: string;
   runId: string;
+  /** 任务 worktree 的绝对路径——模型必须在这里工作，写其它绝对路径会被拒绝 */
+  worktreePath?: string;
   priorFeedback?: string | null;
+  retry?: WorkerRetryContext | undefined;
 }): string {
+  const retry = input.retry
+    ? `# Prior attempt context
+
+The worktree still carries the previous attempt's uncommitted changes. Inspect them before editing.
+${input.retry.diff ? `\n## Uncommitted diff (may be truncated)\n\n${truncate(input.retry.diff, DIFF_LIMIT)}\n` : ''}${input.retry.review ? `\n## Reviewer feedback (verbatim)\n\n${input.retry.review}\n` : ''}${input.retry.previousSummary ? `\n## Previous worker summary\n\n${input.retry.previousSummary}\n` : ''}`
+    : '';
   return `${loadSkill('worker')}
 
 # Runtime contract
 
 Run ID: ${input.runId}
 Task start SHA: ${input.startSha}
+${input.worktreePath ? `Your working directory (the task worktree): ${input.worktreePath}\nAll file edits MUST use paths inside this directory (relative paths are preferred). Writes to any other absolute path are denied by policy.\n` : ''}
 
 Task specification:
 ${JSON.stringify(input.task, null, 2)}
 
-${input.priorFeedback ? `# Previous failure or review feedback\n\n${input.priorFeedback}\n` : ''}
-
+${input.priorFeedback ? `# Previous failure or review feedback\n\n${input.priorFeedback}\n` : ''}${retry}
 The Runner owns staging and commits. Do not run git add, git commit, git merge, git rebase, git push, deployment, or production mutations. Work only inside the current worktree. At the end, return the structured Worker result.`;
+}
+
+function truncate(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}\n… (truncated, ${text.length - limit} more characters)`;
 }
 
 export function reviewerPrompt(input: {
   task: TaskSpec;
   startSha: string;
+  worktreePath?: string;
   workerResult: unknown;
 }): string {
   return `${loadSkill('reviewer')}
@@ -64,16 +113,17 @@ Task specification:
 ${JSON.stringify(input.task, null, 2)}
 
 Task start SHA: ${input.startSha}
-Worker report:
+${input.worktreePath ? `Your working directory (the task worktree): ${input.worktreePath}\nRun all git commands in this directory — do NOT cd anywhere else; the main repository checkout does not contain the candidate changes.\n` : ''}Worker report:
 ${JSON.stringify(input.workerResult, null, 2)}
 
-The candidate changes are staged. Inspect them with git diff --cached and read the affected files. Do not modify, stage, or commit anything. Return the structured review decision.`;
+The candidate changes are staged by the Runner (git add -A already ran). Inspect them with git diff --cached and read the affected files in this worktree. Workers never commit — do not request commits; the Runner commits after your approval. Do not modify, stage, or commit anything. Return the structured review decision.`;
 }
 
 export function integrationPrompt(input: {
   manifest: RunManifest;
   integrationAllowedPaths: string[];
   mode: 'resolve_conflict' | 'finalize';
+  worktreePath?: string;
   conflictFiles?: string[];
 }): string {
   const modeText = input.mode === 'resolve_conflict'
@@ -85,7 +135,7 @@ export function integrationPrompt(input: {
 
 Mode: ${input.mode}
 ${modeText}
-
+${input.worktreePath ? `\nYour working directory (the integration worktree): ${input.worktreePath}\nRun all commands in this directory — do NOT cd anywhere else.\n` : ''}
 Run manifest:
 ${JSON.stringify(input.manifest, null, 2)}
 

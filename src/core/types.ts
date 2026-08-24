@@ -1,4 +1,6 @@
-export type AdapterName = 'claude' | 'codex' | 'opencode';
+export type BackendId = 'claude' | 'codex' | 'opencode';
+/** @deprecated 旧名，随旧 adapter 层在 Phase 4 一起删除 */
+export type AdapterName = BackendId;
 export type AgentRole = 'lead' | 'worker' | 'reviewer' | 'integrator';
 
 export type RunStatus =
@@ -21,27 +23,63 @@ export type TaskStatus =
   | 'blocked'
   | 'failed';
 
-export interface AdapterConfig {
-  command: string;
+/** 后端传输层接线：如何找到/启动对应的 Code Agent 运行时 */
+export interface BackendConfig {
+  /** CLI 二进制名或路径，缺省用 backend id 本身 */
+  command?: string;
   extraArgs?: string[];
-  model?: string;
 }
 
-/** Agent profile 字符串 "cli.model" 解析结果，如 "codex.terra" → { cli: 'codex', model: 'gpt-5.6-terra' } */
-export interface ResolvedProfile {
-  cli: AdapterName;
-  model?: string | undefined;
-  /** 原始 profile 字符串或回退来源描述 */
+/** agents 注册表条目：一个具名的 agent = 后端 + model + 选项 */
+export interface AgentEntry {
+  backend: BackendId;
+  model?: string;
+  description?: string;
+  maxTurns?: number;
+}
+
+/** 角色或任务解析出的 agent 绑定（取代旧 ResolvedProfile） */
+export interface AgentBinding {
+  /** 注册表名，或内联 "backend.model" 规格原文 */
+  agent: string;
+  backend: BackendId;
+  model?: string;
+  /** turn 上限（来自 agents 注册表条目） */
+  maxTurns?: number;
+  /** 来源描述：roles.<role> / defaultAgent / task:<name> / snapshot */
   source: string;
 }
 
+/** plan 时固化的全量快照（roles + agents 注册表），保证 run 不受配置文件后续变化影响 */
+export interface AgentSnapshot {
+  version: 2;
+  roles: Record<AgentRole, AgentBinding>;
+  agents: Record<string, AgentEntry>;
+}
+
+/**
+ * 角色/任务的权限规格——role 权力的唯一定义处（core/policy.ts 构造）。
+ * 编译到各后端：claude canUseTool / codex 审批应答 / opencode 权限配置；
+ * 事后机械验证器继续作为 defense in depth。
+ */
+export interface PolicySpec {
+  fs:
+    | { mode: 'read-only' }
+    | { mode: 'workspace-write'; allowedPaths: string[]; blockedPaths: string[] };
+  bash:
+    | { mode: 'deny' }
+    | { mode: 'prefixes'; prefixes: string[] };
+  network: boolean;
+}
+
 export interface RunnerConfig {
-  version: 1;
+  version: 2;
   repoRoot: string;
   stateDir: string;
   worktreesDir: string;
   baseRef: string;
-  defaultAdapter: AdapterName;
+  /** 缺省 agent（agents 注册表名），未配置的角色回退到它 */
+  defaultAgent: string;
   concurrency: number;
   pollIntervalMs: number;
   staleAfterMs: number;
@@ -50,10 +88,11 @@ export interface RunnerConfig {
   maxWorkerAttempts: number;
   maxReviewCycles: number;
   branchPrefix: string;
-  /** model 别名表：短名 → 真实 model id（如 terra → gpt-5.6-terra） */
-  models?: Record<string, string>;
-  /** 角色 → Agent profile（"cli.model" 字符串），缺省回退 defaultAdapter */
-  roles?: Partial<Record<AgentRole, string>>;
+  backends: Record<BackendId, BackendConfig>;
+  /** agent 注册表：名 → {backend, model, ...} */
+  agents: Record<string, AgentEntry>;
+  /** 角色 → agent 名（或内联 "backend.model" 规格），缺省回退 defaultAgent */
+  roles: Partial<Record<AgentRole, string>>;
   verification: {
     allowedCommandPrefixes: string[];
     globalCommands: string[];
@@ -62,7 +101,6 @@ export interface RunnerConfig {
     allowedPaths: string[];
     runAgentAfterCherryPick: boolean;
   };
-  adapters: Record<AdapterName, AdapterConfig>;
 }
 
 export interface TaskSpec {
@@ -70,7 +108,8 @@ export interface TaskSpec {
   title: string;
   description: string;
   role?: string;
-  adapter?: AdapterName;
+  /** agents 注册表名：Lead 为任务点名更合适的 agent；缺省继承 worker 角色 */
+  agent?: string;
   dependsOn: string[];
   allowedPaths: string[];
   blockedPaths: string[];
@@ -127,10 +166,11 @@ export interface RunRecord {
   goalFile: string;
   baseRef: string;
   baseSha: string;
-  adapter: AdapterName;
+  /** plan 时 Lead 使用的后端（历史列名，保持 schema 不变） */
+  adapter: string;
   status: RunStatus;
   manifestJson: string | null;
-  /** plan 时固化的角色 → profile 快照，保证后续 run 不受配置文件变化影响 */
+  /** plan 时固化的 AgentSnapshot（roles + agents 注册表），保证后续 run 不受配置文件变化影响 */
   rolesJson: string | null;
   integrationBranch: string | null;
   integrationWorktree: string | null;
@@ -162,23 +202,3 @@ export interface TaskRecord {
   finishedAt: string | null;
 }
 
-export interface AgentInvocation {
-  role: AgentRole;
-  cwd: string;
-  prompt: string;
-  schema: object;
-  logPath: string;
-  outputPath: string;
-  timeoutMs: number;
-  staleAfterMs: number;
-  onPid?: (pid: number) => void;
-  onHeartbeat?: () => void;
-}
-
-export interface AgentRunResult<T = unknown> {
-  exitCode: number;
-  output: T | null;
-  rawOutput: string;
-  timedOut: boolean;
-  stalled: boolean;
-}

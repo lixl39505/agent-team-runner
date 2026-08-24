@@ -1,15 +1,16 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
-import type { RunnerConfig } from './types.js';
+import type { AgentEntry, RunnerConfig } from './types.js';
+import { migrateV1Fields } from './agent-config.js';
 
 export const DEFAULT_CONFIG: RunnerConfig = {
-  version: 1,
+  version: 2,
   repoRoot: '.',
   stateDir: '.agent-team',
   worktreesDir: '../.agent-team-worktrees',
   baseRef: 'HEAD',
-  defaultAdapter: 'claude',
+  defaultAgent: 'default-claude',
   concurrency: 3,
   pollIntervalMs: 2000,
   staleAfterMs: 10 * 60 * 1000,
@@ -18,6 +19,15 @@ export const DEFAULT_CONFIG: RunnerConfig = {
   maxWorkerAttempts: 2,
   maxReviewCycles: 2,
   branchPrefix: 'agent-team',
+  backends: {
+    claude: {},
+    codex: {},
+    opencode: {}
+  },
+  agents: {
+    'default-claude': { backend: 'claude' }
+  },
+  roles: {},
   verification: {
     allowedCommandPrefixes: [
       'pnpm test',
@@ -39,11 +49,6 @@ export const DEFAULT_CONFIG: RunnerConfig = {
   integration: {
     allowedPaths: ['specs/**'],
     runAgentAfterCherryPick: true
-  },
-  adapters: {
-    claude: { command: 'claude', extraArgs: [] },
-    codex: { command: 'codex', extraArgs: [] },
-    opencode: { command: 'opencode', extraArgs: [] }
   }
 };
 
@@ -58,7 +63,7 @@ export function configPath(repoRoot: string): string {
   return join(dir, 'config.yml');
 }
 
-function readRawConfig(repoRoot: string): { raw: Partial<RunnerConfig>; file: string | null } {
+function readRawConfig(repoRoot: string): { raw: Record<string, unknown>; file: string | null } {
   const dir = join(repoRoot, '.agent-team');
   for (const name of CONFIG_FILENAME_PRIORITY) {
     const candidate = join(dir, name);
@@ -68,7 +73,7 @@ function readRawConfig(repoRoot: string): { raw: Partial<RunnerConfig>; file: st
     if (raw === null || typeof raw !== 'object') {
       throw new Error(`Config file ${candidate} is empty or not a mapping`);
     }
-    return { raw: raw as Partial<RunnerConfig>, file: candidate };
+    return { raw: raw as Record<string, unknown>, file: candidate };
   }
   return { raw: {}, file: null };
 }
@@ -83,15 +88,14 @@ export function initConfig(repoRoot: string): string {
 }
 
 function defaultConfigYaml(): string {
-  return `# Agent Team Runner 配置
-# Profile 格式: <cli>.<model>，如 codex.gpt-5.6-terra、opencode.deepseek/v4-flash
-# model 段可引用下方 models 别名表中的短名
-version: 1
+  return `# Agent Team Runner 配置 (v2)
+# agent = 后端 + model 的具名组合；角色引用注册表中的 agent 名。
+version: 2
 repoRoot: .
 stateDir: .agent-team
 worktreesDir: ../.agent-team-worktrees
 baseRef: HEAD
-defaultAdapter: claude
+defaultAgent: default-claude
 concurrency: 3
 pollIntervalMs: 2000
 staleAfterMs: 600000
@@ -101,18 +105,38 @@ maxWorkerAttempts: 2
 maxReviewCycles: 2
 branchPrefix: agent-team
 
-# model 别名（可选）：短名 → 真实 model id
-# models:
-#   terra: gpt-5.6-terra
-#   glm52: z-ai/glm-5.2
+# 后端接线：CLI 命令缺省用 backend 名本身
+backends:
+  claude: {}
+  codex: {}
+  opencode: {}
 
-# 角色 → profile（可选）：未配置的角色回退到 defaultAdapter
-# 同一 CLI 可通过不同 profile 使用不同 model
+# agent 注册表：为不同 role 配置不同 agent（背后不同 model）
+# agents:
+#   lead-agent:
+#     backend: codex
+#     model: gpt-5.6-terra
+#     description: strong planner
+#   fast-worker:
+#     backend: opencode
+#     model: deepseek/v4-flash
+#   careful-review:
+#     backend: claude
+#     model: claude-sonnet-5
+
+# 角色 → agent 名（未配置的角色回退 defaultAgent）
+# Lead 可在 manifest 的任务里用 "agent" 字段引用注册表中的任何 agent
 # roles:
-#   lead: codex.terra
-#   worker: opencode.deepseek/v4-flash
-#   reviewer: opencode.glm52
-#   integrator: codex.gpt-5.6-terra
+#   lead: lead-agent
+#   worker: fast-worker
+#   reviewer: careful-review
+#   integrator: lead-agent
+
+agents:
+  default-claude:
+    backend: claude
+
+roles: {}
 
 verification:
   allowedCommandPrefixes:
@@ -135,43 +159,63 @@ integration:
   allowedPaths:
     - specs/**
   runAgentAfterCherryPick: true
-
-adapters:
-  claude:
-    command: claude
-    extraArgs: []
-  codex:
-    command: codex
-    extraArgs: []
-  opencode:
-    command: opencode
-    extraArgs: []
 `;
 }
 
 export function loadConfig(inputRepoRoot: string): RunnerConfig {
   const repoRoot = resolve(inputRepoRoot);
-  const { raw } = readRawConfig(repoRoot);
+  const { raw, file } = readRawConfig(repoRoot);
+
+  // v1 配置（adapters/defaultAdapter/models 字段）在内存内迁移成 v2，不重写磁盘
+  const migration = migrateV1Fields(raw);
+  if (migration && file) {
+    console.error([
+      `warning: ${file} uses the v1 config format (adapters/defaultAdapter/models).`,
+      'It was translated in memory; equivalent v2 config:',
+      ...migration.v2Yaml.split('\n').map((line) => `  ${line}`),
+      'Please migrate the file to version: 2.'
+    ].join('\n'));
+  }
+  const effective: Record<string, unknown> = { ...raw };
+  if (migration) {
+    delete effective.adapters;
+    delete effective.defaultAdapter;
+    delete effective.models;
+    effective.backends = migration.backends;
+    effective.agents = migration.agents;
+    effective.roles = migration.roles;
+    effective.defaultAgent = migration.defaultAgent;
+    effective.version = 2;
+  }
 
   const merged: RunnerConfig = {
     ...DEFAULT_CONFIG,
-    ...raw,
-    models: { ...(raw.models ?? {}) },
-    roles: { ...(raw.roles ?? {}) },
+    ...(effective as Partial<RunnerConfig>),
+    backends: {
+      claude: { ...DEFAULT_CONFIG.backends.claude, ...(effective.backends as Record<string, object> | undefined)?.claude },
+      codex: { ...DEFAULT_CONFIG.backends.codex, ...(effective.backends as Record<string, object> | undefined)?.codex },
+      opencode: { ...DEFAULT_CONFIG.backends.opencode, ...(effective.backends as Record<string, object> | undefined)?.opencode }
+    },
+    agents: effective.agents
+      ? { ...(effective.agents as Record<string, AgentEntry>) }
+      : { ...DEFAULT_CONFIG.agents },
+    roles: { ...(effective.roles as Record<string, string> | undefined) },
     verification: {
       ...DEFAULT_CONFIG.verification,
-      ...(raw.verification ?? {})
+      ...(effective.verification as object | undefined)
     },
     integration: {
       ...DEFAULT_CONFIG.integration,
-      ...(raw.integration ?? {})
-    },
-    adapters: {
-      claude: { ...DEFAULT_CONFIG.adapters.claude, ...(raw.adapters?.claude ?? {}) },
-      codex: { ...DEFAULT_CONFIG.adapters.codex, ...(raw.adapters?.codex ?? {}) },
-      opencode: { ...DEFAULT_CONFIG.adapters.opencode, ...(raw.adapters?.opencode ?? {}) }
+      ...(effective.integration as object | undefined)
     }
   };
+  const rawDefaultAgent = typeof effective.defaultAgent === 'string' ? effective.defaultAgent : null;
+  if (typeof merged.defaultAgent !== 'string' || !merged.defaultAgent) merged.defaultAgent = DEFAULT_CONFIG.defaultAgent;
+  // 自定义 agents 注册表会整体替换默认项；用户未显式指定 defaultAgent 时自动回退到注册表第一个条目
+  if (!merged.agents[merged.defaultAgent] && !rawDefaultAgent) {
+    const first = Object.keys(merged.agents)[0];
+    if (first) merged.defaultAgent = first;
+  }
 
   merged.repoRoot = resolve(repoRoot, merged.repoRoot);
   merged.stateDir = resolvePath(merged.repoRoot, merged.stateDir);

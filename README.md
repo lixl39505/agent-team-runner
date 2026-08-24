@@ -46,23 +46,24 @@ Runner 在调用 Agent 时会直接读取打包的 Skill 内容并编译进运�
 
 - Lead 自动扫描代码库并生成任务 DAG
 - DAG、依赖和循环校验
-- Claude Code、Codex CLI、OpenCode Adapter
+- 三后端协议级集成：claude（Agent SDK）、codex（app-server JSON-RPC）、opencode（serve + SDK）
 - 每个 Worker 独立分支和 Git Worktree
 - 依赖任务提交自动注入下游 Worktree
 - SQLite WAL 状态库和事件记录
 - Worker 并发上限
-- 进程 PID、日志心跳、静默超时和硬超时
-- Worker 失败自动重试
-- 每角色独立 Agent Profile（`cli.model`），同一 CLI 可用不同 model
+- 事件流心跳（真实"无进展"检测）、静默超时和硬超时
+- Worker 失败自动重试（重试 prompt 嵌入 diff + reviewer 反馈原文 + 上次 summary）
+- agents 注册表：为不同 role 配置不同 agent（后端 + model + turn 上限）
+- Runner 统一权限策略：Bash 命令前缀、路径 glob、网络开关，在工具调用时实时裁决
 - YAML 配置文件 + `-c` 命令行任意层级覆写
-- 启动前 profile 有效性预检（CLI 可用性、opencode model 列表）
+- 启动前闭环预检：后端 discover + 真实 model 枚举 + 1-token 试跑（持久缓存）
 - 修改路径 allowlist / blocklist 机械校验
 - 验证命令前缀 allowlist
 - Runner 自己重跑任务验证命令
 - Reviewer 审查 staged diff
 - 审查驳回后自动把反馈交回 Worker
 - Reviewer 批准后由 Runner 创建任务提交
-- 按拓扑顺序 cherry-pick 到 integration 分支
+- 按拓扑顺序 cherry-pick 到 integration 分支（集成 worktree 可重跑、幂等）
 - 限定范围的冲突解决 Agent
 - 全局验证命令
 - Integrator 统一更新架构和进度文档
@@ -121,15 +122,15 @@ agent-team init
 
 ## 配置
 
-配置文件为 `.agent-team/config.yml`（`agent-team init` 自动生成；加载顺序 `config.yml` > `config.yaml` > 旧版 `config.json`，支持注释）：
+配置文件为 `.agent-team/config.yml`（`agent-team init` 自动生成；加载顺序 `config.yml` > `config.yaml` > 旧版 `config.json`，支持注释。v1 配置会在内存内自动迁移成 v2 并打印等价配置）：
 
 ```yaml
-version: 1
+version: 2
 repoRoot: .
 stateDir: .agent-team
 worktreesDir: ../.agent-team-worktrees
 baseRef: HEAD
-defaultAdapter: claude
+defaultAgent: default-claude
 concurrency: 3
 pollIntervalMs: 2000
 staleAfterMs: 600000
@@ -139,17 +140,34 @@ maxWorkerAttempts: 2
 maxReviewCycles: 2
 branchPrefix: agent-team
 
-# model 别名（可选）：短名 → 真实 model id
-models:
-  terra: gpt-5.6-terra
-  glm52: z-ai/glm-5.2
+# 后端接线：CLI 命令缺省用 backend 名本身
+backends:
+  claude: {}
+  codex: {}
+  opencode: {}
 
-# 角色 → profile（可选）：未配置的角色回退到 defaultAdapter
+# agent 注册表：具名 agent = 后端 + model + 选项
+agents:
+  default-claude:
+    backend: claude
+  lead-agent:
+    backend: codex
+    model: gpt-5.6-terra
+    description: strong planner
+    maxTurns: 80
+  fast-worker:
+    backend: opencode
+    model: zhipuai-coding-plan/glm-5.2
+  careful-review:
+    backend: claude
+    model: claude-sonnet-5
+
+# 角色 → agent 名（未配置的角色回退 defaultAgent）
 roles:
-  lead: codex.terra
-  worker: opencode.deepseek/v4-flash
-  reviewer: opencode.glm52
-  integrator: codex.gpt-5.6-terra
+  lead: lead-agent
+  worker: fast-worker
+  reviewer: careful-review
+  integrator: lead-agent
 
 verification:
   allowedCommandPrefixes:
@@ -172,37 +190,18 @@ integration:
   allowedPaths:
     - specs/**
   runAgentAfterCherryPick: true
-
-adapters:
-  claude:
-    command: claude
-    extraArgs: []
-  codex:
-    command: codex
-    extraArgs: []
-  opencode:
-    command: opencode
-    extraArgs: []
 ```
 
-### 角色 Profile 与 model 配置
+### agents 注册表与角色解析
 
-Profile 格式为 `<cli>.<model>`，按第一个 `.` 切分，model 段可以包含 `.` 和 `/`：
-
-```text
-codex.gpt-5.6-terra          codex CLI + gpt-5.6-terra
-opencode.deepseek/v4-flash   opencode CLI + DeepSeek V4 Flash
-opencode.glm52               opencode CLI + models.glm52 别名 → z-ai/glm-5.2
-```
-
-- `roles.<role>` 未配置时回退 `defaultAdapter`（CLI 用 `adapters.<cli>.command`，model 用 `adapters.<cli>.model`，与旧配置完全兼容）。
-- 同一 CLI 可通过不同 profile 使用不同 model（如 worker 和 reviewer 都用 opencode 但各跑各的 model）。
-- Runner 直接复用本地已安装的 Agent CLI 切换 model（`--model` 传参），不涉及任何模型服务连接配置。
-- Lead 生成的任务级 `adapter` 字段仍最高优先：manifest 指定了 `task.adapter` 的任务使用该 CLI 的基础配置。
+- agent 条目即别名：`model` 绑定在唯一后端上，不再有全局别名表。
+- `roles.<role>` 支持注册表名，也支持内联 `backend.model` 规格（如 `-c roles.lead=codex.gpt-5.6-terra` 快速覆写）。
+- Lead 的 prompt 会注入 agents 注册表（人工筛选的能力清单）；任务可用 `agent` 字段点名更合适的 agent，plan 后立即校验。
+- 各后端真实可用的 model 由预检闭环保证（见下），注册表里的 model 必须真实存在。
 
 ### plan 时快照
 
-`plan` 成功后会把解析好的全量角色配置固化到 `runs.roles_json`。之后执行 `agent-team run <runId>` 使用快照，不受配置文件后续修改影响。需要人为强制改某个 run 的角色时，用 `-c roles.*=` 覆写（只更新被覆写的角色，其余保留快照）。
+`plan` 成功后会把角色绑定 + agents 注册表整体固化到 `runs.roles_json`。之后执行 `agent-team run <runId>` 使用快照，不受配置文件后续修改影响。需要人为强制改某个 run 的角色时，用 `-c roles.*=` 覆写（只更新被覆写的角色，其余保留快照）。
 
 ### 命令行覆写 `-c`
 
@@ -210,25 +209,21 @@ opencode.glm52               opencode CLI + models.glm52 别名 → z-ai/glm-5.2
 
 ```bash
 agent-team launch specs/goals/order-export.md \
-  -c roles.lead=codex.terra \
-  -c roles.reviewer=opencode.glm52 \
+  -c roles.lead=lead-agent \
+  -c roles.reviewer=careful-review \
   -c concurrency=5
 ```
 
-### Profile 预检
+### 预检闭环（model 可用性验证）
 
-`plan` / `launch` / `run` 启动前会做预检，`doctor` 展示完整结果：
+`plan` / `launch` / `run` 启动前会做预检，`doctor` 展示完整结果，`doctor --probe` 强制真实试跑：
 
-- profile 语法和 cli 名称校验（如 `badcli.foo` 直接报错）
-- CLI 本地可用性（`<command> --version`）
-- opencode 的 model 通过 `opencode models` 权威列表校验，未列出 → 阻止启动
-- codex 的 model 通过 `~/.codex/config.toml`（或 `$CODEX_HOME/config.toml`）静态校验：
-  - `provider/model` 形式：provider 必须在 `[model_providers.<id>]` 中声明，且 `env_key` 对应的环境变量已设置，否则阻止启动
-  - 裸 model 名：与顶层 `model` 或 `[profiles.<name>]` 的 model 一致则放行；默认 provider 下的 OpenAI 命名（gpt、o、codex 前缀，含 config 缺失时）也放行；其余无法枚举，只输出 warning
-- claude 的 model 通过 `~/.claude/settings.json`（或 `$CLAUDE_CONFIG_DIR/settings.json`）静态校验：
-  - 与 settings 的 `model` 或 `env.ANTHROPIC_MODEL` 一致 → 放行；`claude-*` 默认模型族命名 → 放行
-  - 配置了 `ANTHROPIC_BASE_URL` 网关时，其他 model 只输出 warning（网关后无清单可查）
-  - 既非 claude 命名、无网关、也未在 settings 声明 → 阻止启动（如 `claude.glm5.2` 但没配网关）
+- 后端 `discover()`：安装 / 版本 / 认证状态（未安装或未登录 → 阻止启动）
+- 后端 `listModels()`：枚举本地登录真实可用的 model（claude `supportedModels()`、codex `model/list`、opencode `/config/providers`）
+- 注册表里的 model 不在清单 → 默认阻止启动；此时触发 `probe()`（1-token 真实试跑）仲裁：试跑成功则放行并提示（网关 / 自定义 provider 模型），失败报具体错误
+- probe 结果按 (backend, model, backendVersion) 持久缓存于 `.agent-team/preflight-cache.json`，CLI 升级自动失效
+
+不再解析 `~/.codex/config.toml` 或 `~/.claude/settings.json` 之类 dotfile 来"猜测"可用性。
 
 ### 验证命令安全策略
 
@@ -277,10 +272,10 @@ Lead 只能生成以 `allowedCommandPrefixes` 开头的验证命令。Runner 还
 ```bash
 agent-team plan specs/goals/order-export.md \
   --run-id order-export \
-  --adapter claude
+  --agent careful-review
 ```
 
-`--adapter` 设置全局回退 CLI；角色配置了 `roles.<role>` 时 profile 优先。
+`--agent` 设置全局缺省 agent（agents 注册表名）；角色配置了 `roles.<role>` 时优先。
 
 输出：
 
@@ -302,7 +297,7 @@ agent-team run order-export
 ```bash
 agent-team launch specs/goals/order-export.md \
   --run-id order-export \
-  --adapter codex
+  --agent lead-agent
 ```
 
 ### 后台无人值守运行
@@ -331,7 +326,11 @@ tail -f .agent-team/runs/order-export/logs/integration-verification.log
 agent-team stop order-export
 ```
 
-停止会向当前记录的 Agent PID 发送 `SIGTERM`，并把任务保留为可恢复状态，不删除 Worktree。
+停止会终止 detached runner 进程（其信号处理器释放共享后端子进程）与仍有 pid 记录的旧任务进程，并把任务保留为可恢复状态，不删除 Worktree。
+
+## Worker 生命周期
+
+**每任务、每次尝试都是全新会话**。重试时 prompt 会注入厚重试上下文（当前 git diff + reviewer 反馈原文 + 上次 worker summary）——**worktree 是记忆载体，仓库是长期记忆**：任务间共享知识靠 Integrator 更新的 specs 文档，不靠会话记忆（会话记忆会腐烂、跨任务污染、且与 worktree/cwd 绑定冲突）。`AgentSession` 接口保留 resume 能力（三后端原生支持），留作未来实验开关。
 
 ## 完成判定
 
@@ -382,46 +381,34 @@ Runner 重启时，会把遗留的 `running`、`verifying` 和 `reviewing` 任�
 - 下游自己的修改仍然可以单独审查和提交
 - 最终 Integrator 只需 cherry-pick 每个任务自己的提交
 
-## Adapter 行为
+## 后端与授权闭环
 
-### Claude Code
+三个后端统一实现 `AgentBackend` 接口（`discover` / `listModels` / `probe` / `openSession`），会话统一产生事件流（消息、工具调用、权限裁决、用量），结构化输出走各后端原生通道：
 
-使用：
+| 后端 | 集成方式 | 结构化输出 | 权限闭环 |
+|---|---|---|---|
+| claude | `@anthropic-ai/claude-agent-sdk` | `outputFormat: json_schema` | `canUseTool` 回调实时裁决 Bash/Edit/Write |
+| codex | 直连 `codex app-server`（JSON-RPC/stdio，常驻复用） | `turn/start` 的 `outputSchema` | `item/*/requestApproval` 审批请求 → Runner 应答 accept/decline |
 
-```text
-claude -p
---output-format stream-json
---json-schema
---permission-mode dontAsk / acceptEdits
---allowedTools
+**codex 协议升级流程**：app-server 协议是 experimental 的，vendored 类型（`src/agent/codex/protocol/`）是针对 `GENERATED_FROM` 记录的版本生成的快照，`agent/codex/` 传输代码窄类型导入其中实际消费的类型。codex 升级后：
+
+```bash
+npm run gen:codex   # 重新生成类型 + 写入 GENERATED_FROM 版本标记
+npm run check       # 上游破坏性变更在这里变成编译错误，改完即兼容
 ```
 
-Lead 和 Reviewer 使用只读工具；Worker 和 Integrator允许编辑，并只预批准配置中的验证命令前缀和只读 Git 命令。
+`agent-team doctor` 会比对 `GENERATED_FROM` 与实际安装的 CLI 版本，不一致时提示重新生成。终局方案是等 `@openai/codex-sdk` 补齐审批回调与 model 枚举后切回 SDK（`AgentBackend` 接口即为切换预留）。
+| opencode | 受管 `opencode serve` + `@opencode-ai/sdk` | `format: json_schema`（+ prompt 内嵌兜底） | SSE 权限事件 → Runner 应答 once/reject |
 
-### Codex
+权限的唯一事实来源是 `src/core/policy.ts`：角色 → `{fs, bash 前缀, network}` 规格，编译到各后端原生控制；同一套纯函数同时被事后机械验证器使用。三级执行：
 
-使用：
+1. OS 级 sandbox（codex `sandboxPolicy`，workspace-write 默认断网）
+2. 工具调用时实时裁决（拒绝原因会返回给模型，避免反复重试）
+3. 事后机械验证（HEAD 校验、路径检查、命令重跑）
 
-```text
-codex exec
---json
---sandbox read-only / workspace-write
---ask-for-approval never
---output-schema
-```
+已知不对称（诚实记录）：codex 的 sandbox 粒度是根目录而非 glob，任务级 `allowedPaths` 的精细约束在 codex 上由事后验证器兜底；opencode 的模型侧错误（如 provider 401）会以明确错误终止该次尝试。
 
-### OpenCode
-
-使用：
-
-```text
-opencode run
---format json
---agent plan / build
---auto
-```
-
-OpenCode CLI 当前不由 Runner 强制 JSON Schema，因此 Prompt 会附带 Schema，Runner随后仍执行本地结构校验。
+环境变量默认净化：只传 PATH/HOME/LANG 等基础变量和后端认证变量，防止把父进程全部秘密泄漏给能执行命令的 agent。
 
 ## 安全边界
 
@@ -452,19 +439,37 @@ npm test
 当前包含：
 
 - DAG 校验和拓扑排序
-- 路径 Glob 策略
-- blocked path 优先级
+- 路径 Glob 策略与 blocked 优先级
 - 验证命令安全解析
-- SQLite 状态持久化
-- Agent Profile 解析（别名、回退、快照）
+- 权限策略决策表（前缀命令、glob 路径、网络、只读角色）
+- 三后端 policy 编译（含 claude allowedTools 防 shadow 回归守卫）
+- 监督器全生命周期（fake 后端：成功 / 超时 / 静默 / 传输异常 / 中断）
+- codex JSON-RPC 帧编解码
+- probe 缓存（TTL / 版本隔离）
+- agents 注册表解析、v1 配置迁移、快照兼容
 - YAML 配置加载与 `-c` 覆写
+- SQLite 状态持久化
+
+真实后端集成测试分两层（npm script 已带 `--test-force-exit`，见下）：
+
+```bash
+npm run test:protocol      # 协议层：discover / model 枚举 / app-server 握手 / thread 生命周期 / opencode serve 启动
+                           # 不做任何模型调用——无 token 消耗；codex 升级后先跑这层
+npm run test:integration   # 全会话层：真实推理（claude 权限矩阵 spike + codex/opencode 完整 turn）
+                           # 需要各 CLI 的本地登录，消耗配额
+```
+
+`--test-force-exit` 说明：dispose 后事件循环已被证明排干（handles/requests 均空），但 node:test 的测试子进程在此场景下偶发不触发退出——用官方 flag 收尾，不影响失败检测。opencode 全会话额外需要 `AGENT_TEAM_OPENCODE_SPIKE=1`（本机 provider 挂起，纯 SDK 复现，非集成问题）。
 
 ## 目录结构
 
 ```text
 src/
-  adapters/          Agent CLI Adapter
-  core/              SQLite、Git、状态、Prompt、校验和编排
+  agent/             后端层：types / supervise / registry / fake
+    claude/          Agent SDK 传输 + policy 编译
+    codex/           app-server JSON-RPC 客户端 + policy 编译 + protocol/（生成的协议类型）
+    opencode/        serve + SDK 传输 + policy 编译
+  core/              SQLite、Git、状态、Prompt、校验、编排、policy、preflight
 skills/
   team-lead/
   team-worker/

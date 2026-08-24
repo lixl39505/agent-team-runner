@@ -2,7 +2,6 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type {
-  AdapterName,
   RunRecord,
   RunStatus,
   TaskRecord,
@@ -21,7 +20,7 @@ function mapRun(row: Record<string, unknown>): RunRecord {
     goalFile: String(row.goal_file),
     baseRef: String(row.base_ref),
     baseSha: String(row.base_sha),
-    adapter: String(row.adapter) as AdapterName,
+    adapter: String(row.adapter),
     status: String(row.status) as RunStatus,
     manifestJson: row.manifest_json === null ? null : String(row.manifest_json),
     rolesJson: row.roles_json === null || row.roles_json === undefined ? null : String(row.roles_json),
@@ -147,7 +146,7 @@ export class StateDatabase {
     goalFile: string;
     baseRef: string;
     baseSha: string;
-    adapter: AdapterName;
+    adapter: string;
   }): void {
     const timestamp = now();
     this.db.prepare(`

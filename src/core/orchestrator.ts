@@ -1,7 +1,6 @@
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import type {
-  AdapterName,
   IntegrationResult,
   ReviewResult,
   RunManifest,
@@ -10,9 +9,11 @@ import type {
   TaskSpec,
   WorkerResult
 } from './types.js';
+import type { AgentBackend, AgentEvent } from '../agent/types.js';
 import { StateDatabase } from './db.js';
-import { createAdapter } from '../adapters/index.js';
-import { resolveRoleWithSnapshot } from './profiles.js';
+import { buildBackends, disposeBackends, resolveAgentWithSnapshot, resolveTaskAgent } from '../agent/registry.js';
+import { runAgent } from '../agent/supervise.js';
+import { integratorPolicy, readOnlyPolicy, workerPolicy } from './policy.js';
 import {
   INTEGRATION_SCHEMA,
   REVIEW_SCHEMA,
@@ -32,6 +33,7 @@ import {
   createWorktree,
   currentHead,
   git,
+  resetWorktree,
   stageAll,
   unstageAll
 } from './git.js';
@@ -67,6 +69,15 @@ export async function runOrchestrator(input: {
   db.updateRun(runId, { status: 'running', error: null, finishedAt: null });
   db.addEvent(runId, null, 'RUN_STARTED');
 
+  // 后端进程池：整个 run 共享（codex app-server / opencode serve 常驻复用）
+  const backends = buildBackends(config);
+  // 信号兜底：detached 的后端子进程（app-server 等）不会随父进程退出，显式清理
+  const onSignal = (): void => {
+    disposeBackends(backends);
+    process.exit(0);
+  };
+  process.once('SIGTERM', onSignal);
+  process.once('SIGINT', onSignal);
   const active = new Map<string, Promise<void>>();
   try {
     while (true) {
@@ -87,7 +98,7 @@ export async function runOrchestrator(input: {
       }).slice(0, slots);
 
       for (const candidate of candidates) {
-        const promise = executeTask({ config, db, runId, record: candidate })
+        const promise = executeTask({ config, db, runId, backends, record: candidate })
           .catch((error) => {
             db.updateTask(runId, candidate.taskId, {
               status: 'failed', phase: 'exception', pid: null, lastError: String(error), finishedAt: new Date().toISOString()
@@ -109,13 +120,16 @@ export async function runOrchestrator(input: {
       }
     }
 
-    await integrateRun({ config, db, runId });
+    await integrateRun({ config, db, runId, backends });
   } catch (error) {
     db.updateRun(runId, { status: 'failed', error: String(error), finishedAt: new Date().toISOString() });
     db.addEvent(runId, null, 'RUN_FAILED', { error: String(error) });
     throw error;
   } finally {
     await Promise.allSettled(active.values());
+    process.off('SIGTERM', onSignal);
+    process.off('SIGINT', onSignal);
+    disposeBackends(backends);
     run = db.getRun(runId);
     if (run.status === 'done') db.addEvent(runId, null, 'RUN_COMPLETED');
   }
@@ -125,45 +139,61 @@ async function executeTask(input: {
   config: RunnerConfig;
   db: StateDatabase;
   runId: string;
+  backends: Record<string, AgentBackend>;
   record: TaskRecord;
 }): Promise<void> {
-  const { config, db, runId } = input;
+  const { config, db, runId, backends } = input;
   let record = db.getTask(runId, input.record.taskId);
   const task = taskSpec(record);
   const run = db.getRun(runId);
   const runDir = join(config.stateDir, 'runs', runId);
-  // Worker：Lead manifest 的 task.adapter 优先，否则用 plan 时固化的角色快照（回退当前 config）
-  const workerProfile = resolveRoleWithSnapshot('worker', config, run.rolesJson);
-  const adapterName: AdapterName = task.adapter ?? workerProfile.cli;
-  const adapter = createAdapter(adapterName, config, task.adapter ? undefined : workerProfile.model);
+  // Worker：Lead manifest 的 task.agent 优先（连带 model），否则用 plan 时固化的角色快照（回退当前 config）
+  const workerBinding = resolveTaskAgent(task, config, run.rolesJson);
   const worktreeInfo = await ensureTaskWorktree({ config, db, runId, record, task, manifest: parseManifest(run.manifestJson) });
   record = db.getTask(runId, task.id);
   const attempts = record.attempts + 1;
   db.updateTask(runId, task.id, { status: 'running', phase: 'worker', attempts, pid: null });
   db.addEvent(runId, task.id, 'WORKER_STARTED', {
     attempts,
-    adapter: adapterName,
-    model: task.adapter ? undefined : workerProfile.model
+    agent: workerBinding.agent,
+    backend: workerBinding.backend,
+    model: workerBinding.model
   });
 
   const outputPath = join(runDir, 'results', `${task.id}-worker-${attempts}.json`);
   const logPath = join(runDir, 'logs', `${task.id}-worker-${attempts}.log`);
-  let lastHeartbeatWrite = 0;
-  const worker = await adapter.run<WorkerResult>({
-    role: 'worker', cwd: worktreeInfo.path,
-    prompt: workerPrompt({ task, startSha: worktreeInfo.startSha, runId, priorFeedback: record.lastError }),
-    schema: WORKER_SCHEMA, logPath, outputPath, timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs,
-    onPid: (pid) => db.updateTask(runId, task.id, { pid }),
-    onHeartbeat: () => {
-      if (Date.now() - lastHeartbeatWrite > 3000) {
-        lastHeartbeatWrite = Date.now();
-        db.updateTask(runId, task.id, { phase: 'worker-active' });
+  // 厚重试上下文：worktree 是记忆载体——重试时把 diff、reviewer 原文、上次 summary 注入 prompt，
+  // 会话本身保持全新（避免上下文腐烂与跨任务污染）
+  const retry = record.attempts > 0 || record.reviewCycles > 0
+    ? {
+        diff: await collectWorktreeDiff(worktreeInfo.path),
+        review: record.reviewJson ?? undefined,
+        previousSummary: readPreviousSummary(runDir, task.id, attempts - 1)
       }
+    : undefined;
+  let lastHeartbeatWrite = 0;
+  const onEvent = (event: AgentEvent): void => {
+    if (Date.now() - lastHeartbeatWrite > 3000) {
+      lastHeartbeatWrite = Date.now();
+      db.updateTask(runId, task.id, { phase: 'worker-active' });
     }
+  };
+  const worker = await runAgent<WorkerResult>({
+    backend: backends[workerBinding.backend]!,
+    spec: {
+      role: 'worker', cwd: worktreeInfo.path,
+      prompt: workerPrompt({ task, startSha: worktreeInfo.startSha, runId, worktreePath: worktreeInfo.path, priorFeedback: record.lastError, retry }),
+      schema: WORKER_SCHEMA,
+      ...(workerBinding.model !== undefined ? { model: workerBinding.model } : {}),
+      ...(workerBinding.maxTurns !== undefined ? { maxTurns: workerBinding.maxTurns } : {}),
+      policy: workerPolicy(task, config),
+      timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs,
+      onEvent
+    },
+    logPath, outputPath
   });
-  db.updateTask(runId, task.id, { pid: null });
-  if (worker.exitCode !== 0 || !worker.output) {
-    await retryOrFail({ config, db, runId, taskId: task.id, attempts, error: `Worker exited ${worker.exitCode}${worker.timedOut ? ' after timeout' : ''}${worker.stalled ? ' after becoming stale' : ''}` });
+  if (!worker.ok || !worker.output) {
+    await retryOrFail({ config, db, runId, taskId: task.id, attempts, error: `Worker failed: ${worker.error ?? 'no structured output'}${worker.timedOut ? ' (timeout)' : ''}${worker.stalled ? ' (stalled)' : ''}` });
     return;
   }
   const workerResult = validateWorkerResult(worker.output);
@@ -194,19 +224,22 @@ async function executeTask(input: {
   const reviewOutput = join(runDir, 'reviews', `${task.id}-review-${reviewCycle}.json`);
   const reviewHeadBefore = await currentHead(worktreeInfo.path);
   const reviewStatusBefore = (await git(worktreeInfo.path, ['status', '--porcelain=v1', '-z'])).stdout;
-  // Reviewer 独立解析角色 profile（plan 快照优先），不再复用 Worker 的 adapter 实例
-  const reviewerProfile = resolveRoleWithSnapshot('reviewer', config, run.rolesJson);
-  const reviewerAdapter = createAdapter(reviewerProfile.cli, config, reviewerProfile.model);
-  const reviewRun = await reviewerAdapter.run<ReviewResult>({
-    role: 'reviewer', cwd: worktreeInfo.path,
-    prompt: reviewerPrompt({ task, startSha: worktreeInfo.startSha, workerResult }),
-    schema: REVIEW_SCHEMA,
+  // Reviewer 独立解析角色绑定（plan 快照优先），不复用 Worker 的会话
+  const reviewerBinding = resolveAgentWithSnapshot('reviewer', config, run.rolesJson);
+  const reviewRun = await runAgent<ReviewResult>({
+    backend: backends[reviewerBinding.backend]!,
+    spec: {
+      role: 'reviewer', cwd: worktreeInfo.path,
+      prompt: reviewerPrompt({ task, startSha: worktreeInfo.startSha, worktreePath: worktreeInfo.path, workerResult }),
+      schema: REVIEW_SCHEMA,
+      ...(reviewerBinding.model !== undefined ? { model: reviewerBinding.model } : {}),
+      ...(reviewerBinding.maxTurns !== undefined ? { maxTurns: reviewerBinding.maxTurns } : {}),
+      policy: readOnlyPolicy(),
+      timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs
+    },
     logPath: join(runDir, 'logs', `${task.id}-review-${reviewCycle}.log`),
-    outputPath: reviewOutput,
-    timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs,
-    onPid: (pid) => db.updateTask(runId, task.id, { pid })
+    outputPath: reviewOutput
   });
-  db.updateTask(runId, task.id, { pid: null });
   const reviewHeadAfter = await currentHead(worktreeInfo.path);
   const reviewStatusAfter = (await git(worktreeInfo.path, ['status', '--porcelain=v1', '-z'])).stdout;
   if (reviewHeadAfter !== reviewHeadBefore || reviewStatusAfter !== reviewStatusBefore) {
@@ -214,9 +247,9 @@ async function executeTask(input: {
     await retryOrFail({ config, db, runId, taskId: task.id, attempts, error: 'Reviewer modified Git state or files; review must be read-only.' });
     return;
   }
-  if (reviewRun.exitCode !== 0 || !reviewRun.output) {
+  if (!reviewRun.ok || !reviewRun.output) {
     await unstageAll(worktreeInfo.path);
-    await retryOrFail({ config, db, runId, taskId: task.id, attempts, error: `Reviewer exited ${reviewRun.exitCode}` });
+    await retryOrFail({ config, db, runId, taskId: task.id, attempts, error: `Reviewer failed: ${reviewRun.error ?? 'no structured output'}` });
     return;
   }
   const review = validateReviewResult(reviewRun.output);
@@ -238,6 +271,35 @@ async function executeTask(input: {
     status: 'approved', phase: 'done', commitSha, lastError: null, finishedAt: new Date().toISOString()
   });
   db.addEvent(runId, task.id, 'TASK_APPROVED', { commitSha, review, workerResult });
+}
+
+/** 收集 worktree 当前未提交改动（status + 未跟踪文件清单 + diff），供厚重试上下文注入 */
+async function collectWorktreeDiff(worktree: string): Promise<string> {
+  try {
+    const status = await git(worktree, ['status', '--porcelain=v1']);
+    const diff = await git(worktree, ['diff']);
+    const untracked = status.stdout.split('\n').filter((line) => line.startsWith('??')).map((line) => line.slice(3));
+    return [
+      `# git status (porcelain)\n${status.stdout.trim()}`,
+      untracked.length > 0 ? `# untracked files\n${untracked.join('\n')}` : '',
+      `# git diff\n${diff.stdout.trim()}`
+    ].filter(Boolean).join('\n\n');
+  } catch {
+    return '';
+  }
+}
+
+/** 读取上一次 worker 结果的 summary（文件缺失或损坏时静默省略） */
+function readPreviousSummary(runDir: string, taskId: string, previousAttempt: number): string | undefined {
+  if (previousAttempt < 1) return undefined;
+  const path = join(runDir, 'results', `${taskId}-worker-${previousAttempt}.json`);
+  if (!existsSync(path)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as { summary?: unknown };
+    return typeof parsed.summary === 'string' ? parsed.summary : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function retryOrFail(input: {
@@ -310,6 +372,7 @@ async function integrateRun(input: {
   config: RunnerConfig;
   db: StateDatabase;
   runId: string;
+  backends: Record<string, AgentBackend>;
 }): Promise<void> {
   const { config, db, runId } = input;
   const run = db.getRun(runId);
@@ -319,11 +382,11 @@ async function integrateRun(input: {
   const repoName = safeSegment(basename(config.repoRoot));
   const worktree = join(config.worktreesDir, repoName, safeSegment(runId), 'integration');
   const branch = `${config.branchPrefix}/${safeSegment(runId)}/integration`;
-  await createWorktree({ repoRoot: config.repoRoot, path: worktree, branch, baseSha: run.baseSha });
+  await resetWorktree({ repoRoot: config.repoRoot, path: worktree, branch, baseSha: run.baseSha });
   db.updateRun(runId, { integrationBranch: branch, integrationWorktree: worktree });
   const runDir = join(config.stateDir, 'runs', runId);
-  const integratorProfile = resolveRoleWithSnapshot('integrator', config, run.rolesJson);
-  const adapter = createAdapter(integratorProfile.cli, config, integratorProfile.model);
+  const integratorBinding = resolveAgentWithSnapshot('integrator', config, run.rolesJson);
+  const integratorBackend = input.backends[integratorBinding.backend]!;
 
   for (const task of topologicalTasks(manifest.tasks)) {
     const record = db.getTask(runId, task.id);
@@ -332,15 +395,21 @@ async function integrateRun(input: {
     if (picked.code === 0) continue;
     const conflicts = await conflictedFiles(worktree);
     if (conflicts.length === 0) throw new Error(`Cherry-pick failed for ${task.id}: ${picked.stderr}`);
-    const conflictResult = await adapter.run<IntegrationResult>({
-      role: 'integrator', cwd: worktree,
-      prompt: integrationPrompt({ manifest, integrationAllowedPaths: config.integration.allowedPaths, mode: 'resolve_conflict', conflictFiles: conflicts }),
-      schema: INTEGRATION_SCHEMA,
+    const conflictResult = await runAgent<IntegrationResult>({
+      backend: integratorBackend,
+      spec: {
+        role: 'integrator', cwd: worktree,
+        prompt: integrationPrompt({ manifest, integrationAllowedPaths: config.integration.allowedPaths, mode: 'resolve_conflict', worktreePath: worktree, conflictFiles: conflicts }),
+        schema: INTEGRATION_SCHEMA,
+        ...(integratorBinding.model !== undefined ? { model: integratorBinding.model } : {}),
+        ...(integratorBinding.maxTurns !== undefined ? { maxTurns: integratorBinding.maxTurns } : {}),
+        policy: integratorPolicy('resolve_conflict', config, conflicts),
+        timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs
+      },
       logPath: join(runDir, 'logs', `integration-conflict-${task.id}.log`),
-      outputPath: join(runDir, 'results', `integration-conflict-${task.id}.json`),
-      timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs
+      outputPath: join(runDir, 'results', `integration-conflict-${task.id}.json`)
     });
-    if (conflictResult.exitCode !== 0 || !conflictResult.output) {
+    if (!conflictResult.ok || !conflictResult.output) {
       await abortCherryPick(worktree);
       throw new Error(`Integrator failed to resolve conflict for ${task.id}`);
     }
@@ -366,15 +435,21 @@ async function integrateRun(input: {
 
   await runGlobalVerification({ worktree, config, logPath: join(runDir, 'logs', 'integration-verification.log') });
   if (config.integration.runAgentAfterCherryPick) {
-    const integrationRun = await adapter.run<IntegrationResult>({
-      role: 'integrator', cwd: worktree,
-      prompt: integrationPrompt({ manifest, integrationAllowedPaths: config.integration.allowedPaths, mode: 'finalize' }),
-      schema: INTEGRATION_SCHEMA,
+    const integrationRun = await runAgent<IntegrationResult>({
+      backend: integratorBackend,
+      spec: {
+        role: 'integrator', cwd: worktree,
+        prompt: integrationPrompt({ manifest, integrationAllowedPaths: config.integration.allowedPaths, mode: 'finalize', worktreePath: worktree }),
+        schema: INTEGRATION_SCHEMA,
+        ...(integratorBinding.model !== undefined ? { model: integratorBinding.model } : {}),
+        ...(integratorBinding.maxTurns !== undefined ? { maxTurns: integratorBinding.maxTurns } : {}),
+        policy: integratorPolicy('finalize', config),
+        timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs
+      },
       logPath: join(runDir, 'logs', 'integrator.log'),
-      outputPath: join(runDir, 'results', 'integrator.json'),
-      timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs
+      outputPath: join(runDir, 'results', 'integrator.json')
     });
-    if (integrationRun.exitCode !== 0 || !integrationRun.output) throw new Error('Integrator finalization failed');
+    if (!integrationRun.ok || !integrationRun.output) throw new Error(`Integrator finalization failed: ${integrationRun.error ?? 'no structured output'}`);
     const integrationResult = validateIntegrationResult(integrationRun.output);
     if (integrationResult.status !== 'completed') throw new Error(integrationResult.blockedReason ?? integrationResult.summary);
     const files = await changedFiles(worktree);

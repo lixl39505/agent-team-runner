@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { appendFileSync, mkdirSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
@@ -11,9 +11,12 @@ import { planRun } from './core/planner.js';
 import { runOrchestrator } from './core/orchestrator.js';
 import { formatRunStatus } from './core/status.js';
 import { execFile, ensureGitRepo } from './core/git.js';
-import { snapshotRoles, validateProfiles } from './core/profiles.js';
-import { checkProfileAvailability } from './core/preflight.js';
-import type { AdapterName, ResolvedProfile, RunnerConfig } from './core/types.js';
+import { buildBackends, disposeBackends, parseSnapshot, resolveAgentByName, snapshotAgents } from './agent/registry.js';
+import { generatedProtocolVersion } from './agent/codex/generated.js';
+import { backendCommand, validateAgents } from './core/agent-config.js';
+import { checkAgentAvailability, probeAll } from './core/preflight.js';
+import { terminateTree } from './core/proctree.js';
+import type { AgentBinding, RunnerConfig } from './core/types.js';
 
 const argv = process.argv.slice(2);
 const command = argv.shift();
@@ -62,15 +65,20 @@ function database(repoRoot: string): { config: RunnerConfig; db: StateDatabase }
   return { config, db: new StateDatabase(join(config.stateDir, 'state.sqlite')) };
 }
 
-async function preflight(config: RunnerConfig, profiles: ResolvedProfile[], validateSyntax: boolean): Promise<void> {
+async function preflight(config: RunnerConfig, bindings: AgentBinding[], validateSyntax: boolean): Promise<void> {
   if (validateSyntax) {
-    const syntax = validateProfiles(config);
-    if (!syntax.ok) throw new Error(`Invalid agent profile config:\n  - ${syntax.errors.join('\n  - ')}`);
+    const syntax = validateAgents(config);
+    if (!syntax.ok) throw new Error(`Invalid agent config:\n  - ${syntax.errors.join('\n  - ')}`);
   }
-  const availability = await checkProfileAvailability(config, profiles);
-  for (const warning of availability.warnings) console.error(`warning: ${warning}`);
-  if (!availability.ok) {
-    throw new Error(`Agent profile preflight failed:\n  - ${availability.errors.join('\n  - ')}`);
+  const backends = buildBackends(config);
+  try {
+    const availability = await checkAgentAvailability({ config, backends, bindings });
+    for (const warning of availability.warnings) console.error(`warning: ${warning}`);
+    if (!availability.ok) {
+      throw new Error(`Agent preflight failed:\n  - ${availability.errors.join('\n  - ')}`);
+    }
+  } finally {
+    disposeBackends(backends);
   }
 }
 
@@ -102,25 +110,59 @@ async function main(): Promise<void> {
 
   if (command === 'doctor') {
     const repoRoot = repoOption();
+    const forceProbe = flag('--probe');
     const { config, db } = database(repoRoot);
     try {
       await ensureGitRepo(config.repoRoot);
       console.log(`Node: ${process.version}`);
       console.log(`Repository: ${config.repoRoot}`);
       console.log(`State DB: ${join(config.stateDir, 'state.sqlite')}`);
-      for (const [name, adapter] of Object.entries(config.adapters)) {
-        const result = await execFile(adapter.command, ['--version'], config.repoRoot).catch((error) => ({ code: 127, stdout: '', stderr: String(error) }));
-        console.log(`${name}: ${result.code === 0 ? result.stdout.trim() || 'available' : `unavailable (${result.stderr.trim()})`}`);
+      const backends = buildBackends(config);
+      try {
+        console.log('Backends:');
+        const generatedCodex = generatedProtocolVersion();
+        for (const [name, backend] of Object.entries(backends)) {
+          const discovery = await backend.discover();
+          const label = discovery.installed
+            ? `${discovery.version ?? 'available'}${discovery.authed === false ? ' (not authenticated)' : ''}`
+            : `unavailable${discovery.detail ? ` (${discovery.detail})` : ''}`;
+          console.log(`  ${name}: ${label}`);
+          // 协议类型新鲜度：app-server 协议是 experimental，类型快照必须与实际 CLI 版本一致
+          if (name === 'codex' && generatedCodex && discovery.version && discovery.version.trim() !== generatedCodex) {
+            console.log(`  warn: codex protocol types were generated for "${generatedCodex}" but installed CLI is "${discovery.version.trim()}"; run: npm run gen:codex && npm run check`);
+          }
+        }
+        const snapshot = snapshotAgents(config);
+        const syntax = validateAgents(config);
+        console.log('Models:');
+        for (const [name, backend] of Object.entries(backends)) {
+          try {
+            const models = await backend.listModels();
+            console.log(`  ${name}: ${models.length} models — ${models.slice(0, 6).map((model) => model.id).join(', ')}${models.length > 6 ? ', …' : ''}`);
+          } catch (error) {
+            console.log(`  ${name}: enumeration failed (${error instanceof Error ? error.message : String(error)})`);
+          }
+        }
+        console.log('Agents:');
+        for (const [name, entry] of Object.entries(config.agents)) {
+          console.log(`  ${name}: ${entry.backend}${entry.model ? ` (${entry.model})` : ''}`);
+        }
+        console.log('Roles:');
+        for (const [role, binding] of Object.entries(snapshot.roles)) {
+          console.log(`  ${role}: ${binding.agent} → ${binding.backend}${binding.model ? ` (${binding.model})` : ''} [${binding.source}]`);
+        }
+        const availability = await checkAgentAvailability({ config, backends, bindings: Object.values(snapshot.roles) });
+        for (const error of [...syntax.errors, ...availability.errors]) console.log(`  error: ${error}`);
+        for (const warning of [...syntax.warnings, ...availability.warnings]) console.log(`  warn: ${warning}`);
+        if (forceProbe) {
+          console.log('Probes:');
+          for (const result of await probeAll({ config, backends, bindings: Object.values(snapshot.roles) })) {
+            console.log(`  ${result.backend}${result.model ? `/${result.model}` : ''}: ${result.ok ? `ok (${result.latencyMs ?? 0}ms)` : `FAILED${result.error ? ` — ${result.error}` : ''}`}`);
+          }
+        }
+      } finally {
+        disposeBackends(backends);
       }
-      const roles = snapshotRoles(config);
-      const syntax = validateProfiles(config);
-      const availability = await checkProfileAvailability(config, Object.values(roles));
-      console.log('Roles:');
-      for (const [role, profile] of Object.entries(roles)) {
-        console.log(`  ${role}: ${profile.cli}${profile.model ? ` (${profile.model})` : ''} [${profile.source}]`);
-      }
-      for (const error of [...syntax.errors, ...availability.errors]) console.log(`  error: ${error}`);
-      for (const warning of availability.warnings) console.log(`  warn: ${warning}`);
     } finally {
       db.close();
     }
@@ -129,15 +171,15 @@ async function main(): Promise<void> {
 
   if (command === 'plan' || command === 'launch') {
     const goalFile = argv.shift();
-    if (!goalFile) throw new Error(`Usage: agent-team ${command} <goal-file> [--run-id ID] [--adapter claude|codex|opencode] [-c path=value] [--repo PATH]`);
+    if (!goalFile) throw new Error(`Usage: agent-team ${command} <goal-file> [--run-id ID] [--agent NAME] [-c path=value] [--repo PATH]`);
     const runId = option('--run-id');
-    const adapter = option('--adapter') as AdapterName | undefined;
+    const agent = option('--agent');
     const repoRoot = repoOption();
     const { config, db } = database(repoRoot);
-    if (adapter) config.defaultAdapter = adapter;
+    if (agent) config.defaultAgent = agent;
     try {
-      await preflight(config, Object.values(snapshotRoles(config)), true);
-      const id = await planRun({ config, db, goalFile, ...(runId ? { runId } : {}), ...(adapter ? { adapter } : {}) });
+      await preflight(config, Object.values(snapshotAgents(config).roles), true);
+      const id = await planRun({ config, db, goalFile, ...(runId ? { runId } : {}) });
       console.log(`Planned run: ${id}`);
       console.log(formatRunStatus(db.getRun(id), db.listTasks(id)));
       if (command === 'launch') await runOrchestrator({ config, db, runId: id });
@@ -176,29 +218,25 @@ async function main(): Promise<void> {
       const roleOverrides = configOverrides().filter(({ key }) => key === 'roles' || key.startsWith('roles.'));
       if (roleOverrides.length > 0) {
         const record = db.getRun(runId);
-        const base: Record<string, ResolvedProfile> = record.rolesJson
-          ? (JSON.parse(record.rolesJson) as Record<string, ResolvedProfile>)
-          : snapshotRoles(config);
-        const fresh: Record<string, ResolvedProfile> = snapshotRoles(config);
+        const base = parseSnapshot(record.rolesJson) ?? snapshotAgents(config);
+        const fresh = snapshotAgents(config);
         for (const { key } of roleOverrides) {
-          const role = key.split('.')[1];
-          if (role && role in fresh) base[role] = fresh[role]!;
+          const role = key.split('.')[1] as keyof typeof fresh.roles;
+          if (role && role in fresh.roles) base.roles[role] = fresh.roles[role]!;
         }
         db.updateRun(runId, { rolesJson: JSON.stringify(base) });
       }
       const run = db.getRun(runId);
-      const profiles: ResolvedProfile[] = run.rolesJson
-        ? Object.values(JSON.parse(run.rolesJson) as Record<string, ResolvedProfile>)
-        : Object.values(snapshotRoles(config));
+      const snapshot = parseSnapshot(run.rolesJson) ?? snapshotAgents(config);
+      const bindings: AgentBinding[] = [...Object.values(snapshot.roles)];
       if (run.manifestJson) {
-        const manifest = JSON.parse(run.manifestJson) as { tasks: { adapter?: AdapterName }[] };
+        const manifest = JSON.parse(run.manifestJson) as { tasks: { agent?: string }[] };
         for (const task of manifest.tasks) {
-          if (task.adapter && !profiles.some((profile) => profile.cli === task.adapter)) {
-            profiles.push({ cli: task.adapter, model: config.adapters[task.adapter].model, source: `task:${task.adapter}` });
-          }
+          if (!task.agent || bindings.some((binding) => binding.agent === task.agent)) continue;
+          bindings.push(resolveAgentByName(task.agent, config, snapshot.agents));
         }
       }
-      await preflight(config, profiles, false);
+      await preflight(config, bindings, false);
       await runOrchestrator({ config, db, runId });
       console.log(formatRunStatus(db.getRun(runId), db.listTasks(runId)));
     } finally {
@@ -247,11 +285,22 @@ async function main(): Promise<void> {
     const runId = argv.shift();
     if (!runId) throw new Error('Usage: agent-team stop <run-id> [--repo PATH]');
     const repoRoot = repoOption();
-    const { db } = database(repoRoot);
+    const { config, db } = database(repoRoot);
     try {
+      // SDK 后端的会话没有 per-task pid；杀掉 detached runner 进程，
+      // 其信号处理器会释放共享后端子进程（app-server / opencode serve）
+      const runnerLog = join(config.stateDir, 'runs', runId, 'runner.log');
+      try {
+        const log = readFileSync(runnerLog, 'utf8');
+        const match = log.match(/Detached runner pid=(\d+)/);
+        if (match) terminateTree(Number(match[1]), true);
+      } catch { /* 无 detach 日志 = 前台运行，无需杀 runner */ }
       for (const task of db.listTasks(runId)) {
         if (task.pid) {
-          try { process.kill(task.pid, 'SIGTERM'); } catch { /* already stopped */ }
+          // 兼容仍有 pid 记录的旧 run：杀整个进程组
+          terminateTree(task.pid, true);
+        }
+        if (['running', 'verifying', 'reviewing'].includes(task.status)) {
           db.updateTask(runId, task.taskId, { pid: null, status: 'changes_requested', phase: 'stopped', lastError: 'Stopped by user.' });
         }
       }
@@ -269,7 +318,7 @@ function printHelp(): void {
 
 Commands:
   init [repo]                         Initialize config and sync role skills
-  doctor [--repo PATH]               Check repository and agent CLIs
+  doctor [--repo PATH]               Check repository and agent backends
   skills sync [--repo PATH]          Mirror portable skills for Codex/OpenCode/Claude
   plan <goal.md> [options]           Ask Lead to create and validate a task DAG
   launch <goal.md> [options]         Plan and run end-to-end
@@ -281,9 +330,9 @@ Commands:
 Options:
   --repo PATH
   --run-id ID
-  --adapter claude|codex|opencode
+  --agent NAME                   Default agent (from the agents registry)
   -c <path>=<value>              Override any config key (repeatable), e.g.
-                                     -c roles.lead=codex.terra -c concurrency=5
+                                     -c roles.lead=lead-agent -c concurrency=5
                                  Priority: -c flags > config.yml > defaults
 `);
 }

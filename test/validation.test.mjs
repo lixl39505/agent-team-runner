@@ -65,3 +65,45 @@ test('rejects repository escaping paths', () => {
     tasks: [{ ...task('T001'), allowedPaths: ['../outside/**'] }]
   }), /escapes the repository/);
 });
+
+test('.git ownership is rejected in allowedPaths but allowed in blockedPaths', () => {
+  assert.throws(() => validateLeadResult({
+    version: 1,
+    title: 'git',
+    summary: 'git',
+    tasks: [{ ...task('T001'), allowedPaths: ['.git/**'] }]
+  }), /may not own .git paths/);
+  // blockedPaths 里的 .git/** 是纯增强限制（Lead 的防御性输出），应当接受
+  assert.doesNotThrow(() => validateLeadResult({
+    version: 1,
+    title: 'git',
+    summary: 'git',
+    tasks: [{ ...task('T001'), blockedPaths: ['.git/**', 'package.json'] }]
+  }));
+});
+
+test('validates per-task agent names against the registry', () => {
+  const withAgent = { ...task('T001'), agent: 'heavy' };
+  assert.doesNotThrow(() => validateLeadResult({
+    version: 1, title: 'agents', summary: 'agents', tasks: [withAgent]
+  }, ['heavy', 'light']));
+  assert.equal(validateLeadResult({
+    version: 1, title: 'agents', summary: 'agents', tasks: [withAgent]
+  }, ['heavy', 'light']).tasks[0].agent, 'heavy');
+  assert.throws(() => validateLeadResult({
+    version: 1, title: 'agents', summary: 'agents', tasks: [withAgent]
+  }, ['light']), /unknown agent "heavy"/);
+  // 未提供注册表时不校验成员关系（允许旧 manifest 读取路径）
+  assert.doesNotThrow(() => validateLeadResult({
+    version: 1, title: 'agents', summary: 'agents', tasks: [withAgent]
+  }));
+});
+
+test('rejects the deprecated task.adapter field', () => {
+  assert.throws(() => validateLeadResult({
+    version: 1,
+    title: 'legacy',
+    summary: 'legacy',
+    tasks: [{ ...task('T001'), adapter: 'codex' }]
+  }), /deprecated "adapter" field/);
+});
