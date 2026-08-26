@@ -1,10 +1,11 @@
 import { mkdirSync, readFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
-import type { LeadResult, RunnerConfig } from './types.js';
+import type { BackendId, LeadResult, RunnerConfig } from './types.js';
 import { StateDatabase } from './db.js';
 import { buildBackends, disposeBackends, resolveAgent, snapshotAgents } from '../agent/registry.js';
 import { runAgent } from '../agent/supervise.js';
 import type { ApprovalHandler, UserInputHandler } from '../agent/approval.js';
+import type { AgentBackend } from '../agent/types.js';
 import { agentList } from './agent-config.js';
 import { LEAD_SCHEMA, validateLeadResult } from './validation.js';
 import { ensureGitRepo, revParse } from './git.js';
@@ -23,6 +24,8 @@ export async function planRun(input: {
   runId?: string;
   requestApproval?: ApprovalHandler;
   requestUserInput?: UserInputHandler;
+  /** Test seam: production creates its own managed backend pool. */
+  backends?: Record<BackendId, AgentBackend>;
 }): Promise<string> {
   const repoRoot = input.config.repoRoot;
   await ensureGitRepo(repoRoot);
@@ -44,7 +47,7 @@ export async function planRun(input: {
   });
 
   try {
-    const backends = buildBackends(input.config);
+    const backends = input.backends ?? buildBackends(input.config);
     let manifest: LeadResult | null = null;
     let priorError = '';
     let interrupted = false;

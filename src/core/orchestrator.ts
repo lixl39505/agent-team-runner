@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import type {
+  BackendId,
   IntegrationResult,
   ReviewResult,
   RunManifest,
@@ -60,6 +61,8 @@ export async function runOrchestrator(input: {
   runId: string;
   requestApproval?: ApprovalHandler;
   requestUserInput?: UserInputHandler;
+  /** Test seam: production creates its own managed backend pool. */
+  backends?: Record<BackendId, AgentBackend>;
 }): Promise<void> {
   const { config, db, runId } = input;
   let run = db.getRun(runId);
@@ -72,7 +75,7 @@ export async function runOrchestrator(input: {
   db.addEvent(runId, null, 'RUN_STARTED');
 
   // 后端进程池：整个 run 共享（codex app-server / opencode serve 常驻复用）
-  const backends = buildBackends(config);
+  const backends = input.backends ?? buildBackends(config);
   // Child backends own process groups, so release them explicitly on terminal interruption.
   const active = new Map<string, Promise<void>>();
   const interruptedTasks = new Set<string>();
