@@ -2,6 +2,9 @@ import { join } from 'node:path';
 import type { AgentBackend } from '../agent/types.js';
 import type { AgentBinding, BackendId, RunnerConfig } from './types.js';
 import { ProbeCache } from './probe-cache.js';
+import { parseSnapshot, resolveAgentByName, snapshotAgents } from '../agent/registry.js';
+
+const DEFAULT_MODEL_CACHE_KEY = '<backend-default>';
 
 export interface PreflightResult {
   ok: boolean;
@@ -17,11 +20,24 @@ export interface PreflightInput {
   forceProbe?: boolean;
 }
 
+/** Collect the immutable role bindings and every task-level Agent selected by a manifest. */
+export function bindingsForRun(config: RunnerConfig, rolesJson: string | null, manifestJson: string | null): AgentBinding[] {
+  const snapshot = parseSnapshot(rolesJson) ?? snapshotAgents(config);
+  const bindings: AgentBinding[] = [...Object.values(snapshot.roles)];
+  if (!manifestJson) return bindings;
+  const manifest = JSON.parse(manifestJson) as { tasks: { agent?: string }[] };
+  for (const task of manifest.tasks) {
+    if (!task.agent || bindings.some((binding) => binding.agent === task.agent)) continue;
+    bindings.push(resolveAgentByName(task.agent, config, snapshot.agents));
+  }
+  return bindings;
+}
+
 /**
  * 预检闭环：
  * 1. discover() — 后端安装/版本/认证（未安装 = error）
  * 2. listModels() — 枚举本地可用 model（注册表里的 model 不在清单 = 默认 error）
- * 3. probe() — 1-token 真实试跑，仅用于：清单缺失时的仲裁（网关模型）、或 --probe 强制；
+ * 3. probe() — 1-token 真实试跑，验证后端默认模型和清单缺失时的显式模型；
  *    结果按 (backend, model, version) 持久缓存
  * 取代旧的 dotfile 静态解析（codex-config / claude-config 已删除）。
  */
@@ -71,19 +87,25 @@ export async function checkAgentAvailability(input: PreflightInput): Promise<Pre
     }
   }
 
-  // 每个 (backend, model) 校验
+  // 每个 (backend, model) 校验。默认模型没有可枚举的 ID，必须真实 probe。
   const seen = new Set<string>();
   for (const binding of input.bindings) {
-    if (!binding.model) continue; // 未指定 model → 用后端默认，无需校验
-    const key = `${binding.backend}|${binding.model}`;
+    const key = `${binding.backend}|${binding.model ?? DEFAULT_MODEL_CACHE_KEY}`;
     if (seen.has(key)) continue;
     seen.add(key);
     const listed = modelLists.get(binding.backend);
-    if (listed !== null && listed !== undefined && !listed.includes(binding.model)) {
-      const probe = await probeCached(input.backends[binding.backend]!, binding, versions.get(binding.backend), cache, input.forceProbe === true, warnings);
+    const mustProbe = binding.model === undefined || listed === null || (listed !== undefined && !listed.includes(binding.model));
+    if (mustProbe) {
+      const probe = await probeCached(
+        input.backends[binding.backend]!, binding, versions.get(binding.backend), cache,
+        input.forceProbe === true, warnings
+      );
       if (!probe.ok) {
-        errors.push(`agent "${binding.agent}": model "${binding.model}" is not available on backend "${binding.backend}"${probe.error ? `: ${probe.error}` : ''}`);
-      } else {
+        const target = binding.model === undefined ? 'default model' : `model "${binding.model}"`;
+        errors.push(`agent "${binding.agent}": ${target} is not available on backend "${binding.backend}"${probe.error ? `: ${probe.error}` : ''}`);
+      } else if (binding.model !== undefined && listed === null) {
+        warnings.push(`agent "${binding.agent}": model "${binding.model}" could not be enumerated but a live probe succeeded`);
+      } else if (binding.model !== undefined) {
         warnings.push(`agent "${binding.agent}": model "${binding.model}" is not in the backend's model list but a live probe succeeded (gateway/custom model?)`);
       }
     }
@@ -99,11 +121,12 @@ async function probeCached(
   force: boolean,
   warnings: string[]
 ): Promise<{ ok: boolean; error?: string | undefined }> {
-  const cached = force ? null : cache.get(backend.id, binding.model!, version);
+  const cacheModel = binding.model ?? DEFAULT_MODEL_CACHE_KEY;
+  const cached = force ? null : cache.get(backend.id, cacheModel, version);
   if (cached) return { ok: cached.ok, ...(cached.ok ? {} : { error: cached.error }) };
   try {
     const probe = await backend.probe(binding.model);
-    cache.set(backend.id, binding.model!, version, {
+    cache.set(backend.id, cacheModel, version, {
       ok: probe.ok,
       ...(probe.ok ? {} : { error: probe.error }),
       latencyMs: probe.latencyMs,
@@ -112,7 +135,7 @@ async function probeCached(
     return { ok: probe.ok, ...(probe.ok ? {} : { error: probe.error }) };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    warnings.push(`probe on ${backend.id}/${binding.model} crashed: ${message}`);
+    warnings.push(`probe on ${backend.id}/${binding.model ?? 'default'} crashed: ${message}`);
     return { ok: false, error: message };
   }
 }
@@ -123,21 +146,17 @@ export async function probeAll(input: PreflightInput): Promise<Array<{ agent: st
   const results: Array<{ agent: string; backend: string; model?: string | undefined; ok: boolean; error?: string | undefined; latencyMs?: number | undefined }> = [];
   const seen = new Set<string>();
   for (const binding of input.bindings) {
-    const key = `${binding.backend}|${binding.model ?? ''}`;
+    const key = `${binding.backend}|${binding.model ?? DEFAULT_MODEL_CACHE_KEY}`;
     if (seen.has(key)) continue;
     seen.add(key);
     const backend = input.backends[binding.backend];
     if (!backend) continue;
-    if (!binding.model) {
-      results.push({ agent: binding.agent, backend: binding.backend, ok: true });
-      continue;
-    }
     try {
       const probe = await backend.probe(binding.model);
-      cache.set(binding.backend, binding.model, undefined, { ok: probe.ok, ...(probe.ok ? {} : { error: probe.error }), latencyMs: probe.latencyMs, checkedAt: Date.now() });
-      results.push({ agent: binding.agent, backend: binding.backend, model: binding.model, ok: probe.ok, ...(probe.ok ? {} : { error: probe.error }), latencyMs: probe.latencyMs });
+      cache.set(binding.backend, binding.model ?? DEFAULT_MODEL_CACHE_KEY, undefined, { ok: probe.ok, ...(probe.ok ? {} : { error: probe.error }), latencyMs: probe.latencyMs, checkedAt: Date.now() });
+      results.push({ agent: binding.agent, backend: binding.backend, ...(binding.model !== undefined ? { model: binding.model } : {}), ok: probe.ok, ...(probe.ok ? {} : { error: probe.error }), latencyMs: probe.latencyMs });
     } catch (error) {
-      results.push({ agent: binding.agent, backend: binding.backend, model: binding.model, ok: false, error: error instanceof Error ? error.message : String(error) });
+      results.push({ agent: binding.agent, backend: binding.backend, ...(binding.model !== undefined ? { model: binding.model } : {}), ok: false, error: error instanceof Error ? error.message : String(error) });
     }
   }
   return results;

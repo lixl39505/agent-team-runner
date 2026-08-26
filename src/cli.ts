@@ -9,10 +9,10 @@ import { planRun } from './core/planner.js';
 import { runOrchestrator } from './core/orchestrator.js';
 import { formatRunStatus } from './core/status.js';
 import { execFile, ensureGitRepo } from './core/git.js';
-import { buildBackends, disposeBackends, parseSnapshot, resolveAgentByName, snapshotAgents } from './agent/registry.js';
+import { buildBackends, disposeBackends, parseSnapshot, snapshotAgents } from './agent/registry.js';
 import { generatedProtocolVersion } from './agent/codex/generated.js';
 import { backendCommand, validateAgents } from './core/agent-config.js';
-import { checkAgentAvailability, probeAll } from './core/preflight.js';
+import { bindingsForRun, checkAgentAvailability, probeAll } from './core/preflight.js';
 import type { AgentBinding, RunnerConfig } from './core/types.js';
 import { TerminalApprovalBroker } from './agent/approval.js';
 
@@ -187,6 +187,8 @@ async function main(): Promise<void> {
         console.log(`Planned run: ${id}`);
         console.log(formatRunStatus(db.getRun(id), db.listTasks(id)));
         if (command === 'launch') {
+          const run = db.getRun(id);
+          await preflight(config, bindingsForRun(config, run.rolesJson, run.manifestJson), false);
           await runOrchestrator({
             config, db, runId: id,
             requestApproval: approvals.request,
@@ -222,16 +224,7 @@ async function main(): Promise<void> {
         db.updateRun(runId, { rolesJson: JSON.stringify(base) });
       }
       const run = db.getRun(runId);
-      const snapshot = parseSnapshot(run.rolesJson) ?? snapshotAgents(config);
-      const bindings: AgentBinding[] = [...Object.values(snapshot.roles)];
-      if (run.manifestJson) {
-        const manifest = JSON.parse(run.manifestJson) as { tasks: { agent?: string }[] };
-        for (const task of manifest.tasks) {
-          if (!task.agent || bindings.some((binding) => binding.agent === task.agent)) continue;
-          bindings.push(resolveAgentByName(task.agent, config, snapshot.agents));
-        }
-      }
-      await preflight(config, bindings, false);
+      await preflight(config, bindingsForRun(config, run.rolesJson, run.manifestJson), false);
       const approvals = terminalApprovals();
       try {
         await runOrchestrator({

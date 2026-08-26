@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { checkAgentAvailability } from '../dist/core/preflight.js';
+import { bindingsForRun, checkAgentAvailability, probeAll } from '../dist/core/preflight.js';
 import { DEFAULT_CONFIG } from '../dist/core/config.js';
 import { FakeBackend } from '../dist/agent/fake.js';
 
@@ -27,4 +27,64 @@ test('preflight surfaces explicit sandbox degradation as a warning', async () =>
   const result = await checkAgentAvailability(input({ ok: true, degraded: true, detail: 'user opted into host permissions' }));
   assert.equal(result.ok, true);
   assert.deepEqual(result.warnings, ['backend "claude" platform isolation is degraded: user opted into host permissions']);
+});
+
+test('preflight probes an explicit model when enumeration fails', async () => {
+  const value = input({ ok: true, degraded: false, detail: 'sandbox ready' });
+  value.bindings = [{ agent: 'custom', backend: 'claude', model: 'custom-model', source: 'test' }];
+  const probes = [];
+  value.backends.claude.listModels = async () => { throw new Error('provider unavailable'); };
+  value.backends.claude.probe = async (model) => {
+    probes.push(model);
+    return { ok: true, latencyMs: 1 };
+  };
+
+  const result = await checkAgentAvailability(value);
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(probes, ['custom-model']);
+  assert.match(result.warnings.join('\n'), /model enumeration failed/);
+  assert.match(result.warnings.join('\n'), /live probe succeeded/);
+});
+
+test('preflight rejects an unavailable default model', async () => {
+  const value = input({ ok: true, degraded: false, detail: 'sandbox ready' });
+  const probes = [];
+  value.backends.claude.probe = async (model) => {
+    probes.push(model);
+    return { ok: false, error: 'authentication failed', latencyMs: 1 };
+  };
+
+  const result = await checkAgentAvailability(value);
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(probes, [undefined]);
+  assert.match(result.errors[0], /default model is not available.*authentication failed/);
+});
+
+test('doctor probe verifies the backend default model', async () => {
+  const value = input({ ok: true, degraded: false, detail: 'sandbox ready' });
+  const probes = [];
+  value.backends.claude.probe = async (model) => {
+    probes.push(model);
+    return { ok: false, error: 'default unavailable', latencyMs: 1 };
+  };
+
+  const result = await probeAll(value);
+
+  assert.deepEqual(probes, [undefined]);
+  assert.deepEqual(result, [{ agent: 'test', backend: 'claude', ok: false, error: 'default unavailable', latencyMs: 1 }]);
+});
+
+test('run bindings include manifest task-level agents', () => {
+  const config = {
+    ...DEFAULT_CONFIG,
+    agents: {
+      'default-claude': { backend: 'claude' },
+      specialist: { backend: 'codex', model: 'gpt-5.6-terra' }
+    }
+  };
+  const bindings = bindingsForRun(config, null, JSON.stringify({ tasks: [{ agent: 'specialist' }] }));
+
+  assert.equal(bindings.some((binding) => binding.agent === 'specialist' && binding.backend === 'codex'), true);
 });
