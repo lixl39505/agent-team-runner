@@ -63,6 +63,8 @@ export class OpenCodeBackend implements AgentBackend {
   private serverChild: ChildProcess | null = null;
   private readonly sessions = new Map<string, OpenCodeAgentSession>();
   private subscribed = false;
+  private subscribePromise: Promise<void> | null = null;
+  private reconnectTimer: NodeJS.Timeout | null = null;
   /** SSE 事件流：dispose 时必须终结，否则打开的 fetch 连接会钉住事件循环（进程无法退出） */
   private eventStream: AsyncGenerator<unknown> | null = null;
   private readonly platform: NodeJS.Platform;
@@ -172,6 +174,14 @@ export class OpenCodeBackend implements AgentBackend {
       () => this.sessions.delete(sessionId)
     );
     this.sessions.set(sessionId, session);
+    // SSE may have ended between session.create and registration. Do not run a
+    // prompt without its permission/event channel.
+    try {
+      await this.ensureSubscribed(client);
+    } catch (error) {
+      await session.close();
+      throw error;
+    }
     spec.onEvent?.({ type: 'session', sessionId });
     return session;
   }
@@ -225,11 +235,14 @@ export class OpenCodeBackend implements AgentBackend {
   dispose(): void {
     for (const session of [...this.sessions.values()]) void session.interrupt();
     this.sessions.clear();
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
     // 终结 SSE 订阅流，释放其底层连接
     if (this.eventStream) {
       void this.eventStream.return?.(undefined).catch(() => {});
       this.eventStream = null;
     }
+    this.subscribePromise = null;
     this.killServer();
     this.clientPromise = null;
     this.questionClient = null;
@@ -295,6 +308,13 @@ export class OpenCodeBackend implements AgentBackend {
       this.clientPromise = null;
       this.questionClient = null;
       this.subscribed = false;
+      if (this.eventStream) {
+        void this.eventStream.return?.(undefined).catch(() => {});
+        this.eventStream = null;
+      }
+      if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+      this.subscribePromise = null;
     });
     this.questionClient = createOpencodeV2Client({ baseUrl: url });
     return createOpencodeClient({ baseUrl: url });
@@ -318,22 +338,47 @@ export class OpenCodeBackend implements AgentBackend {
   }
 
   private async ensureSubscribed(client: OpencodeClient): Promise<void> {
-    if (this.subscribed) return;
-    this.subscribed = true;
+    if (this.subscribePromise) return await this.subscribePromise;
+    const subscription = this.startSubscription(client);
+    this.subscribePromise = subscription;
     try {
-      const { stream } = await client.event.subscribe();
-      this.eventStream = stream as AsyncGenerator<unknown>;
-      void (async () => {
-        try {
-          for await (const item of stream) {
-            const event = normalizeEvent(item);
-            if (event) this.handleEvent(event);
-          }
-        } catch { /* server closed */ }
-      })();
-    } catch {
-      this.subscribed = false;
+      await subscription;
+    } catch (error) {
+      if (this.subscribePromise === subscription) this.subscribePromise = null;
+      throw error;
     }
+  }
+
+  private async startSubscription(client: OpencodeClient): Promise<void> {
+    const { stream } = await client.event.subscribe();
+    const eventStream = stream as AsyncGenerator<unknown>;
+    this.eventStream = eventStream;
+    this.subscribed = true;
+    void this.consumeSubscription(client, eventStream);
+  }
+
+  private async consumeSubscription(client: OpencodeClient, stream: AsyncGenerator<unknown>): Promise<void> {
+    try {
+      for await (const item of stream) {
+        const event = normalizeEvent(item);
+        if (event) this.handleEvent(event);
+      }
+    } catch { /* server closed or subscription dropped */ } finally {
+      if (this.eventStream !== stream) return;
+      this.eventStream = null;
+      this.subscribed = false;
+      this.subscribePromise = null;
+      this.scheduleResubscribe(client);
+    }
+  }
+
+  private scheduleResubscribe(client: OpencodeClient): void {
+    if (!this.serverChild || this.sessions.size === 0 || this.reconnectTimer) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (!this.serverChild || this.subscribed) return;
+      void this.ensureSubscribed(client).catch(() => this.scheduleResubscribe(client));
+    }, 100);
   }
 }
 
@@ -357,6 +402,7 @@ class OpenCodeAgentSession implements AgentSession {
   private interrupted = false;
   private readonly resultPromise: Promise<AgentRunOutcome>;
   private readonly approvalController = new AbortController();
+  private abortPromise: Promise<void> | null = null;
 
   constructor(
     private readonly client: OpencodeClient,
@@ -523,20 +569,28 @@ ${JSON.stringify(this.spec.schema)}`;
   async interrupt(): Promise<void> {
     this.interrupted = true;
     this.approvalController.abort(new Error('OpenCode session interrupted'));
-    try {
-      await this.client.session.abort({ path: { id: this.sessionId } });
-    } catch { /* already idle */ }
+    await this.abortRemote();
   }
 
   async close(): Promise<void> {
     this.approvalController.abort(new Error('OpenCode session closed'));
+    await this.abortRemote();
     this.onClose();
-    if (this.interrupted) return;
-    // 会话保留在服务端（resume 能力预留）；不主动删除
   }
 
   completion(): Promise<AgentRunOutcome> {
     return this.resultPromise;
+  }
+
+  private abortRemote(): Promise<void> {
+    this.abortPromise ??= (async () => {
+      try {
+        await this.client.session.abort({ path: { id: this.sessionId } });
+      } catch {
+        // The session may have completed or the server may already be gone.
+      }
+    })();
+    return this.abortPromise!;
   }
 }
 
