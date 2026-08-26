@@ -385,8 +385,19 @@ class CodexAgentSession implements AgentSession {
     };
     try {
       await this.connection.request('turn/start', params, this.spec.timeoutMs);
-    } catch {
-      // turn/start 的响应不是完成信号；turn/completed 通知才是。请求失败时由监督器兜底。
+    } catch (error) {
+      // A rejected turn/start has no corresponding turn/completed notification.
+      // Settle immediately instead of waiting for the supervisor's stale timeout.
+      if (this.settled) return;
+      this.settled = true;
+      this.resolveResult({
+        ok: false,
+        output: null,
+        error: `codex turn/start failed: ${error instanceof Error ? error.message : String(error)}`,
+        timedOut: false,
+        stalled: false,
+        sessionId: this.sessionId
+      });
     }
   }
 

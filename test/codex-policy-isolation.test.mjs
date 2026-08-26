@@ -68,3 +68,38 @@ test('Codex backend routes agent questions to their session', async () => {
   });
   assert.deepEqual(await backend.handleServerRequest('item/tool/requestUserInput', { ...params, threadId: 'missing' }), { answers: {} });
 });
+
+test('Codex session settles immediately when turn/start fails', async () => {
+  const backend = new CodexBackend();
+  backend.ensureServer = async () => {};
+  backend.connection = {
+    async request(method) {
+      if (method === 'thread/start') return { thread: { id: 'thread' } };
+      if (method === 'turn/start') throw new Error('model unavailable');
+      throw new Error(`unexpected request: ${method}`);
+    }
+  };
+  const session = await backend.openSession({
+    role: 'worker',
+    cwd: process.cwd(),
+    prompt: 'test',
+    schema: { type: 'object' },
+    access: 'workspace-write',
+    timeoutMs: 60_000,
+    staleAfterMs: 60_000
+  });
+  let timer;
+  try {
+    const outcome = await Promise.race([
+      session.completion(),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('session did not settle')), 100); })
+    ]);
+    assert.equal(outcome.ok, false);
+    assert.equal(outcome.timedOut, false);
+    assert.match(outcome.error, /turn\/start failed: model unavailable/);
+  } finally {
+    clearTimeout(timer);
+    await session.close();
+  }
+  assert.equal(backend.sessions.size, 0);
+});
