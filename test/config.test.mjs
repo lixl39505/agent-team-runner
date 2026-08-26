@@ -101,7 +101,19 @@ test('applyOverrides keeps unmodified defaults intact', () => {
   const config = applyOverrides(loadConfig(tempRepo()), [{ key: 'roles.worker', value: 'codex.gpt-5.6-terra' }]);
   assert.equal(config.roles.worker, 'codex.gpt-5.6-terra');
   assert.equal(config.concurrency, 3);
-  assert.deepEqual(config.backends.codex, {});
+  assert.deepEqual(config.backends.codex, { nativeWindowsSandbox: 'require' });
+});
+
+test('validates native Windows sandbox policy', () => {
+  const repo = tempRepo();
+  writeFileSync(join(repo, '.agent-team', 'config.yml'), [
+    'backends:',
+    '  claude:',
+    '    nativeWindowsSandbox: allow-degraded'
+  ].join('\n'));
+  assert.equal(loadConfig(repo).backends.claude.nativeWindowsSandbox, 'allow-degraded');
+  writeFileSync(join(repo, '.agent-team', 'config.yml'), 'backends:\n  claude:\n    nativeWindowsSandbox: unsafe\n');
+  assert.throws(() => loadConfig(repo), /nativeWindowsSandbox/);
 });
 
 test('generated default config yml round-trips through loadConfig', () => {

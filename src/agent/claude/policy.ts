@@ -3,7 +3,7 @@
  * 关键约束：Bash/Edit/Write/NotebookEdit 绝不能出现在 allowedTools，
  * 否则会绕过 canUseTool（shadow），权限闭环失效。
  */
-export const CLAUDE_READ_ONLY_TOOLS = ['Read', 'Glob', 'Grep'];
+export const CLAUDE_READ_ONLY_TOOLS = ['Read', 'Glob', 'Grep', 'LSP', 'TaskGet', 'TaskList', 'TaskOutput'];
 
 export interface CompiledClaudePolicy {
   /** 必须是 'default'：dontAsk 会静默拒绝且不触发回调；acceptEdits 会自动放行编辑 */
@@ -15,8 +15,8 @@ export interface CompiledClaudePolicy {
 /** Compile only the role boundary; Claude remains responsible for operation-level permission requests. */
 export function compileClaude(access: 'read-only' | 'workspace-write'): CompiledClaudePolicy {
   const disallowedTools = access === 'read-only'
-    ? ['Edit', 'Write', 'NotebookEdit', 'Task', 'AskUserQuestion']
-    : ['AskUserQuestion'];
+    ? ['Edit', 'Write', 'NotebookEdit', 'Task']
+    : [];
   return {
     permissionMode: 'default',
     allowedTools: [...CLAUDE_READ_ONLY_TOOLS],

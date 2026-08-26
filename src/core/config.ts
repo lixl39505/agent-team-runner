@@ -20,9 +20,9 @@ export const DEFAULT_CONFIG: RunnerConfig = {
   maxReviewCycles: 2,
   branchPrefix: 'agent-team',
   backends: {
-    claude: {},
-    codex: {},
-    opencode: {}
+    claude: { nativeWindowsSandbox: 'require' },
+    codex: { nativeWindowsSandbox: 'require' },
+    opencode: { nativeWindowsSandbox: 'require' }
   },
   agents: {
     'default-claude': { backend: 'claude' }
@@ -107,9 +107,12 @@ branchPrefix: agent-team
 
 # 后端接线：CLI 命令缺省用 backend 名本身
 backends:
-  claude: {}
-  codex: {}
-  opencode: {}
+  claude:
+    nativeWindowsSandbox: require
+  codex:
+    nativeWindowsSandbox: require
+  opencode:
+    nativeWindowsSandbox: require
 
 # agent 注册表：为不同 role 配置不同 agent（背后不同 model）
 # agents:
@@ -215,6 +218,11 @@ export function loadConfig(inputRepoRoot: string): RunnerConfig {
   if (!merged.agents[merged.defaultAgent] && !rawDefaultAgent) {
     const first = Object.keys(merged.agents)[0];
     if (first) merged.defaultAgent = first;
+  }
+  for (const [id, backend] of Object.entries(merged.backends)) {
+    if (!['require', 'allow-degraded'].includes(backend.nativeWindowsSandbox ?? '')) {
+      throw new Error(`backends.${id}.nativeWindowsSandbox must be "require" or "allow-degraded"`);
+    }
   }
 
   merged.repoRoot = resolve(repoRoot, merged.repoRoot);

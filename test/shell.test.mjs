@@ -6,6 +6,15 @@ test('splits quoted command arguments', () => {
   assert.deepEqual(splitCommand('pnpm test "order export"'), ['pnpm', 'test', 'order export']);
 });
 
+test('preserves Windows paths and quoted executable paths', () => {
+  assert.deepEqual(
+    splitCommand('"C:\\Program Files\\nodejs\\node.exe" "C:\\work dir\\check.js" C:\\repo\\src', 'win32'),
+    ['C:\\Program Files\\nodejs\\node.exe', 'C:\\work dir\\check.js', 'C:\\repo\\src']
+  );
+  assert.doesNotThrow(() => assertAllowedCommand('C:\\tools\\pnpm.cmd test', ['C:\\tools\\pnpm.cmd test'], 'win32'));
+  assert.throws(() => splitCommand('pnpm test ^& del C:\\repo', 'win32'), /Unsafe/);
+});
+
 test('rejects shell operators and unlisted commands', () => {
   assert.throws(() => splitCommand('pnpm test && rm -rf /'), /Unsafe/);
   assert.throws(() => assertAllowedCommand('node destructive.js', ['pnpm test']), /allowlisted/);

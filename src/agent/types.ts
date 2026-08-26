@@ -1,5 +1,5 @@
 import type { AgentRole, BackendId } from '../core/types.js';
-import type { ApprovalHandler } from './approval.js';
+import type { ApprovalHandler, UserInputHandler } from './approval.js';
 
 export type { BackendId };
 
@@ -20,6 +20,12 @@ export interface ProbeResult {
   ok: boolean;
   error?: string | undefined;
   latencyMs: number;
+}
+
+export interface PlatformCheckResult {
+  ok: boolean;
+  degraded: boolean;
+  detail: string;
 }
 
 /** 后端事件流：真实心跳/进度/权限/用量信号（取代 stdout 静默判断） */
@@ -44,6 +50,7 @@ export interface SessionSpec {
   /** Coarse role boundary; operation-level decisions stay in the backend's native permission model. */
   access: 'read-only' | 'workspace-write';
   requestApproval?: ApprovalHandler | undefined;
+  requestUserInput?: UserInputHandler | undefined;
   timeoutMs: number;
   /** 静默超时：任何 AgentEvent 重置计时（"无进展"而非"无 stdout"） */
   staleAfterMs: number;
@@ -80,5 +87,7 @@ export interface AgentBackend {
   listModels(): Promise<ModelInfo[]>;
   /** 1-token 真实试跑 = 权威可用性验证 */
   probe(model?: string | undefined): Promise<ProbeResult>;
+  /** Host-specific sandbox/process capability check, called by preflight before model enumeration. */
+  checkPlatform?(): Promise<PlatformCheckResult>;
   openSession(spec: SessionSpec): Promise<AgentSession>;
 }

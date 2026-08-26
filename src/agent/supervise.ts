@@ -28,7 +28,7 @@ export async function runAgent<T = unknown>(input: RunAgentInput): Promise<Agent
   const startedAt = Date.now();
   let pausedAt: number | null = null;
   let pausedMs = 0;
-  let pendingApprovals = 0;
+  let pendingInteractions = 0;
   const activeNow = (): number => Date.now() - pausedMs - (pausedAt === null ? 0 : Date.now() - pausedAt);
   let lastActivity = activeNow();
   try {
@@ -41,23 +41,38 @@ export async function runAgent<T = unknown>(input: RunAgentInput): Promise<Agent
       },
       ...(spec.requestApproval ? {
         requestApproval: async (request, signal) => {
-          pendingApprovals += 1;
-          if (pendingApprovals === 1) pausedAt = Date.now();
-          append(`[approval] waiting ${JSON.stringify({ backend: request.backend, tool: request.tool, kind: request.kind })}`);
+          pendingInteractions += 1;
+          if (pendingInteractions === 1) pausedAt = Date.now();
+          append(`[interaction] approval waiting ${JSON.stringify({ backend: request.backend, tool: request.tool, kind: request.kind })}`);
           try {
             return await spec.requestApproval!(request, signal);
           } finally {
-            pendingApprovals -= 1;
-            if (pendingApprovals === 0 && pausedAt !== null) {
-              pausedMs += Date.now() - pausedAt;
-              pausedAt = null;
-              lastActivity = activeNow();
-              append('[approval] resumed');
-            }
+            resumeClock();
+          }
+        }
+      } : {}),
+      ...(spec.requestUserInput ? {
+        requestUserInput: async (request, signal) => {
+          pendingInteractions += 1;
+          if (pendingInteractions === 1) pausedAt = Date.now();
+          append(`[interaction] user input waiting ${JSON.stringify({ backend: request.backend, questions: request.questions.length })}`);
+          try {
+            return await spec.requestUserInput!(request, signal);
+          } finally {
+            resumeClock();
           }
         }
       } : {})
     };
+    function resumeClock(): void {
+      pendingInteractions -= 1;
+      if (pendingInteractions === 0 && pausedAt !== null) {
+        pausedMs += Date.now() - pausedAt;
+        pausedAt = null;
+        lastActivity = activeNow();
+        append('[interaction] resumed');
+      }
+    }
     session = await backend.openSession(wrapped);
     append(`[session] opened on backend ${backend.id}`);
   } catch (error) {
@@ -81,7 +96,7 @@ export async function runAgent<T = unknown>(input: RunAgentInput): Promise<Agent
   };
 
   const timerInterval = setInterval(() => {
-    if (pendingApprovals > 0) return;
+    if (pendingInteractions > 0) return;
     const now = activeNow();
     if (!timedOut && now - startedAt > spec.timeoutMs) {
       timedOut = true;

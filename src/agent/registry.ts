@@ -17,13 +17,22 @@ import { OpenCodeBackend } from './opencode/sdk.js';
 export function buildBackends(config: RunnerConfig): Record<BackendId, AgentBackend> {
   return {
     claude: new ClaudeBackend(
-      config.backends.claude?.command ? { command: config.backends.claude.command } : {}
+      {
+        ...(config.backends.claude.command ? { command: config.backends.claude.command } : {}),
+        nativeWindowsSandbox: config.backends.claude.nativeWindowsSandbox
+      }
     ),
     codex: new CodexBackend(
-      config.backends.codex?.command ? { command: config.backends.codex.command } : {}
+      {
+        ...(config.backends.codex.command ? { command: config.backends.codex.command } : {}),
+        nativeWindowsSandbox: config.backends.codex.nativeWindowsSandbox
+      }
     ),
     opencode: new OpenCodeBackend(
-      config.backends.opencode?.command ? { command: config.backends.opencode.command } : {}
+      {
+        ...(config.backends.opencode.command ? { command: config.backends.opencode.command } : {}),
+        nativeWindowsSandbox: config.backends.opencode.nativeWindowsSandbox
+      }
     )
   };
 }
@@ -116,4 +125,3 @@ export function resolveTaskAgent(task: TaskSpec, config: RunnerConfig, rolesJson
   if (task.agent) return resolveAgentByName(task.agent, config, parseSnapshot(rolesJson)?.agents);
   return resolveAgentWithSnapshot('worker', config, rolesJson);
 }
-

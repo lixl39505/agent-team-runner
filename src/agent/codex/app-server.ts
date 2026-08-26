@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import spawn from 'cross-spawn';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -12,7 +12,7 @@ import type {
   ProbeResult,
   SessionSpec
 } from '../types.js';
-import type { BackendId } from '../../core/types.js';
+import type { BackendId, NativeWindowsSandboxPolicy } from '../../core/types.js';
 import { JsonRpcConnection } from './jsonrpc.js';
 import { compileCodex, type CompiledCodexPolicy } from './policy.js';
 import type { ApprovalDecision, ApprovalRequest } from '../approval.js';
@@ -40,11 +40,20 @@ import type { ReviewDecision } from './protocol/ReviewDecision.js';
 import type { PermissionsRequestApprovalParams } from './protocol/v2/PermissionsRequestApprovalParams.js';
 import type { PermissionsRequestApprovalResponse } from './protocol/v2/PermissionsRequestApprovalResponse.js';
 import type { GrantedPermissionProfile } from './protocol/v2/GrantedPermissionProfile.js';
+import type { ToolRequestUserInputParams } from './protocol/v2/ToolRequestUserInputParams.js';
+import type { ToolRequestUserInputResponse } from './protocol/v2/ToolRequestUserInputResponse.js';
+import type { McpServerElicitationRequestResponse } from './protocol/v2/McpServerElicitationRequestResponse.js';
+import type { WindowsSandboxReadiness } from './protocol/v2/WindowsSandboxReadiness.js';
+import type { WindowsSandboxReadinessResponse } from './protocol/v2/WindowsSandboxReadinessResponse.js';
+import type { PlatformCheckResult } from '../types.js';
 
 const CLIENT_INFO = { name: 'agent-team-runner', title: null, version: '0.1.0' };
 
 export interface CodexBackendOptions {
   command?: string | undefined;
+  nativeWindowsSandbox?: NativeWindowsSandboxPolicy | undefined;
+  /** Test seam; production always uses process.platform. */
+  platform?: NodeJS.Platform | undefined;
 }
 
 interface TurnRecord {
@@ -64,9 +73,15 @@ export class CodexBackend implements AgentBackend {
   private connection: JsonRpcConnection | null = null;
   private initialized = false;
   private initPromise: Promise<void> | null = null;
+  private platformCheckPromise: Promise<PlatformCheckResult> | null = null;
   private readonly sessions = new Map<string, CodexAgentSession>();
+  private readonly platform: NodeJS.Platform;
+  private readonly nativeWindowsSandbox: NativeWindowsSandboxPolicy;
 
-  constructor(private readonly options: CodexBackendOptions = {}) {}
+  constructor(private readonly options: CodexBackendOptions = {}) {
+    this.platform = options.platform ?? process.platform;
+    this.nativeWindowsSandbox = options.nativeWindowsSandbox ?? 'require';
+  }
 
   private get command(): string {
     return this.options.command ?? 'codex';
@@ -115,6 +130,25 @@ export class CodexBackend implements AgentBackend {
     return models;
   }
 
+  async checkPlatform(): Promise<PlatformCheckResult> {
+    if (this.platform !== 'win32') {
+      return { ok: true, degraded: false, detail: 'native Windows policy is not applicable' };
+    }
+    this.platformCheckPromise ??= (async () => {
+      try {
+        await this.ensureServer();
+        const response = await this.connection!.request('windowsSandbox/readiness', undefined, 30_000) as WindowsSandboxReadinessResponse;
+        return codexWindowsSandboxCapability(response.status, this.nativeWindowsSandbox, this.platform);
+      } catch (error) {
+        return codexWindowsSandboxCapability(
+          'unavailable', this.nativeWindowsSandbox, this.platform,
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+    })();
+    return await this.platformCheckPromise;
+  }
+
   async probe(model?: string | undefined): Promise<ProbeResult> {
     const started = Date.now();
     const scratch = mkdtempSync(join(tmpdir(), 'agent-team-codex-probe-'));
@@ -141,6 +175,8 @@ export class CodexBackend implements AgentBackend {
   }
 
   async openSession(spec: SessionSpec): Promise<AgentSession> {
+    const platform = await this.checkPlatform();
+    if (!platform.ok) throw new Error(platform.detail);
     await this.ensureServer();
     const compiled = compileCodex(spec.access, spec.cwd);
     const params: ThreadStartParams = {
@@ -168,6 +204,7 @@ export class CodexBackend implements AgentBackend {
     this.connection = null;
     this.initialized = false;
     this.initPromise = null;
+    this.platformCheckPromise = null;
   }
 
   handleNotification(method: string, params: unknown): void {
@@ -243,8 +280,14 @@ export class CodexBackend implements AgentBackend {
         : 'decline';
       return { decision: legacyReviewDecision(decision) };
     }
-    if (method === 'item/tool/requestUserInput' || method === 'mcpServer/elicitation/request') {
-      throw new Error('interactive question routing is not implemented');
+    if (method === 'item/tool/requestUserInput') {
+      const record = params as ToolRequestUserInputParams;
+      const session = this.sessions.get(record.threadId);
+      return session ? await session.answerUserInput(record) : { answers: {} } satisfies ToolRequestUserInputResponse;
+    }
+    if (method === 'mcpServer/elicitation/request') {
+      // MCP forms have a separate schema and security boundary. Decline until a typed form renderer is available.
+      return { action: 'decline', content: null, _meta: null } satisfies McpServerElicitationRequestResponse;
     }
     throw new Error(`unhandled app-server request: ${method}`);
   }
@@ -269,6 +312,7 @@ export class CodexBackend implements AgentBackend {
           this.connection = null;
           this.initialized = false;
           this.initPromise = null;
+          this.platformCheckPromise = null;
         }
       },
       sanitizedEnv()
@@ -284,6 +328,22 @@ export class CodexBackend implements AgentBackend {
       throw error;
     }
   }
+}
+
+export function codexWindowsSandboxCapability(
+  status: WindowsSandboxReadiness | 'unavailable',
+  policy: NativeWindowsSandboxPolicy,
+  platform: NodeJS.Platform,
+  error?: string
+): PlatformCheckResult {
+  if (platform !== 'win32') return { ok: true, degraded: false, detail: 'native Windows policy is not applicable' };
+  if (status === 'ready') return { ok: true, degraded: false, detail: 'Codex native Windows sandbox is ready' };
+  const reason = status === 'unavailable'
+    ? `Codex Windows sandbox readiness check failed${error ? `: ${error}` : ''}`
+    : `Codex native Windows sandbox is ${status}`;
+  return policy === 'allow-degraded'
+    ? { ok: true, degraded: true, detail: `${reason}; unsandboxed execution was explicitly allowed` }
+    : { ok: false, degraded: false, detail: `${reason}; configure/update the Codex sandbox or explicitly set nativeWindowsSandbox: allow-degraded` };
 }
 
 class CodexAgentSession implements AgentSession {
@@ -368,11 +428,15 @@ class CodexAgentSession implements AgentSession {
 
   async approveFilePaths(paths: string[], grantRoot?: string | null, reason?: string | null): Promise<'accept' | 'acceptForSession' | 'decline'> {
     if (this.compiled.access === 'read-only') return 'decline';
+    if (!grantRoot) {
+      this.spec.onEvent?.({ type: 'permission-check', tool: 'Edit', input: { paths }, allowed: true });
+      return 'accept';
+    }
     const decision = await this.ask({
-      kind: grantRoot ? 'external-directory' : 'file-change',
+      kind: 'external-directory',
       tool: 'Edit',
-      input: { paths, ...(grantRoot ? { grantRoot } : {}) },
-      title: grantRoot ? `Codex wants write access to ${grantRoot}` : 'Codex wants to modify files',
+      input: { paths, grantRoot },
+      title: `Codex wants write access to ${grantRoot}`,
       reason: reason ?? undefined,
       allowSession: true
     });
@@ -405,6 +469,33 @@ class CodexAgentSession implements AgentSession {
     });
     if (decision === 'deny') return deniedPermissionResponse();
     return { permissions: grantable, scope: decision === 'session' ? 'session' : 'turn' };
+  }
+
+  async answerUserInput(request: ToolRequestUserInputParams): Promise<ToolRequestUserInputResponse> {
+    if (!this.spec.requestUserInput) return { answers: {} };
+    try {
+      const questions = request.questions.map((question) => ({
+        id: question.id,
+        header: question.header,
+        question: question.question,
+        ...(question.options ? { options: question.options } : {}),
+        allowCustom: question.isOther || question.options === null,
+        secret: question.isSecret
+      }));
+      const answers = await this.spec.requestUserInput({
+        backend: 'codex', role: this.spec.role, label: this.spec.label,
+        sessionId: this.sessionId, cwd: this.spec.cwd, questions
+      }, this.approvalController.signal);
+      this.spec.onEvent?.({ type: 'activity' });
+      return {
+        answers: Object.fromEntries(request.questions.map((question) => [
+          question.id,
+          { answers: answers[question.id] ?? [] }
+        ]))
+      };
+    } catch {
+      return { answers: {} };
+    }
   }
 
   onFileChangePatch(itemId: string, paths: string[]): void {

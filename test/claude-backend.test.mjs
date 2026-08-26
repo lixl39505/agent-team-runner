@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ClaudeBackend } from '../dist/agent/claude/sdk.js';
 
-async function captureSessionOptions(access, requestApproval) {
+async function captureSessionOptions(access, requestApproval, requestUserInput) {
   const cwd = mkdtempSync(join(tmpdir(), 'agent-team-claude-cwd-'));
   let capturedOptions;
   const queryFactory = ({ options }) => {
@@ -33,6 +33,7 @@ async function captureSessionOptions(access, requestApproval) {
     schema: { type: 'object' },
     access,
     ...(requestApproval ? { requestApproval } : {}),
+    ...(requestUserInput ? { requestUserInput } : {}),
     timeoutMs: 1_000,
     staleAfterMs: 1_000
   });
@@ -94,4 +95,48 @@ test('Claude read-only sessions cannot elevate unknown or MCP tools', async () =
   });
   assert.equal(result.behavior, 'deny');
   assert.equal(prompted, false);
+});
+
+test('Claude routes AskUserQuestion separately from permission approval', async () => {
+  const requests = [];
+  const { options } = await captureSessionOptions('workspace-write', undefined, async (request) => {
+    requests.push(request);
+    return { '0': ['SQLite'] };
+  });
+  const result = await options.canUseTool('AskUserQuestion', {
+    questions: [{
+      header: 'Database', question: 'Which database?', multiSelect: false,
+      options: [{ label: 'SQLite', description: 'Local file' }, { label: 'Postgres', description: 'Server' }]
+    }]
+  }, {
+    signal: new AbortController().signal,
+    toolUseID: 'tool-question', requestId: 'request-question'
+  });
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].questions[0].question, 'Which database?');
+  assert.equal(result.behavior, 'allow');
+  assert.deepEqual(result.updatedInput.answers, { 'Which database?': 'SQLite' });
+});
+
+test('Claude workspace edits are allowed without prompting unless native policy forced the ask', async () => {
+  let prompted = false;
+  const { cwd, options } = await captureSessionOptions('workspace-write', async () => { prompted = true; return 'once'; });
+  const result = await options.canUseTool('Edit', { file_path: join(cwd, 'a.ts') }, {
+    signal: new AbortController().signal,
+    toolUseID: 'tool-edit', requestId: 'request-edit'
+  });
+  assert.equal(result.behavior, 'allow');
+  assert.equal(prompted, false);
+});
+
+test('Claude edits outside cwd still require native approval', async () => {
+  let prompted = false;
+  const { options } = await captureSessionOptions('workspace-write', async () => { prompted = true; return 'once'; });
+  const result = await options.canUseTool('Write', { file_path: join(tmpdir(), 'outside.txt') }, {
+    signal: new AbortController().signal,
+    blockedPath: join(tmpdir(), 'outside.txt'),
+    toolUseID: 'tool-external-edit', requestId: 'request-external-edit'
+  });
+  assert.equal(result.behavior, 'allow');
+  assert.equal(prompted, true);
 });

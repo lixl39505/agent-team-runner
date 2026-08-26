@@ -1,5 +1,6 @@
 .claude/skills
 
 dist
+.local
 node_modules
 .agent-team/

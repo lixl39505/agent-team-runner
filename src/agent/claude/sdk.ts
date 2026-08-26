@@ -1,6 +1,6 @@
-import { spawn } from 'node:child_process';
+import spawn from 'cross-spawn';
 import { readFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { query, type Options, type PermissionUpdate, type Query } from '@anthropic-ai/claude-agent-sdk';
 import type {
   AgentBackend,
@@ -9,26 +9,41 @@ import type {
   AgentSession,
   DiscoveryResult,
   ModelInfo,
+  PlatformCheckResult,
   ProbeResult,
   SessionSpec
 } from '../types.js';
 import type { BackendId } from '../../core/types.js';
+import type { NativeWindowsSandboxPolicy } from '../../core/types.js';
 import { compileClaude } from './policy.js';
 import { sanitizedEnv } from '../env.js';
+import { unsupportedNativeWindowsSandbox } from '../platform.js';
 
 export interface ClaudeBackendOptions {
   /** 覆盖 claude 可执行文件路径（backends.claude.command）；缺省用 SDK 内置二进制 */
   command?: string | undefined;
+  nativeWindowsSandbox?: NativeWindowsSandboxPolicy | undefined;
+  /** Test seam; production always uses process.platform. */
+  platform?: NodeJS.Platform | undefined;
 }
 
 export class ClaudeBackend implements AgentBackend {
   readonly id: BackendId = 'claude';
   private readonly sessions = new Set<ClaudeAgentSession>();
+  private readonly platform: NodeJS.Platform;
+  private readonly nativeWindowsSandbox: NativeWindowsSandboxPolicy;
 
   constructor(
     private readonly options: ClaudeBackendOptions = {},
     private readonly queryFactory: typeof query = query
-  ) {}
+  ) {
+    this.platform = options.platform ?? process.platform;
+    this.nativeWindowsSandbox = options.nativeWindowsSandbox ?? 'require';
+  }
+
+  async checkPlatform(): Promise<PlatformCheckResult> {
+    return unsupportedNativeWindowsSandbox('claude', this.nativeWindowsSandbox, this.platform);
+  }
 
   async discover(): Promise<DiscoveryResult> {
     const command = this.options.command ?? 'claude';
@@ -118,21 +133,50 @@ export class ClaudeBackend implements AgentBackend {
   }
 
   async openSession(spec: SessionSpec): Promise<AgentSession> {
+    const platform = await this.checkPlatform();
+    if (!platform.ok) throw new Error(platform.detail);
     const compiled = compileClaude(spec.access);
     const controller = new AbortController();
     const options: Options = this.baseOptions({
       cwd: spec.cwd,
-      sandbox: compileSandbox(spec),
+      ...(this.platform === 'win32' ? {} : { sandbox: compileSandbox(spec) }),
       ...(spec.model !== undefined ? { model: spec.model } : {}),
       permissionMode: compiled.permissionMode,
       settingSources: spec.access === 'read-only' ? [] : ['user', 'project', 'local'],
       allowedTools: compiled.allowedTools,
-      disallowedTools: compiled.disallowedTools,
+      disallowedTools: this.platform === 'win32' && spec.access === 'read-only'
+        ? [...compiled.disallowedTools, 'Bash']
+        : compiled.disallowedTools,
       canUseTool: async (toolName, input, context) => {
+        if (toolName === 'AskUserQuestion') {
+          if (!spec.requestUserInput) {
+            return { behavior: 'deny', message: 'No interactive user-input handler is available.' };
+          }
+          try {
+            const questions = claudeUserQuestions(input);
+            const answers = await spec.requestUserInput({
+              backend: 'claude', role: spec.role, label: spec.label,
+              cwd: spec.cwd, questions
+            }, context.signal);
+            const answerByQuestion = Object.fromEntries(questions.map((question) => [
+              question.question,
+              (answers[question.id] ?? []).join(', ')
+            ]));
+            spec.onEvent?.({ type: 'activity' });
+            return { behavior: 'allow', updatedInput: { ...input, answers: answerByQuestion } };
+          } catch (error) {
+            return { behavior: 'deny', message: error instanceof Error ? error.message : String(error) };
+          }
+        }
         if (spec.access === 'read-only' && !readOnlyApprovableTool(toolName)) {
           const reason = `tool ${toolName} is outside the read-only role boundary`;
           spec.onEvent?.({ type: 'permission-check', tool: toolName, input, allowed: false, reason });
           return { behavior: 'deny', message: reason };
+        }
+        if (spec.access === 'workspace-write' && workspaceEditInCwd(toolName, input, spec.cwd, this.platform)
+          && !context.blockedPath && context.matchedAskRule === undefined) {
+          spec.onEvent?.({ type: 'permission-check', tool: toolName, input, allowed: true });
+          return { behavior: 'allow' };
         }
         if (!spec.requestApproval) {
           const reason = 'no approval handler is available';
@@ -238,6 +282,48 @@ function claudeApprovalKind(toolName: string, blockedPath?: string): 'command' |
 
 function readOnlyApprovableTool(toolName: string): boolean {
   return ['bash', 'webfetch', 'websearch'].includes(toolName.toLowerCase());
+}
+
+function workspaceEditInCwd(toolName: string, input: Record<string, unknown>, cwd: string, platform: NodeJS.Platform): boolean {
+  const normalized = toolName.toLowerCase();
+  const path = normalized === 'notebookedit' ? input.notebook_path : input.file_path;
+  if (!['edit', 'write', 'notebookedit'].includes(normalized) || typeof path !== 'string') return false;
+  const fromCwd = relative(resolve(cwd), resolve(cwd, path));
+  return fromCwd !== '..' && !fromCwd.startsWith(`..${platform === 'win32' ? '\\' : '/'}`) && !isAbsolute(fromCwd);
+}
+
+export function claudeUserQuestions(input: Record<string, unknown>): Array<{
+  id: string;
+  header?: string;
+  question: string;
+  options?: Array<{ label: string; description?: string }>;
+  multiple?: boolean;
+  allowCustom?: boolean;
+}> {
+  if (!Array.isArray(input.questions) || input.questions.length === 0) {
+    throw new Error('AskUserQuestion supplied no questions');
+  }
+  return input.questions.map((value, index) => {
+    const question = value as Record<string, unknown>;
+    if (typeof question.question !== 'string') throw new Error('AskUserQuestion supplied an invalid question');
+    const options = Array.isArray(question.options)
+      ? question.options.flatMap((option) => {
+          if (!option || typeof option !== 'object') return [];
+          const record = option as Record<string, unknown>;
+          return typeof record.label === 'string'
+            ? [{ label: record.label, ...(typeof record.description === 'string' ? { description: record.description } : {}) }]
+            : [];
+        })
+      : undefined;
+    return {
+      id: String(index),
+      ...(typeof question.header === 'string' ? { header: question.header } : {}),
+      question: question.question,
+      ...(options && options.length > 0 ? { options } : {}),
+      ...(question.multiSelect === true ? { multiple: true } : {}),
+      allowCustom: true
+    };
+  });
 }
 
 /** Resolve linked-worktree Git metadata so the command sandbox cannot mutate history or hooks. */

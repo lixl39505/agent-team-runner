@@ -179,10 +179,20 @@ async function main(): Promise<void> {
       await preflight(config, Object.values(snapshotAgents(config).roles), true);
       const approvals = terminalApprovals();
       try {
-        const id = await planRun({ config, db, goalFile, ...(runId ? { runId } : {}), requestApproval: approvals.request });
+        const id = await planRun({
+          config, db, goalFile, ...(runId ? { runId } : {}),
+          requestApproval: approvals.request,
+          requestUserInput: approvals.requestUserInput
+        });
         console.log(`Planned run: ${id}`);
         console.log(formatRunStatus(db.getRun(id), db.listTasks(id)));
-        if (command === 'launch') await runOrchestrator({ config, db, runId: id, requestApproval: approvals.request });
+        if (command === 'launch') {
+          await runOrchestrator({
+            config, db, runId: id,
+            requestApproval: approvals.request,
+            requestUserInput: approvals.requestUserInput
+          });
+        }
       } finally {
         approvals.close();
       }
@@ -224,7 +234,11 @@ async function main(): Promise<void> {
       await preflight(config, bindings, false);
       const approvals = terminalApprovals();
       try {
-        await runOrchestrator({ config, db, runId, requestApproval: approvals.request });
+        await runOrchestrator({
+          config, db, runId,
+          requestApproval: approvals.request,
+          requestUserInput: approvals.requestUserInput
+        });
         console.log(formatRunStatus(db.getRun(runId), db.listTasks(runId)));
       } finally {
         approvals.close();
@@ -299,7 +313,7 @@ Options:
 
 function terminalApprovals(): TerminalApprovalBroker {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    throw new Error('Planning and running require an interactive terminal for backend permission requests.');
+    throw new Error('Planning and running require an interactive terminal for backend permissions and user questions.');
   }
   return new TerminalApprovalBroker();
 }

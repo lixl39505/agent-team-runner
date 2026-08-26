@@ -54,7 +54,7 @@ Runner 在调用 Agent 时会直接读取打包的 Skill 内容并编译进运�
 - 事件流心跳（真实"无进展"检测）、静默超时和硬超时
 - Worker 失败自动重试（重试 prompt 嵌入 diff + reviewer 反馈原文 + 上次 summary）
 - agents 注册表：为不同 role 配置不同 agent（后端 + model + turn 上限）
-- 三后端原生权限请求统一转发到当前终端，支持 once / session / deny
+- 三后端原生权限请求与 Agent 补充问题统一进入当前终端 FIFO；两类交互使用独立返回协议
 - YAML 配置文件 + `-c` 命令行任意层级覆写
 - 启动前闭环预检：后端 discover + 真实 model 枚举 + 1-token 试跑（持久缓存）
 - 修改路径 allowlist / blocklist 机械校验
@@ -79,6 +79,8 @@ Runner 在调用 Agent 时会直接读取打包的 Skill 内容并编译进运�
   - `opencode`
 
 Runner 使用 Node 内置的 `node:sqlite`，无需安装本地 SQLite 原生扩展。
+
+Runner 支持 macOS、Linux 和 Windows。Windows 子进程通过 `cross-spawn` 启动并用 `taskkill /T /F` 清理进程树。native Windows 默认 fail closed：Claude/OpenCode 没有等价进程 sandbox，Codex 会检查原生 sandbox readiness。需要强隔离时请在 WSL2 中运行。
 
 ## 安装
 
@@ -142,9 +144,12 @@ branchPrefix: agent-team
 
 # 后端接线：CLI 命令缺省用 backend 名本身
 backends:
-  claude: {}
-  codex: {}
-  opencode: {}
+  claude:
+    nativeWindowsSandbox: require
+  codex:
+    nativeWindowsSandbox: require
+  opencode:
+    nativeWindowsSandbox: require
 
 # agent 注册表：具名 agent = 后端 + model + 选项
 agents:
@@ -191,6 +196,13 @@ integration:
     - specs/**
   runAgentAfterCherryPick: true
 ```
+
+`nativeWindowsSandbox` 仅对 native Windows 生效，取值为：
+
+- `require`：默认值。Claude/OpenCode 因没有等价 sandbox 而拒绝运行；Codex 只有报告 `ready` 时运行。
+- `allow-degraded`：显式接受降级。Claude/OpenCode 的命令获批后拥有宿主用户权限；Codex readiness 不可用、未配置或需更新时也继续运行，并打印 warning。
+
+WSL2 运行时属于 Linux 路径，不触发该开关。
 
 ### agents 注册表与角色解析
 
@@ -316,11 +328,11 @@ tail -f .agent-team/runs/order-export/logs/T001-review-1.log
 tail -f .agent-team/runs/order-export/logs/integration-verification.log
 ```
 
-`plan`、`launch` 和 `run` 都是前台终端命令。运行中使用 Ctrl-C 停止；再次执行 `agent-team run <runId>` 会恢复遗留任务状态和 Worktree。
+`plan`、`launch` 和 `run` 都是前台终端命令。运行中使用 Ctrl-C 停止，现场 Worktree 会暂时保留供检查；再次执行 `agent-team run <runId>` 时，Runner 会从任务 `startSha` 重建被中断的 Worktree，并用新会话重跑完整 attempt。
 
-### 终端审批
+### 终端交互
 
-Claude、Codex 和 OpenCode 的原生权限请求统一显示在运行命令所在终端。并发 Agent 的请求进入 FIFO 队列，避免同时读取 stdin：
+Claude、Codex 和 OpenCode 的原生权限请求与补充问题统一显示在运行命令所在终端。并发 Agent 的交互进入同一个 FIFO 队列，避免同时读取 stdin：
 
 ```text
 [Approval] codex / worker / order-export T001 worker
@@ -330,11 +342,13 @@ Working directory: /path/to/worktree
 [o] once  [s] session  [d] deny:
 ```
 
-网络、外部目录和文件修改使用同一流程。等待人工审批的时间不计入 hard timeout 或 stale timeout。`session` 只在对应后端支持时显示；拒绝会作为原生工具结果返回 Agent，而不是由 Runner 直接判定任务失败。
+workspace-write 角色在当前 Worktree 内的直接编辑默认允许；命令、网络和外部目录仍使用审批流程。等待审批或回答问题的时间不计入 hard timeout 或 stale timeout。`session` 只在对应后端支持时显示；拒绝会作为原生工具结果返回 Agent，而不是由 Runner 直接判定任务失败。
+
+补充问题不属于授权，不显示 once/session/deny。Claude `AskUserQuestion`、Codex `requestUserInput` 和 OpenCode `question.asked` 会显示选项或自由文本输入，并把答案返回原会话。
 
 ## Worker 生命周期
 
-**每任务、每次尝试都是全新会话**。重试时 prompt 会注入厚重试上下文（当前 git diff + reviewer 反馈原文 + 上次 worker summary）——**worktree 是记忆载体，仓库是长期记忆**：任务间共享知识靠 Integrator 更新的 specs 文档，不靠会话记忆（会话记忆会腐烂、跨任务污染、且与 worktree/cwd 绑定冲突）。`AgentSession` 接口保留 resume 能力（三后端原生支持），留作未来实验开关。
+**每任务、每次尝试都是全新会话**。普通失败或 Reviewer 驳回重试时，prompt 会注入厚重试上下文（当前 git diff + reviewer 反馈原文 + 上次 worker summary），Worktree 是这类重试的记忆载体。Ctrl-C/进程异常中断则在下次调度前从 `startSha` 重建 Worktree，不继承半成品 diff。任务间共享知识靠 Integrator 更新的 specs 文档，不靠会话记忆。`AgentSession` 接口保留 resume 能力（三后端原生支持），留作未来实验开关。
 
 ## 完成判定
 
@@ -373,7 +387,7 @@ integrating
 done / failed
 ```
 
-Runner 重启时，会把遗留的 `running`、`verifying` 和 `reviewing` 任务恢复为 `changes_requested`，保留现有 Worktree 和修改，避免重复创建任务目录。
+Runner 重启时，会把遗留的 `running`、`verifying` 和 `reviewing` 任务恢复为 `changes_requested`。再次调度前从 `startSha` 重建其 Worktree，丢弃被中断 attempt 的全部文件修改，再创建新会话；普通 Reviewer 驳回重试仍保留现有 diff。
 
 ## Worktree 和依赖
 

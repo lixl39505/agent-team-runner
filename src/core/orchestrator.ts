@@ -10,7 +10,7 @@ import type {
   WorkerResult
 } from './types.js';
 import type { AgentBackend, AgentEvent } from '../agent/types.js';
-import type { ApprovalHandler } from '../agent/approval.js';
+import type { ApprovalHandler, UserInputHandler } from '../agent/approval.js';
 import { StateDatabase } from './db.js';
 import { buildBackends, disposeBackends, resolveAgentWithSnapshot, resolveTaskAgent } from '../agent/registry.js';
 import { runAgent } from '../agent/supervise.js';
@@ -59,6 +59,7 @@ export async function runOrchestrator(input: {
   db: StateDatabase;
   runId: string;
   requestApproval?: ApprovalHandler;
+  requestUserInput?: UserInputHandler;
 }): Promise<void> {
   const { config, db, runId } = input;
   let run = db.getRun(runId);
@@ -110,7 +111,8 @@ export async function runOrchestrator(input: {
       for (const candidate of candidates) {
         const promise = executeTask({
           config, db, runId, backends, record: candidate,
-          ...(input.requestApproval ? { requestApproval: input.requestApproval } : {})
+          ...(input.requestApproval ? { requestApproval: input.requestApproval } : {}),
+          ...(input.requestUserInput ? { requestUserInput: input.requestUserInput } : {})
         })
           .catch((error) => {
             db.updateTask(runId, candidate.taskId, {
@@ -137,7 +139,8 @@ export async function runOrchestrator(input: {
     await integrateRun({
       config, db, runId, backends,
       isInterrupted: () => interrupted,
-      ...(input.requestApproval ? { requestApproval: input.requestApproval } : {})
+      ...(input.requestApproval ? { requestApproval: input.requestApproval } : {}),
+      ...(input.requestUserInput ? { requestUserInput: input.requestUserInput } : {})
     });
   } catch (error) {
     if (interrupted) return;
@@ -153,7 +156,7 @@ export async function runOrchestrator(input: {
         db.updateTask(runId, taskId, {
           status: 'changes_requested', phase: 'interrupted',
           attempts: Math.max(0, task.attempts - 1),
-          lastError: 'Interrupted by user; task will resume on the next run.', finishedAt: null
+          lastError: 'Interrupted by user; the next run will discard this attempt and start a clean session.', finishedAt: null
         });
       }
     }
@@ -173,6 +176,7 @@ async function executeTask(input: {
   backends: Record<string, AgentBackend>;
   record: TaskRecord;
   requestApproval?: ApprovalHandler;
+  requestUserInput?: UserInputHandler;
 }): Promise<void> {
   const { config, db, runId, backends } = input;
   let record = db.getTask(runId, input.record.taskId);
@@ -221,6 +225,7 @@ async function executeTask(input: {
       ...(workerBinding.maxTurns !== undefined ? { maxTurns: workerBinding.maxTurns } : {}),
       access: 'workspace-write',
       requestApproval: input.requestApproval,
+      requestUserInput: input.requestUserInput,
       timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs,
       onEvent
     },
@@ -279,6 +284,7 @@ async function executeTask(input: {
       ...(reviewerBinding.maxTurns !== undefined ? { maxTurns: reviewerBinding.maxTurns } : {}),
       access: 'read-only',
       requestApproval: input.requestApproval,
+      requestUserInput: input.requestUserInput,
       timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs
     },
     logPath: join(runDir, 'logs', `${task.id}-review-${reviewCycle}.log`),
@@ -376,6 +382,19 @@ async function ensureTaskWorktree(input: {
   manifest: RunManifest;
 }): Promise<{ path: string; startSha: string }> {
   if (input.record.worktree && input.record.startSha && existsSync(input.record.worktree)) {
+    if (input.record.phase === 'interrupted' || input.record.phase === 'recovered') {
+      if (!input.record.branch) throw new Error(`Interrupted task ${input.task.id} has no worktree branch`);
+      await resetWorktree({
+        repoRoot: input.config.repoRoot,
+        path: input.record.worktree,
+        branch: input.record.branch,
+        baseSha: input.record.startSha
+      });
+      input.db.addEvent(input.runId, input.task.id, 'INTERRUPTED_WORKTREE_RESET', {
+        path: input.record.worktree,
+        startSha: input.record.startSha
+      });
+    }
     return { path: input.record.worktree, startSha: input.record.startSha };
   }
   const run = input.db.getRun(input.runId);
@@ -418,6 +437,7 @@ async function integrateRun(input: {
   runId: string;
   backends: Record<string, AgentBackend>;
   requestApproval?: ApprovalHandler;
+  requestUserInput?: UserInputHandler;
   isInterrupted: () => boolean;
 }): Promise<void> {
   const { config, db, runId } = input;
@@ -453,6 +473,7 @@ async function integrateRun(input: {
         ...(integratorBinding.maxTurns !== undefined ? { maxTurns: integratorBinding.maxTurns } : {}),
         access: 'workspace-write',
         requestApproval: input.requestApproval,
+        requestUserInput: input.requestUserInput,
         timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs
       },
       logPath: join(runDir, 'logs', `integration-conflict-${task.id}.log`),
@@ -497,6 +518,7 @@ async function integrateRun(input: {
         ...(integratorBinding.maxTurns !== undefined ? { maxTurns: integratorBinding.maxTurns } : {}),
         access: 'workspace-write',
         requestApproval: input.requestApproval,
+        requestUserInput: input.requestUserInput,
         timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs
       },
       logPath: join(runDir, 'logs', 'integrator.log'),

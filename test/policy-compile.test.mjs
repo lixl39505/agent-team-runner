@@ -7,7 +7,7 @@ import { compileOpenCode, compileOpenCodeBasePermission } from '../dist/agent/op
 test('claude compile preserves native asks behind coarse role boundaries', () => {
   const worker = compileClaude('workspace-write');
   assert.equal(worker.permissionMode, 'default');
-  assert.deepEqual(worker.allowedTools.sort(), ['Glob', 'Grep', 'Read']);
+  assert.deepEqual(worker.allowedTools.sort(), ['Glob', 'Grep', 'LSP', 'Read', 'TaskGet', 'TaskList', 'TaskOutput'].sort());
   for (const gated of ['Bash', 'Edit', 'Write', 'NotebookEdit', 'WebFetch', 'WebSearch']) {
     assert.equal(worker.allowedTools.includes(gated), false, `${gated} must use Claude native permission handling`);
     assert.equal(worker.disallowedTools.includes(gated), false, `${gated} must not be hard-denied for workers`);
@@ -19,6 +19,7 @@ test('claude compile preserves native asks behind coarse role boundaries', () =>
   }
   assert.equal(readOnly.disallowedTools.includes('Bash'), false, 'read-only sandbox, not command parsing, enforces writes');
   assert.equal(readOnly.disallowedTools.includes('WebFetch'), false, 'network remains natively approvable');
+  assert.equal(readOnly.disallowedTools.includes('AskUserQuestion'), false, 'questions route to the terminal interaction broker');
 });
 
 test('codex compile uses native untrusted approvals and role sandboxes', () => {
@@ -39,6 +40,7 @@ test('codex compile uses native untrusted approvals and role sandboxes', () => {
 test('opencode asks natively for mutable, network, and external operations', () => {
   assert.deepEqual(compileOpenCodeBasePermission(), {
     '*': 'deny', read: 'allow', glob: 'allow', grep: 'allow', list: 'allow',
+    lsp: 'allow', skill: 'allow', todoread: 'allow', todowrite: 'allow', question: 'allow',
     bash: 'ask', edit: 'ask', webfetch: 'ask', websearch: 'ask', external_directory: 'ask'
   });
   assert.equal(compileOpenCode('read-only').access, 'read-only');

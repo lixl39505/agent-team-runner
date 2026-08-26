@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { spawn } from 'node:child_process';
+import spawn from 'cross-spawn';
 import { gitIsolationEnv } from './process-env.js';
 
 export interface ExecResult {
@@ -25,8 +25,8 @@ export async function execFile(program: string, args: string[], cwd: string): Pr
     const child = spawn(program, args, { cwd, env: { ...process.env, ...gitIsolationEnv() }, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
-    child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
-    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.stdout!.on('data', (chunk) => { stdout += chunk.toString(); });
+    child.stderr!.on('data', (chunk) => { stderr += chunk.toString(); });
     child.on('error', reject);
     child.on('close', (code) => resolve({ code: code ?? 1, stdout, stderr }));
   });

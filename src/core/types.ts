@@ -2,6 +2,7 @@ export type BackendId = 'claude' | 'codex' | 'opencode';
 /** @deprecated 旧名，随旧 adapter 层在 Phase 4 一起删除 */
 export type AdapterName = BackendId;
 export type AgentRole = 'lead' | 'worker' | 'reviewer' | 'integrator';
+export type NativeWindowsSandboxPolicy = 'require' | 'allow-degraded';
 
 export type RunStatus =
   | 'planning'
@@ -27,6 +28,8 @@ export interface BackendConfig {
   /** CLI 二进制名或路径，缺省用 backend id 本身 */
   command?: string;
   extraArgs?: string[];
+  /** Native Windows only: fail closed unless degraded unsandboxed execution is explicitly allowed. */
+  nativeWindowsSandbox?: NativeWindowsSandboxPolicy;
 }
 
 /** agents 注册表条目：一个具名的 agent = 后端 + model + 选项 */

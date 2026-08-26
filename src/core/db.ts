@@ -280,7 +280,7 @@ export class StateDatabase {
       this.updateTask(runId, row.task_id, {
         status: 'changes_requested',
         phase: 'recovered',
-        lastError: 'Runner restarted while the task was active. Resume from the existing worktree.'
+        lastError: 'Runner restarted while the task was active. The interrupted attempt will be discarded before retrying.'
       });
       this.addEvent(runId, row.task_id, 'TASK_RECOVERED');
     }

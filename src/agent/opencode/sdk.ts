@@ -1,8 +1,14 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
+import spawn from 'cross-spawn';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createOpencodeClient, type OpencodeClient } from '@opencode-ai/sdk/client';
+import {
+  createOpencodeClient as createOpencodeV2Client,
+  type OpencodeClient as OpencodeV2Client,
+  type QuestionInfo
+} from '@opencode-ai/sdk/v2/client';
 import type {
   AgentBackend,
   AgentEvent,
@@ -10,18 +16,25 @@ import type {
   AgentSession,
   DiscoveryResult,
   ModelInfo,
+  PlatformCheckResult,
   ProbeResult,
   SessionSpec
 } from '../types.js';
 import type { BackendId } from '../../core/types.js';
+import type { NativeWindowsSandboxPolicy } from '../../core/types.js';
 import { compileOpenCode, compileOpenCodeBasePermission } from './policy.js';
 import { parseAgentJson } from '../parse.js';
 import { sanitizedEnv } from '../env.js';
+import { killProcessTree } from '../process-tree.js';
+import { unsupportedNativeWindowsSandbox } from '../platform.js';
 
 export interface OpenCodeBackendOptions {
   command?: string | undefined;
   hostname?: string | undefined;
   port?: number | undefined;
+  nativeWindowsSandbox?: NativeWindowsSandboxPolicy | undefined;
+  /** Test seam; production always uses process.platform. */
+  platform?: NodeJS.Platform | undefined;
 }
 
 interface OpenCodeMessagePart {
@@ -46,13 +59,23 @@ interface OpenCodeMessage {
 export class OpenCodeBackend implements AgentBackend {
   readonly id: BackendId = 'opencode';
   private clientPromise: Promise<OpencodeClient> | null = null;
+  private questionClient: OpencodeV2Client | null = null;
   private serverChild: ChildProcess | null = null;
   private readonly sessions = new Map<string, OpenCodeAgentSession>();
   private subscribed = false;
   /** SSE 事件流：dispose 时必须终结，否则打开的 fetch 连接会钉住事件循环（进程无法退出） */
   private eventStream: AsyncGenerator<unknown> | null = null;
+  private readonly platform: NodeJS.Platform;
+  private readonly nativeWindowsSandbox: NativeWindowsSandboxPolicy;
 
-  constructor(private readonly options: OpenCodeBackendOptions = {}) {}
+  constructor(private readonly options: OpenCodeBackendOptions = {}) {
+    this.platform = options.platform ?? process.platform;
+    this.nativeWindowsSandbox = options.nativeWindowsSandbox ?? 'require';
+  }
+
+  async checkPlatform(): Promise<PlatformCheckResult> {
+    return unsupportedNativeWindowsSandbox('opencode', this.nativeWindowsSandbox, this.platform);
+  }
 
   private get command(): string {
     return this.options.command ?? 'opencode';
@@ -134,6 +157,8 @@ export class OpenCodeBackend implements AgentBackend {
   }
 
   async openSession(spec: SessionSpec): Promise<AgentSession> {
+    const platform = await this.checkPlatform();
+    if (!platform.ok) throw new Error(platform.detail);
     const client = await this.ensureClient();
     await this.ensureSubscribed(client);
     const created = await client.session.create({
@@ -143,7 +168,7 @@ export class OpenCodeBackend implements AgentBackend {
     const sessionId = created.data?.id;
     if (!sessionId) throw new Error('opencode session creation returned no id');
     const session = new OpenCodeAgentSession(
-      client, sessionId, spec, compileOpenCode(spec.access),
+      client, this.questionClient!, sessionId, spec, compileOpenCode(spec.access),
       () => this.sessions.delete(sessionId)
     );
     this.sessions.set(sessionId, session);
@@ -165,6 +190,16 @@ export class OpenCodeBackend implements AgentBackend {
       }
       return;
     }
+    if (event.type === 'question.asked') {
+      const request = properties as unknown as { id?: string; sessionID?: string; questions?: QuestionInfo[] };
+      const session = request.sessionID ? this.sessions.get(request.sessionID) : undefined;
+      if (session && request.id && request.questions) {
+        void session.answerQuestion(request.id, request.questions);
+      } else if (request.id) {
+        void this.rejectQuestion(request.id);
+      }
+      return;
+    }
     if (!sessionId) return;
     if (event.type === 'message.updated' || event.type === 'message.part.updated' || event.type === 'session.diff') {
       this.sessions.get(sessionId)?.onActivity();
@@ -181,6 +216,12 @@ export class OpenCodeBackend implements AgentBackend {
     } catch { /* session may be gone */ }
   }
 
+  private async rejectQuestion(requestId: string): Promise<void> {
+    try {
+      await this.questionClient?.question.reject({ requestID: requestId });
+    } catch { /* session may be gone */ }
+  }
+
   dispose(): void {
     for (const session of [...this.sessions.values()]) void session.interrupt();
     this.sessions.clear();
@@ -191,6 +232,7 @@ export class OpenCodeBackend implements AgentBackend {
     }
     this.killServer();
     this.clientPromise = null;
+    this.questionClient = null;
     this.subscribed = false;
   }
 
@@ -217,7 +259,7 @@ export class OpenCodeBackend implements AgentBackend {
         })
       },
       stdio: ['ignore', 'pipe', 'pipe'],
-      detached: process.platform !== 'win32'
+      detached: this.platform !== 'win32'
     });
     this.serverChild = child;
     const url = await new Promise<string>((resolve, reject) => {
@@ -251,8 +293,10 @@ export class OpenCodeBackend implements AgentBackend {
       this.sessions.clear();
       this.serverChild = null;
       this.clientPromise = null;
+      this.questionClient = null;
       this.subscribed = false;
     });
+    this.questionClient = createOpencodeV2Client({ baseUrl: url });
     return createOpencodeClient({ baseUrl: url });
   }
 
@@ -263,13 +307,11 @@ export class OpenCodeBackend implements AgentBackend {
     // 显式销毁 stdio 流：子进程死后未销毁的管道句柄会钉住事件循环
     try { child.stdout?.destroy(); child.stderr?.destroy(); } catch { /* already closed */ }
     try {
-      if (child.pid && process.platform !== 'win32') process.kill(-child.pid, 'SIGTERM');
-      else child.kill('SIGTERM');
+      killProcessTree(child, 'SIGTERM');
       // ref'd 的 SIGKILL 升级（与 codex jsonrpc 相同的语义）
       setTimeout(() => {
         try {
-          if (child.pid && process.platform !== 'win32') process.kill(-child.pid, 'SIGKILL');
-          else child.kill('SIGKILL');
+          killProcessTree(child, 'SIGKILL');
         } catch { /* already exited */ }
       }, 3_000);
     } catch { /* already exited */ }
@@ -318,6 +360,7 @@ class OpenCodeAgentSession implements AgentSession {
 
   constructor(
     private readonly client: OpencodeClient,
+    private readonly questionClient: OpencodeV2Client,
     sessionId: string,
     private readonly spec: SessionSpec,
     private readonly compiled: ReturnType<typeof compileOpenCode>,
@@ -412,7 +455,9 @@ ${JSON.stringify(this.spec.schema)}`;
   async answerPermission(permissionId: string, request: { type: string; pattern?: string | Array<string> | undefined }): Promise<void> {
     const hardDenied = this.compiled.access === 'read-only' && ['bash', 'edit'].includes(request.type);
     let response: 'once' | 'always' | 'reject' = 'reject';
-    if (!hardDenied && this.spec.requestApproval) {
+    if (!hardDenied && this.compiled.access === 'workspace-write' && request.type === 'edit') {
+      response = 'once';
+    } else if (!hardDenied && this.spec.requestApproval) {
       try {
         const decision = await this.spec.requestApproval({
           backend: 'opencode',
@@ -444,6 +489,35 @@ ${JSON.stringify(this.spec.schema)}`;
         body: { response }
       });
     } catch { /* session may be gone */ }
+  }
+
+  async answerQuestion(requestId: string, questions: QuestionInfo[]): Promise<void> {
+    if (!this.spec.requestUserInput) {
+      try { await this.questionClient.question.reject({ requestID: requestId, directory: this.spec.cwd }); } catch { /* session may be gone */ }
+      return;
+    }
+    try {
+      const normalized = questions.map((question, index) => ({
+        id: String(index),
+        header: question.header,
+        question: question.question,
+        options: question.options,
+        multiple: question.multiple,
+        allowCustom: question.custom !== false
+      }));
+      const answers = await this.spec.requestUserInput({
+        backend: 'opencode', role: this.spec.role, label: this.spec.label,
+        sessionId: this.sessionId, cwd: this.spec.cwd, questions: normalized
+      }, this.approvalController.signal);
+      await this.questionClient.question.reply({
+        requestID: requestId,
+        directory: this.spec.cwd,
+        answers: normalized.map((question) => answers[question.id] ?? [])
+      });
+      this.spec.onEvent?.({ type: 'activity' });
+    } catch {
+      try { await this.questionClient.question.reject({ requestID: requestId, directory: this.spec.cwd }); } catch { /* session may be gone */ }
+    }
   }
 
   async interrupt(): Promise<void> {

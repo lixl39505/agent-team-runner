@@ -1,4 +1,6 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
+import spawn from 'cross-spawn';
+import { killProcessTree } from '../process-tree.js';
 
 /** stdio 换行分隔 JSON 的帧解析（纯函数，单测核心） */
 export function parseFrames(buffer: string): { messages: unknown[]; rest: string } {
@@ -109,14 +111,12 @@ export class JsonRpcConnection {
     }
     this.pending.clear();
     try {
-      if (this.child.pid && process.platform !== 'win32') process.kill(-this.child.pid, 'SIGTERM');
-      else this.child.kill('SIGTERM');
+      killProcessTree(this.child, 'SIGTERM');
       // SIGKILL 升级保持 ref'd：子进程不死 → stdio 管道句柄不释放 → 事件循环不排干。
       // ref 的定时器保证 3 秒内强杀子进程，管道随之关闭，宿主进程可正常退出。
       setTimeout(() => {
         try {
-          if (this.child.pid && process.platform !== 'win32') process.kill(-this.child.pid, 'SIGKILL');
-          else this.child.kill('SIGKILL');
+          killProcessTree(this.child, 'SIGKILL');
         } catch { /* already exited */ }
       }, 3_000);
     } catch { /* already exited */ }

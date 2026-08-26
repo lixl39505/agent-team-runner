@@ -9,7 +9,8 @@ src/
   cli.ts                  CLI 入口，命令解析与路由
   agent/                  后端层（取代旧 adapters/）
     types.ts              AgentBackend / AgentSession / AgentEvent / SessionSpec / AgentRunOutcome
-    approval.ts           FIFO 终端审批队列；原生请求统一映射 once/session/deny
+    approval.ts           FIFO 终端交互队列；权限审批与用户补充问题使用独立协议
+    process-tree.ts       POSIX 进程组 / Windows taskkill 进程树终止
     registry.ts           buildBackends 工厂；resolveAgent/snapshotAgents/resolveTaskAgent（取代 profiles.ts）
     supervise.ts          runAgent 监督器：事件泵、日志、心跳、超时/静默、中断与宽限强杀
     fake.ts               脚本化 AgentBackend（单测核心）
@@ -144,6 +145,7 @@ const result = await runAgent<LeadResult>({
     schema: LEAD_SCHEMA, model: leadBinding.model,
     access: 'read-only',             // 粗粒度角色边界
     requestApproval,                 // 原生权限请求送到前台 FIFO 队列
+    requestUserInput,                // Agent 补充问题送到同一 FIFO 的独立问答协议
     timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs
   },
   logPath, outputPath
@@ -215,7 +217,25 @@ SELECT task_id FROM tasks
 WHERE run_id = ? AND status IN ('running', 'verifying', 'reviewing')
 ```
 
-> **只修改 DB，不杀旧进程。** 正常前台运行时，SIGTERM/SIGINT/SIGHUP handler 会调用 `disposeBackends` 释放当前 Runner 持有的 Agent 会话和子进程组。终端中使用 Ctrl-C，随后可重新执行 `run` 恢复 Worktree。
+> `resetInterrupted` **只修改 DB，不负责杀进程**。正常前台运行时，SIGTERM/SIGINT/SIGHUP handler 会调用 `disposeBackends`：POSIX 终止整个进程组，Windows 使用 `taskkill /T /F` 终止整个进程树。Ctrl-C 后 Worktree 暂时保留用于检查现场；再次 `run` 时才执行清理。
+
+#### Ctrl-C 后的恢复边界
+
+这里的“恢复”不是恢复模型内存中的执行点，也不调用后端 session resume：
+
+1. 已经 `approved` 的任务保持不变，不重新运行。
+2. 当时活跃且尚未 approved 的任务变为 `changes_requested`，本次被中断的 attempt 不计入重试额度。
+3. Ctrl-C 返回后，任务 Worktree 暂时保留，便于人工检查中断现场。
+4. 下一次 `run` 真正调度该任务时，`ensureTaskWorktree` 删除并从 `startSha` 重建任务 Worktree，丢弃该 attempt 的 tracked、untracked 和 ignored 修改；随后创建全新 Agent 会话，从 Worker 步骤重新执行完整的 Worker → 机械验证 → Reviewer 尝试。
+5. 若在 integration 阶段中断，下一次 `run` 会从 `baseSha` 重建 integration Worktree，并按拓扑顺序重新 cherry-pick 所有 approved task commit；不会从半次 cherry-pick 中续跑。
+
+#### invocation、session 与 turn
+
+- **Runner invocation**：一次 `runAgent()` 调用，从 `openSession()` 到结构化 outcome；超时、日志和重试均以此为边界。
+- **backend session**：后端会话或 thread。当前每次 Runner invocation 都新建会话；`resumeSessionId` 只是预留字段。
+- **provider turn**：后端协议自己的概念，不应作为 Runner 生命周期术语。Claude 一次 query 可包含多个“模型响应 → 工具结果 → 再推理”轮次；Codex 当前每次 invocation 在新 thread 中发起一个 `turn/start`；OpenCode 的一次 `session.prompt` 内部同样可循环调用工具。
+
+因此本文描述 Runner 行为时使用“invocation/调用”；只有说明 Claude `maxTurns` 或 Codex 协议消息时才使用 turn。
 
 ### 3.2 核心事件循环
 
@@ -274,7 +294,9 @@ while (true) {
 `orchestrator.ts:254-285`
 
 ```
-1. 如果 Worktree 已存在 (record.worktree && existsSync) → 复用
+1. 如果 Worktree 已存在：
+   - phase 为 `interrupted/recovered` → 从 `startSha` 删除并重建，再复用路径
+   - 其他 phase → 直接复用（普通 retry 仍保留 diff 和 Reviewer 反馈）
 2. 否则创建:
    repoName = safeSegment(basename(repoRoot))
    path     = worktreesDir/repoName/runId/taskId
@@ -326,21 +348,22 @@ loadSkill('worker')
 + "Runner owns staging and commits. Do not run git add/commit/merge/rebase/push."
 ```
 
-厚重试上下文由 orchestrator 在重试时构造（`collectWorktreeDiff` / `readPreviousSummary`）——
-**worktree 是记忆载体**：会话每次全新（避免上下文腐烂），但磁盘状态与反馈原文完整注入 prompt。
+厚重试上下文由 orchestrator 在普通失败/Reviewer 驳回重试时构造（`collectWorktreeDiff` / `readPreviousSummary`）——
+**worktree 是普通重试的记忆载体**：会话每次全新（避免上下文腐烂），但磁盘状态与反馈原文完整注入 prompt。Ctrl-C/进程异常中断是例外：下次调度前从 `startSha` 重建，不向新会话继承半成品 diff。
 
 ### 步骤 3：会话监督
 
-`agent/supervise.ts` 的 `runAgent` 为会话设置两层守护，并包装权限等待：
+`agent/supervise.ts` 的 `runAgent` 为会话设置两层守护，并包装终端交互等待：
 
 | 守护层 | 触发条件 | 动作 |
 |--------|---------|------|
-| 硬超时 | `timeoutMs`（默认 2 小时）到期 | `session.interrupt()` → 15s 宽限后 `close()` 强杀 |
-| 静默超时 | 任何 AgentEvent 之外静默 `staleAfterMs`（默认 10 分钟） | 同上 |
+| 硬超时 | invocation 的累计有效运行时间超过 `timeoutMs`（默认 2 小时） | `session.interrupt()` → 15s 宽限后 `close()` 强杀 |
+| 静默超时 | 连续 `staleAfterMs`（默认 10 分钟）没有任何 `AgentEvent` | 同上 |
 
 - `lastActivity` 在**任何 AgentEvent**（消息增量、工具调用、权限裁决、用量）时重置——"无进展"取代旧"无 stdout"
-- `requestApproval` 等待期间暂停 hard/stale 有效时钟；返回后恢复计时
+- `requestApproval` 与 `requestUserInput` 排队和等待期间都暂停 hard/stale 有效时钟；返回后恢复计时
 - 用户拒绝作为后端原生工具结果返回；单次或重复拒绝本身不会被 Runner 判定为任务失败
+- 被拒绝后 Agent 可以解释、换工具或采取无权限替代方案；最终只有 invocation 失败、Agent 返回 `failed/blocked`，或后续验证失败才会改变任务结果
 - 事件以 JSONL 追加到 logPath；结构化输出落盘 outputPath
 - 传输异常（completion reject）转为 `ok:false` outcome，走既有 retryOrFail
 
@@ -418,7 +441,7 @@ loadSkill('reviewer')
    Inspect them with git diff --cached ... Workers never commit ..."
 ```
 
-Reviewer 以 `access: 'read-only'` 运行：Claude/Codex 使用原生只读 sandbox，OpenCode 对 Bash/Edit 硬拒绝；外加下方的 Git 状态快照兜底。
+Reviewer 以 `access: 'read-only'` 运行：macOS/Linux 上 Claude/Codex 使用原生只读 sandbox；native Windows 上 Claude 硬拒绝 Bash；OpenCode 在所有平台对 Bash/Edit 硬拒绝。下方的 Git 状态快照提供独立兜底。
 
 **安全校验** — Reviewer 不能修改任何东西 (`orchestrator.ts:200-206`)：
 
@@ -589,9 +612,9 @@ writeFileSync(join(runDir, 'summary.txt'), `...`, 'utf8');
 ```yaml
 version: 2
 backends:                    # 传输层接线
-  claude: {}
-  codex: { command: codex }
-  opencode: {}
+  claude: { nativeWindowsSandbox: require }
+  codex: { command: codex, nativeWindowsSandbox: require }
+  opencode: { nativeWindowsSandbox: require }
 agents:                      # 人工筛选的 agent 注册表
   lead-agent:     { backend: codex, model: gpt-5.6-terra, description: strong planner, maxTurns: 80 }
   fast-worker:    { backend: opencode, model: zhipuai-coding-plan/glm-5.2 }
@@ -604,6 +627,7 @@ defaultAgent: <注册表名>     # 未配置角色的回退
 - v1 配置（`adapters`/`defaultAdapter`/`models` 字段）由 `agent-config.ts:migrateV1Fields` **内存内迁移**：roles 字符串物化为注册表条目、别名表展开、打印等价 v2 YAML + 弃用警告，不重写磁盘。
 - 自定义 `agents:` 整体替换默认注册表；用户未显式指定 `defaultAgent` 时自动取注册表第一个条目。
 - `roles.<role>` 也接受内联 `<backend>.<model>` 规格（`-c roles.lead=codex.gpt-5.6-terra` 快速覆写）。
+- `backends.<id>.nativeWindowsSandbox` 仅影响 native Windows：`require`（默认）要求等价 sandbox，`allow-degraded` 是用户明确选择的宿主权限降级。WSL2 作为 Linux 运行，不触发该策略。
 
 ### 角色解析回退链（`agent/registry.ts`）
 
@@ -670,6 +694,7 @@ export interface SessionSpec {
   schema: object;                                           // 结构化输出 JSON Schema
   model?: string; access: 'read-only' | 'workspace-write';  // 不可提升的角色边界
   requestApproval?: ApprovalHandler;                        // once/session/deny
+  requestUserInput?: UserInputHandler;                      // question id -> string[]
   timeoutMs: number; staleAfterMs: number; maxTurns?: number;
   resumeSessionId?: string;                                 // 实验开关预留
   onEvent?: (event: AgentEvent) => void;
@@ -689,7 +714,7 @@ export interface AgentRunOutcome<T> {
 }
 ```
 
-`AgentEvent` 联合：`activity | session | message | tool-call | tool-result | permission-check | usage`——事件流同时驱动心跳、日志与静默判断。
+`AgentEvent` 联合：`activity | session | message | tool-call | tool-result | permission-check | usage`——事件流同时驱动心跳、日志与静默判断。回答用户问题后适配器发出 `activity`；等待答案期间监督时钟已暂停。
 
 ### 工厂与进程池
 
@@ -697,19 +722,35 @@ export interface AgentRunOutcome<T> {
 
 ### 监督器（`agent/supervise.ts:runAgent`）
 
-`openSession`（包装 onEvent：记日志 + 重置静默计时 + 转发；包装 requestApproval：暂停有效时钟）→ 并发跑 `completion()` 与两层守护（硬超时 / 静默超时，均 `interrupt()` + 15s 宽限后 `close()` 强杀）→ `close()` → 结构化输出写 outputPath。传输异常转为 `ok:false` outcome。审批排队和等待用户输入的墙钟时间不计入 hard/stale timeout。
+`openSession`（包装 onEvent：记日志 + 重置静默计时 + 转发；包装 requestApproval/requestUserInput：暂停有效时钟）→ 并发跑 `completion()` 与两层守护（硬超时 / 静默超时，均 `interrupt()` + 15s 宽限后 `close()` 强杀）→ `close()` → 结构化输出写 outputPath。传输异常转为 `ok:false` outcome。审批和问答的排队/等待墙钟时间不计入 hard/stale timeout。
 
-### 原生权限路由（`agent/approval.ts` + 各后端 policy.ts）
+### 终端交互与原生权限路由（`agent/approval.ts` + 各后端 policy.ts）
 
-Runner 只传递 `read-only | workspace-write` 角色边界，不实现 Bash 解析、路径实时裁决或网络开关。后端产生的原生请求由共享 `ApprovalQueue` 串行显示，用户返回 `once | session | deny`；具体协议值由适配器映射：
+Runner 只传递 `read-only | workspace-write` 角色边界，不实现通用 Bash 解析、路径实时裁决或网络开关。后端产生的所有终端交互由共享 `ApprovalQueue` 串行显示，避免并发任务争抢 stdin，但交互契约分开：
+
+- 权限请求返回 `once | session | deny`，由适配器映射为后端原生裁决。
+- 补充问题返回 `Record<questionId, string[]>`，没有“本次/本会话授权”语义。Claude `AskUserQuestion`、Codex `item/tool/requestUserInput`、OpenCode `question.asked` 均接入该通道。
+- Codex MCP elicitation 不是 Agent 补充问题，当前显式 decline；后续需要单独实现 schema-aware form renderer，不能把它当普通文本问题接受。
 
 | 后端 | sandbox | in-flight 裁决 | 说明 |
 |---|---|---|---|
-| claude | SDK sandbox：`failIfUnavailable`、禁止 unsandboxed、只读角色 deny cwd；Git metadata denyWrite | `canUseTool` → allow/deny；session 选择把 SDK suggestions 的 destination 改为 session | 读取工具可原生预授权，AskUserQuestion 暂不路由 |
-| codex | `sandboxPolicy`：readOnly / workspaceWrite(writableRoots=[cwd], networkAccess=false) | command/file → accept/acceptForSession/decline；permissions profile → turn/session grant | 泛化权限请求支持网络和额外目录；只读角色不授予写权限 |
-| opencode | 无进程 sandbox；read-only 角色硬拒绝 Bash/Edit | SSE permission.updated → once/always/reject | Workspace 角色的 Bash/Web/Edit/external_directory 全部使用原生 ask |
+| claude | macOS/Linux 使用 SDK sandbox：`failIfUnavailable`、禁止 unsandboxed、只读角色 deny cwd；Git metadata denyWrite | `canUseTool` → allow/deny；session 选择把 SDK suggestions 的 destination 改为 session | workspace 内 Edit/Write/NotebookEdit 默认 allow；外部路径、Bash、网络仍走原生 ask |
+| codex | `sandboxPolicy`：readOnly / workspaceWrite(writableRoots=[cwd], networkAccess=false) | command → accept/acceptForSession/decline；permissions profile → turn/session grant | workspace 内 file change 默认 accept；额外目录和网络仍审批；只读角色不授予写权限 |
+| opencode | 无进程 sandbox；read-only 角色硬拒绝 Bash/Edit | SSE permission.updated → once/always/reject | workspace 内 edit 由 Runner 自动 once；Bash/Web/external_directory 仍审批 |
 
-`allowedPaths` / `blockedPaths` 不参与 in-flight 审批。它们在 Agent turn 完成后由 `verifier.ts` 检查实际 Git 变更；Reviewer 的只读 sandbox 和前后 Git fingerprint 提供另一条独立边界。
+安全读工具按**明确工具名**预授权，不对 MCP/custom tool 使用通配符：Claude 为 `Read/Glob/Grep/LSP/TaskGet/TaskList/TaskOutput`；OpenCode 为 `read/glob/grep/list/lsp/skill/todoread/todowrite/question`；Codex 不使用工具名 allowlist，而由原生 sandbox 限制能力。网络读取不属于安全本地读取，仍需审批。
+
+`allowedPaths` / `blockedPaths` 不参与 in-flight 审批。它们在 Agent invocation 完成后由 `verifier.ts` 检查实际 Git 变更；Reviewer 的只读 sandbox 和前后 Git fingerprint 提供另一条独立边界。
+
+### 平台能力矩阵
+
+| 平台 | 子进程启动/清理 | 后端隔离 |
+|---|---|---|
+| macOS | `cross-spawn`；独立进程组 SIGTERM → 3s 后 SIGKILL | Claude/Codex 使用各自 macOS sandbox；OpenCode 无进程 sandbox |
+| Linux | `cross-spawn`；独立进程组 SIGTERM → 3s 后 SIGKILL | Claude/Codex 使用各自 Linux sandbox，缺少内核/工具能力时 fail closed；OpenCode 无进程 sandbox |
+| Windows | `cross-spawn` 兼容 `.cmd`/shebang；`taskkill /T /F` 清理整棵进程树 | 默认 `nativeWindowsSandbox: require` fail closed：Codex 检查 native readiness，Claude/OpenCode 因无等价 sandbox 拒绝运行；只有显式 `allow-degraded` 才允许降级 |
+
+三平台都能运行 Runner，但“兼容”不代表隔离强度相同。`allow-degraded` 时，native Windows 上 Claude/OpenCode 的获批命令具有宿主用户权限；Codex 的 readiness 为 `notConfigured`、`updateRequired` 或查询失败时也会降级。native Windows 上需要 Claude 的完整命令 sandbox 时应在 WSL2 中运行；OpenCode 在所有平台上如需强进程隔离，应放入容器或其他外层 sandbox。路径策略已统一把 `\\` 归一化为 `/`。
 
 ### claude 后端（`agent/claude/sdk.ts`）
 
@@ -720,14 +761,14 @@ Runner 只传递 `read-only | workspace-write` 角色边界，不实现 Bash 解
 
 ### codex 后端（`agent/codex/`）
 
-- `jsonrpc.ts`：stdio 换行分隔 JSON 客户端，帧编解码 `parseFrames` 纯函数可测；服务端主动请求（审批）异步应答；进程以独立进程组 spawn，`close()` 进程组 SIGTERM → **ref'd** 3s SIGKILL 升级（unref 版会在 SIGTERM 被忽略时留下孤儿与未释放的管道句柄）。
-- `app-server.ts`：常驻 `codex app-server` 子进程；`initialize` 握手（clientInfo）→ `thread/start`（cwd/model/approvalPolicy/sandbox）→ `turn/start`（input 文本 + `outputSchema` + per-turn 覆盖）；通知路由：`turn/completed`→完成、`item/completed`（agentMessage/commandExecution）→事件、`item/*/delta`→activity、`thread/tokenUsage/updated`→usage；command/file/permissions 审批请求异步等待终端决定。
+- `jsonrpc.ts`：stdio 换行分隔 JSON 客户端，帧编解码 `parseFrames` 纯函数可测；服务端主动请求异步应答；POSIX 进程以独立进程组 spawn，`close()` 进程组 SIGTERM → **ref'd** 3s SIGKILL 升级，Windows 使用 `taskkill /T /F`。
+- `app-server.ts`：常驻 `codex app-server` 子进程；native Windows 预检调用 `windowsSandbox/readiness`，结果为 `ready` 才满足默认策略；`notConfigured`、`updateRequired` 或协议查询失败只有在显式 `allow-degraded` 时继续。随后 `thread/start`（cwd/model/approvalPolicy/sandbox）→ `turn/start`（input 文本 + `outputSchema` + per-turn 覆盖）；通知路由：`turn/completed`→完成、`item/completed`（agentMessage/commandExecution）→事件、`item/*/delta`→activity、`thread/tokenUsage/updated`→usage；command/file/permissions 审批与 `item/tool/requestUserInput` 问答请求异步等待终端决定。
 - `protocol/` 是 `npm run gen:codex`（`codex app-server generate-ts`）生成的 vendored 类型；`protocol/GENERATED_FROM` 记录生成时的 CLI 版本，`agent/codex/generated.ts` 在 doctor 中与实际版本比对（不一致 → warn 提示重新生成）。`app-server.ts` / `policy.ts` 窄类型导入实际消费的协议类型（`TurnStartParams`、`SandboxPolicy`、审批 params/response、通知载荷、`ModelListResponse` 等，均为 `import type` 零运行时耦合）——上游破坏性变更在 `npm run check` 直接变成编译错误，升级流程是机械的 `gen:codex` → `check` → 集成测试。
 
 ### opencode 后端（`agent/opencode/sdk.ts`）
 
 - **自管 `opencode serve` 子进程**：自己 spawn（支持 `backends.opencode.command` 覆盖、自选端口、解析 "listening on" 行就绪）+ 只用 SDK 的 `createOpencodeClient({baseUrl})` 连接。不使用 SDK 的 `createOpencode()` 托管模式——其 server 关闭是黑盒（实测残留未销毁的 stdio 管道句柄，宿主进程无法退出）且硬编码命令名。
-- dispose：终结 SSE 订阅流 → 销毁 server 子进程 stdio 流 → 进程组 SIGTERM → ref'd 3s SIGKILL 升级（与 codex jsonrpc 同语义）。
+- dispose：终结 SSE 订阅流 → 销毁 server 子进程 stdio 流 → POSIX 进程组终止或 Windows `taskkill /T /F`（与 codex jsonrpc 同语义）。
 - `session.create`（directory=cwd）→ `session.prompt`（parts 文本 + model `{providerID, modelID}` + `format {type:'json_schema', retryCount}`，SDK 类型滞后于服务端故用 cast；prompt 同时内嵌 schema 兜底）；响应取 `info.structured` 优先，退回 parts 文本经 `parseAgentJson` 解析。
 - provider 错误（如 401）在 `info.error`——显式转为失败 outcome 并透出明细。
 
@@ -760,7 +801,7 @@ cargo test
 `shell.ts:3-26` `splitCommand` — 拒绝以下所有内容：
 
 ```
-; & | < > `         shell 控制/重定向操作符
+; & | < > ` ^       shell 控制/重定向/Windows 转义操作符
 $()                 命令替换
 \n \r               多行命令
 ```
@@ -843,10 +884,10 @@ Runner 重启时 (`db.ts:266-281` `resetInterrupted`)：
     → 重置为 changes_requested
     → phase = 'recovered'
     → lastError = 'Runner restarted while the task was active...'
-    → 保留 worktree 和修改文件
+    → 暂时保留 worktree，供人工检查现场
 ```
 
-`ensureTaskWorktree` 检测到已有 Worktree 时直接复用，避免重复创建。
+`ensureTaskWorktree` 检测到 `interrupted/recovered` phase 时，调用 `resetWorktree` 从 `startSha` 删除并重建任务 Worktree，然后启动全新 Worker 会话；其他普通重试继续复用已有 Worktree，以保留 Reviewer 反馈对应的 diff。
 
 ## 数据库 Schema
 
@@ -972,10 +1013,14 @@ npm run test:protocol     # 协议层集成（AGENT_TEAM_PROTOCOL=1）：discove
 npm run test:integration  # 全会话层（AGENT_TEAM_INTEGRATION=1）：真实推理，需要各 CLI 本地登录
 ```
 
+- `.github/workflows/ci.yml` 在 `ubuntu-latest`、`macos-latest` 与 `windows-latest` 运行 `npm test`。
+- Windows 路径 tokenization 和 sandbox 降级策略是可在任意平台执行的纯单元测试；`taskkill /T /F` 后代清理测试仅在 Windows 执行，其他平台显式 skip。
+- Codex readiness 的 `ready/notConfigured/updateRequired` 映射是纯单元测试；对真实 Codex app-server 的 readiness 请求在 Windows CI 不执行，因为 CI 没有登录的 Codex CLI。用户机器上的 `doctor`、`plan`、`launch` 与 `run` 预检会执行真实查询。
+
 - 两个集成 script 自带 `--test-force-exit`：dispose 后事件循环已排干（handles/requests 均空的诊断结论），但 node:test 子进程在此场景偶发不退出，官方 flag 只影响收尾不影响失败检测。
 - opencode 全会话额外需要 `AGENT_TEAM_OPENCODE_SPIKE=1`（本机 provider 挂起，纯 SDK 复现，非集成问题）。
 - codex 升级验证顺序：`npm run gen:codex` → `npm run check`（窄类型导入让破坏性变更变成编译错误）→ `npm run test:protocol` → 需要时 `npm run test:integration`。
 
 ## 前台运行与终止
 
-`plan`、`launch` 和 `run` 要求交互终端，因为任一后端都可能在 turn 中发起权限请求。Ctrl-C 触发 `disposeBackends`，释放当前 Runner 的 Agent 会话和子进程组；下次 `run` 通过 `resetInterrupted` 恢复数据库状态并复用 Worktree。
+`plan`、`launch` 和 `run` 要求交互终端，因为任一后端都可能在 invocation 中发起权限请求或补充问题。Ctrl-C 触发 `disposeBackends`，释放当前 Runner 的 Agent 会话和子进程树；现场 Worktree 暂时保留。下次 `run` 调度未完成任务前从 `startSha` 重建其 Worktree，并使用新会话重跑；integration 从 `baseSha` 重建。

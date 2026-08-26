@@ -67,3 +67,24 @@ test('ApprovalQueue cancels a queued request without breaking FIFO ownership', a
   pending.shift()('d');
   assert.equal(await third, 'deny');
 });
+
+test('ApprovalQueue serializes questions with approvals and returns structured answers', async () => {
+  const answers = ['o', '1, 2', 'custom value'];
+  const queue = new ApprovalQueue(async () => answers.shift(), () => {});
+  assert.equal(await queue.request(request('approval')), 'once');
+  assert.deepEqual(await queue.requestUserInput({
+    backend: 'claude', role: 'worker', cwd: '/repo',
+    questions: [
+      {
+        id: 'features', question: 'Which features?', multiple: true,
+        options: [{ label: 'Auth' }, { label: 'Search' }]
+      },
+      {
+        id: 'detail', question: 'Anything else?', options: [{ label: 'None' }], allowCustom: true
+      }
+    ]
+  }), {
+    features: ['Auth', 'Search'],
+    detail: ['custom value']
+  });
+});

@@ -1,6 +1,6 @@
 /**
  * OpenCode has no process sandbox, so read-only roles hard-deny mutating tools.
- * Workspace roles leave operation-level decisions to native permission requests.
+ * Workspace roles auto-answer direct edits but leave commands, network, and external paths to native asks.
  */
 export interface CompiledOpenCodePolicy {
   serverPermission: Record<string, unknown>;
@@ -14,6 +14,11 @@ export function compileOpenCodeBasePermission(): Record<string, unknown> {
     glob: 'allow',
     grep: 'allow',
     list: 'allow',
+    lsp: 'allow',
+    skill: 'allow',
+    todoread: 'allow',
+    todowrite: 'allow',
+    question: 'allow',
     bash: 'ask',
     edit: 'ask',
     webfetch: 'ask',

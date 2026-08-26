@@ -21,6 +21,33 @@ export interface ApprovalRequest {
 
 export type ApprovalHandler = (request: ApprovalRequest, signal?: AbortSignal) => Promise<ApprovalDecision>;
 
+export interface UserInputOption {
+  label: string;
+  description?: string | undefined;
+}
+
+export interface UserInputQuestion {
+  id: string;
+  header?: string | undefined;
+  question: string;
+  options?: UserInputOption[] | undefined;
+  multiple?: boolean | undefined;
+  allowCustom?: boolean | undefined;
+  secret?: boolean | undefined;
+}
+
+export interface UserInputRequest {
+  backend: BackendId;
+  role: AgentRole;
+  label?: string | undefined;
+  sessionId?: string | undefined;
+  cwd: string;
+  questions: UserInputQuestion[];
+}
+
+export type UserInputAnswers = Record<string, string[]>;
+export type UserInputHandler = (request: UserInputRequest, signal?: AbortSignal) => Promise<UserInputAnswers>;
+
 type Ask = (prompt: string, signal?: AbortSignal) => Promise<string>;
 
 /** Serializes concurrent backend requests so only one prompt owns stdin at a time. */
@@ -33,15 +60,23 @@ export class ApprovalQueue {
   ) {}
 
   request: ApprovalHandler = async (request, signal) => {
+    return await this.enqueue(() => this.promptApproval(request, signal), signal);
+  };
+
+  requestUserInput: UserInputHandler = async (request, signal) => {
+    return await this.enqueue(() => this.promptUserInput(request, signal), signal);
+  };
+
+  private async enqueue<T>(prompt: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     const turn = this.tail.then(async () => {
-      if (signal?.aborted) throw signal.reason ?? new Error('approval cancelled');
-      return await this.prompt(request, signal);
+      if (signal?.aborted) throw signal.reason ?? new Error('interaction cancelled');
+      return await prompt();
     });
     this.tail = turn.then(() => {}, () => {});
     return await abortable(turn, signal);
-  };
+  }
 
-  private async prompt(request: ApprovalRequest, signal?: AbortSignal): Promise<ApprovalDecision> {
+  private async promptApproval(request: ApprovalRequest, signal?: AbortSignal): Promise<ApprovalDecision> {
     this.write(formatApproval(request));
     while (true) {
       const choices = request.allowSession ? '[o] once  [s] session  [d] deny: ' : '[o] once  [d] deny: ';
@@ -50,6 +85,60 @@ export class ApprovalQueue {
       if (request.allowSession && (answer === 's' || answer === 'session' || answer === 'always')) return 'session';
       if (answer === 'd' || answer === 'deny' || answer === 'reject') return 'deny';
       this.write('Enter o, d, or s when session approval is available.\n');
+    }
+  }
+
+  private async promptUserInput(request: UserInputRequest, signal?: AbortSignal): Promise<UserInputAnswers> {
+    this.write(formatUserInputHeading(request));
+    const answers: UserInputAnswers = {};
+    for (const question of request.questions) {
+      this.write(`\n${question.header ? `[${question.header}] ` : ''}${question.question}\n`);
+      for (const [index, option] of (question.options ?? []).entries()) {
+        this.write(`  ${index + 1}. ${option.label}${option.description ? ` - ${option.description}` : ''}\n`);
+      }
+      if (question.secret) this.write('  Note: this terminal input is not masked.\n');
+      answers[question.id] = await this.promptQuestion(question, signal);
+    }
+    return answers;
+  }
+
+  private async promptQuestion(question: UserInputQuestion, signal?: AbortSignal): Promise<string[]> {
+    const options = question.options ?? [];
+    const prompt = options.length === 0
+      ? 'Answer: '
+      : question.multiple
+        ? `Select comma-separated numbers${question.allowCustom ? ' or enter custom text' : ''}: `
+        : `Select a number${question.allowCustom ? ' or enter custom text' : ''}: `;
+    while (true) {
+      const answer = (await this.ask(prompt, signal)).trim();
+      if (!answer) {
+        this.write('Enter an answer.\n');
+        continue;
+      }
+      if (options.length === 0) return [answer];
+      const values = question.multiple ? answer.split(',').map((value) => value.trim()).filter(Boolean) : [answer];
+      const selected: string[] = [];
+      let valid = true;
+      for (const value of values) {
+        const index = Number(value);
+        if (Number.isInteger(index) && index >= 1 && index <= options.length) {
+          selected.push(options[index - 1]!.label);
+          continue;
+        }
+        const option = options.find((candidate) => candidate.label.toLowerCase() === value.toLowerCase());
+        if (option) {
+          selected.push(option.label);
+          continue;
+        }
+        if (question.allowCustom) {
+          selected.push(value);
+          continue;
+        }
+        valid = false;
+        break;
+      }
+      if (valid && selected.length > 0) return selected;
+      this.write(`Enter ${question.multiple ? 'one or more valid numbers separated by commas' : 'a valid option number'}.\n`);
     }
   }
 }
@@ -70,6 +159,7 @@ async function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<
 
 export class TerminalApprovalBroker {
   readonly request: ApprovalHandler;
+  readonly requestUserInput: UserInputHandler;
   private readonly readline: Interface;
 
   constructor(input: Readable = process.stdin, output: Writable = process.stdout) {
@@ -81,11 +171,17 @@ export class TerminalApprovalBroker {
       (text) => output.write(text)
     );
     this.request = queue.request;
+    this.requestUserInput = queue.requestUserInput;
   }
 
   close(): void {
     this.readline.close();
   }
+}
+
+function formatUserInputHeading(request: UserInputRequest): string {
+  const heading = [request.backend, request.role, request.label].filter(Boolean).join(' / ');
+  return `\n[Question] ${heading}\nWorking directory: ${request.cwd}\n`;
 }
 
 function formatApproval(request: ApprovalRequest): string {

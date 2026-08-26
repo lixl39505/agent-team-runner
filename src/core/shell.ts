@@ -1,20 +1,37 @@
-import { spawn } from 'node:child_process';
+import spawn from 'cross-spawn';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { verificationEnv } from './process-env.js';
 
-export function splitCommand(input: string): string[] {
-  if (/[\n\r;&|<>`]/.test(input) || input.includes('$(')) {
+export function splitCommand(input: string, platform: NodeJS.Platform = process.platform): string[] {
+  if (/[\n\r;&|<>`^]/.test(input) || input.includes('$(')) {
     throw new Error(`Unsafe shell syntax is not allowed: ${input}`);
   }
   const result: string[] = [];
   let current = '';
   let quote: 'single' | 'double' | null = null;
+  const command = input.trim();
   let escape = false;
-  for (const char of input.trim()) {
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index]!;
     if (escape) { current += char; escape = false; continue; }
-    if (char === '\\' && quote !== 'single') { escape = true; continue; }
+    if (char === '\\') {
+      if (platform !== 'win32' && quote !== 'single') { escape = true; continue; }
+      if (platform === 'win32' && quote === 'double') {
+        let slashes = 1;
+        while (command[index + slashes] === '\\') slashes += 1;
+        if (command[index + slashes] === '"') {
+          current += '\\'.repeat(Math.floor(slashes / 2));
+          if (slashes % 2 === 1) current += '"';
+          else quote = null;
+          index += slashes;
+          continue;
+        }
+      }
+      current += char;
+      continue;
+    }
     if (char === "'" && quote !== 'double') { quote = quote === 'single' ? null : 'single'; continue; }
     if (char === '"' && quote !== 'single') { quote = quote === 'double' ? null : 'double'; continue; }
     if (/\s/.test(char) && quote === null) {
@@ -29,12 +46,12 @@ export function splitCommand(input: string): string[] {
   return result;
 }
 
-export function assertAllowedCommand(command: string, prefixes: string[]): void {
-  const tokens = splitCommand(command);
+export function assertAllowedCommand(command: string, prefixes: string[], platform: NodeJS.Platform = process.platform): void {
+  const tokens = splitCommand(command, platform);
   assertNoCapabilityBearingArguments(tokens);
   const normalized = tokens.join(' ');
   const allowed = prefixes.some((prefix) => {
-    const prefixTokens = splitCommand(prefix);
+    const prefixTokens = splitCommand(prefix, platform);
     return prefixTokens.every((token, index) => tokens[index] === token);
   });
   if (!allowed) throw new Error(`Verification command is not allowlisted: ${normalized}`);
@@ -78,8 +95,8 @@ export async function runCommand(command: string, cwd: string, log?: (line: stri
     const home = mkdtempSync(join(tmpdir(), 'agent-team-verification-home-'));
     const child = spawn(program!, args, { cwd, env: verificationEnv(home), stdio: ['ignore', 'pipe', 'pipe'] });
     const cleanup = (): void => { rmSync(home, { recursive: true, force: true }); };
-    child.stdout.on('data', (chunk) => log?.(chunk.toString()));
-    child.stderr.on('data', (chunk) => log?.(chunk.toString()));
+    child.stdout!.on('data', (chunk) => log?.(chunk.toString()));
+    child.stderr!.on('data', (chunk) => log?.(chunk.toString()));
     child.on('error', (error) => { cleanup(); reject(error); });
     child.on('close', (code) => { cleanup(); resolve(code ?? 1); });
   });

@@ -4,7 +4,7 @@ import type { LeadResult, RunnerConfig } from './types.js';
 import { StateDatabase } from './db.js';
 import { buildBackends, disposeBackends, resolveAgent, snapshotAgents } from '../agent/registry.js';
 import { runAgent } from '../agent/supervise.js';
-import type { ApprovalHandler } from '../agent/approval.js';
+import type { ApprovalHandler, UserInputHandler } from '../agent/approval.js';
 import { agentList } from './agent-config.js';
 import { LEAD_SCHEMA, validateLeadResult } from './validation.js';
 import { ensureGitRepo, revParse } from './git.js';
@@ -22,6 +22,7 @@ export async function planRun(input: {
   goalFile: string;
   runId?: string;
   requestApproval?: ApprovalHandler;
+  requestUserInput?: UserInputHandler;
 }): Promise<string> {
   const repoRoot = input.config.repoRoot;
   await ensureGitRepo(repoRoot);
@@ -81,6 +82,7 @@ Return a corrected full manifest.` : '');
             ...(leadBinding.maxTurns !== undefined ? { maxTurns: leadBinding.maxTurns } : {}),
             access: 'read-only',
             requestApproval: input.requestApproval,
+            requestUserInput: input.requestUserInput,
             timeoutMs: input.config.taskTimeoutMs, staleAfterMs: input.config.staleAfterMs
           },
           logPath: join(runDir, 'logs', `lead-${attempt}.log`),

@@ -48,6 +48,11 @@ export async function checkAgentAvailability(input: PreflightInput): Promise<Pre
       if (discovery.authed === false) {
         errors.push(`backend "${id}" is installed but not authenticated; run its login command`);
       }
+      if (backend.checkPlatform) {
+        const platform = await backend.checkPlatform();
+        if (!platform.ok) errors.push(`backend "${id}" platform check failed: ${platform.detail}`);
+        else if (platform.degraded) warnings.push(`backend "${id}" platform isolation is degraded: ${platform.detail}`);
+      }
     } catch (error) {
       errors.push(`backend "${id}" discovery failed: ${error instanceof Error ? error.message : String(error)}`);
     }

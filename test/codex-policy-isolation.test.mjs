@@ -47,3 +47,24 @@ test('Codex backend routes generic permission profiles and fails closed for unkn
     { permissions: {}, scope: 'turn' }
   );
 });
+
+test('Codex backend routes agent questions to their session', async () => {
+  const backend = new CodexBackend();
+  backend.sessions.set('thread', {
+    async answerUserInput(request) {
+      assert.equal(request.questions[0].question, 'Which database?');
+      return { answers: { database: { answers: ['SQLite'] } } };
+    }
+  });
+  const params = {
+    threadId: 'thread', turnId: 'turn', itemId: 'question', isBlocking: true, autoResolutionMs: null,
+    questions: [{
+      id: 'database', header: 'Database', question: 'Which database?',
+      isOther: true, isSecret: false, options: [{ label: 'SQLite', description: 'Local file' }]
+    }]
+  };
+  assert.deepEqual(await backend.handleServerRequest('item/tool/requestUserInput', params), {
+    answers: { database: { answers: ['SQLite'] } }
+  });
+  assert.deepEqual(await backend.handleServerRequest('item/tool/requestUserInput', { ...params, threadId: 'missing' }), { answers: {} });
+});

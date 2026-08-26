@@ -134,5 +134,34 @@ test('runAgent excludes approval waits from hard and stale timeouts', async () =
   assert.equal(outcome.ok, true);
   assert.equal(outcome.timedOut, false);
   assert.equal(outcome.stalled, false);
-  assert.match(readFileSync(logPath, 'utf8'), /\[approval\] resumed/);
+  assert.match(readFileSync(logPath, 'utf8'), /\[interaction\] resumed/);
+});
+
+test('runAgent excludes user-question waits from hard and stale timeouts', async () => {
+  const { logPath, outputPath } = paths();
+  let resolveAnswer;
+  const answer = new Promise((resolve) => { resolveAnswer = resolve; });
+  const backend = new FakeBackend();
+  backend.openSession = async (sessionSpec) => {
+    const completion = (async () => {
+      await sessionSpec.requestUserInput({
+        backend: 'claude', role: 'lead', cwd: sessionSpec.cwd,
+        questions: [{ id: 'one', question: 'Which approach?' }]
+      });
+      return { ok: true, output: { done: true }, timedOut: false, stalled: false };
+    })();
+    return { async interrupt() {}, async close() {}, completion() { return completion; } };
+  };
+  const running = runAgent({
+    backend,
+    spec: spec({ timeoutMs: 80, staleAfterMs: 60, requestUserInput: async () => await answer }),
+    logPath,
+    outputPath
+  });
+  await new Promise((resolve) => setTimeout(resolve, 140));
+  resolveAnswer({ one: ['A'] });
+  const outcome = await running;
+  assert.equal(outcome.ok, true);
+  assert.equal(outcome.timedOut, false);
+  assert.equal(outcome.stalled, false);
 });
