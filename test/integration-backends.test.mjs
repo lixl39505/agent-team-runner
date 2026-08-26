@@ -8,7 +8,7 @@
 //   AGENT_TEAM_OPENCODE_SPIKE=1  opencode 全会话额外二次门控（本机 provider 挂起，见 README）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { CodexBackend } from '../dist/agent/codex/app-server.js';
@@ -79,19 +79,15 @@ protocolTest('opencode: serve lifecycle and session creation without inference',
   const backend = new OpenCodeBackend();
   const cwd = workspace();
   try {
-    // openSession 只做 session.create + SSE 订阅；不调用 session.prompt = 不做推理
-    const session = await backend.openSession({
-      role: 'worker',
-      cwd,
-      prompt: '(not sent in this tier)',
-      schema: { type: 'object' },
-      access: 'workspace-write',
-      requestApproval: async () => 'once',
-      timeoutMs: 10_000,
-      staleAfterMs: 10_000
+    // OpenCodeAgentSession starts prompt eagerly, so do not call openSession here.
+    // Start the managed server through listModels, then create an idle SDK session directly.
+    await backend.listModels();
+    const client = await backend.clientPromise;
+    const created = await client.session.create({
+      query: { directory: cwd },
+      body: { title: 'agent-team protocol test' }
     });
-    assert.ok(session.sessionId, 'opencode session created');
-    await session.close();
+    assert.ok(created.data?.id, 'opencode session created without session.prompt');
   } finally {
     backend.dispose();
   }
@@ -105,6 +101,7 @@ maybeTest('codex: full session with structured output and native approval routin
   const backend = new CodexBackend();
   const cwd = workspace();
   const events = [];
+  const approvals = [];
   try {
     const outcome = await runAgent({
       backend,
@@ -120,7 +117,10 @@ maybeTest('codex: full session with structured output and native approval routin
         ].join('\n'),
         schema: { type: 'object', properties: { done: { type: 'boolean' }, note: { type: 'string' } }, required: ['done', 'note'] },
         access: 'workspace-write',
-        requestApproval: async () => 'once',
+        requestApproval: async (request) => {
+          approvals.push(request);
+          return 'once';
+        },
         timeoutMs: 150_000,
         staleAfterMs: 60_000,
         onEvent: (event) => events.push(event)
@@ -133,8 +133,11 @@ maybeTest('codex: full session with structured output and native approval routin
     console.error('--- codex permission checks:', JSON.stringify(permissionChecks));
     assert.equal(outcome.ok, true, `turn succeeded: ${outcome.error}`);
     assert.equal(outcome.output?.done, true);
-    // 审批路由已验证：至少一个权限请求被送到 Runner 裁决
+    // 审批路由已验证：原生请求到达 Runner，且 Runner 的 once 决策被允许事件反映。
     assert.ok(permissionChecks.length >= 1, 'at least one approval routed to the Runner approval handler');
+    assert.ok(approvals.length >= 1, 'Runner approval handler was invoked');
+    assert.ok(permissionChecks.some((event) => event.allowed), 'a Runner-approved action was allowed');
+    assert.match(readFileSync(join(cwd, 'src', 'a.txt'), 'utf8'), /changed/, 'approved session changed the requested file');
   } finally {
     backend.dispose();
   }
