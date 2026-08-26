@@ -25,12 +25,12 @@ export async function runAgent<T = unknown>(input: RunAgentInput): Promise<Agent
   const append = (line: string): void => { appendFileSync(input.logPath, `${line}\n`, 'utf8'); };
 
   let session: AgentSession;
-  const startedAt = Date.now();
   let pausedAt: number | null = null;
   let pausedMs = 0;
   let pendingInteractions = 0;
   const activeNow = (): number => Date.now() - pausedMs - (pausedAt === null ? 0 : Date.now() - pausedAt);
-  let lastActivity = activeNow();
+  const startedAt = activeNow();
+  let lastActivity = startedAt;
   try {
     const wrapped: SessionSpec = {
       ...spec,
@@ -127,12 +127,17 @@ export async function runAgent<T = unknown>(input: RunAgentInput): Promise<Agent
     append(`[session] closed (settled=${String(settled)})`);
   }
 
+  const terminalTimedOut = outcome.timedOut || timedOut;
+  const terminalStalled = outcome.stalled || stalled;
+  const locallyTerminated = timedOut || stalled;
   const merged: AgentRunOutcome = {
     ...outcome,
-    timedOut: outcome.timedOut || timedOut,
-    stalled: outcome.stalled || stalled
+    ok: !(terminalTimedOut || terminalStalled) && outcome.ok,
+    output: terminalTimedOut || terminalStalled ? null : outcome.output,
+    timedOut: terminalTimedOut,
+    stalled: terminalStalled
   };
-  if (!merged.ok && (timedOut || stalled)) {
+  if (locallyTerminated) {
     merged.error = timedOut
       ? `agent exceeded timeout of ${spec.timeoutMs}ms`
       : `agent made no progress for ${spec.staleAfterMs}ms`;

@@ -67,6 +67,37 @@ test('runAgent enforces the hard timeout', async () => {
   assert.equal(backend.sessions[0].interruptCount >= 1, true);
 });
 
+test('runAgent rejects a success that arrives after a hard timeout', async () => {
+  const { logPath, outputPath } = paths();
+  let interrupted = false;
+  const backend = new FakeBackend();
+  backend.openSession = async () => {
+    let resolveCompletion;
+    const completion = new Promise((resolve) => { resolveCompletion = resolve; });
+    const lateSuccess = () => resolveCompletion({ ok: true, output: { done: true }, timedOut: false, stalled: false });
+    const fallback = setTimeout(lateSuccess, 200);
+    return {
+      async interrupt() { interrupted = true; clearTimeout(fallback); lateSuccess(); },
+      async close() {},
+      completion() { return completion; }
+    };
+  };
+
+  const outcome = await runAgent({
+    backend,
+    spec: spec({ timeoutMs: 40, staleAfterMs: 5_000 }),
+    logPath,
+    outputPath
+  });
+
+  assert.equal(interrupted, true);
+  assert.equal(outcome.ok, false);
+  assert.equal(outcome.output, null);
+  assert.equal(outcome.timedOut, true);
+  assert.match(outcome.error, /timeout/);
+  assert.equal(existsSync(outputPath), false);
+});
+
 test('runAgent detects stalls by lack of events', async () => {
   const { logPath, outputPath } = paths();
   const backend = new FakeBackend({ silent: true });
