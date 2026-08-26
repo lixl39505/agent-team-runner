@@ -30,6 +30,7 @@ export interface JsonRpcHandlers {
   onNotification?: (method: string, params: unknown) => void;
   /** 服务端主动请求（如审批）：返回 result 或抛错 */
   onServerRequest?: (method: string, params: unknown) => Promise<unknown>;
+  onExit?: (error: Error) => void;
 }
 
 /**
@@ -41,6 +42,7 @@ export class JsonRpcConnection {
   private readonly pending = new Map<number, PendingRequest>();
   private buffer = '';
   private closed = false;
+  private exitReported = false;
   private readonly child: ChildProcess;
 
   constructor(
@@ -64,19 +66,11 @@ export class JsonRpcConnection {
     });
     this.child.on('close', () => {
       this.closed = true;
-      for (const [, pending] of this.pending) {
-        clearTimeout(pending.timer);
-        pending.reject(new Error('app-server process exited'));
-      }
-      this.pending.clear();
+      this.failAll(new Error('app-server process exited'));
     });
     this.child.on('error', (error) => {
       this.closed = true;
-      for (const [, pending] of this.pending) {
-        clearTimeout(pending.timer);
-        pending.reject(new Error(`app-server process error: ${error.message}`));
-      }
-      this.pending.clear();
+      this.failAll(new Error(`app-server process error: ${error.message}`));
     });
   }
 
@@ -131,6 +125,18 @@ export class JsonRpcConnection {
   private send(message: unknown): void {
     if (this.closed) return;
     this.child.stdin!.write(`${JSON.stringify(message)}\n`);
+  }
+
+  private failAll(error: Error): void {
+    for (const [, pending] of this.pending) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pending.clear();
+    if (!this.exitReported) {
+      this.exitReported = true;
+      this.handlers.onExit?.(error);
+    }
   }
 
   private receive(chunk: string): void {

@@ -48,7 +48,6 @@ function mapTask(row: Record<string, unknown>): TaskRecord {
     commitSha: row.commit_sha === null ? null : String(row.commit_sha),
     attempts: Number(row.attempts),
     reviewCycles: Number(row.review_cycles),
-    pid: row.pid === null ? null : Number(row.pid),
     lastError: row.last_error === null ? null : String(row.last_error),
     reviewJson: row.review_json === null ? null : String(row.review_json),
     createdAt: String(row.created_at),
@@ -107,7 +106,6 @@ export class StateDatabase {
         commit_sha TEXT,
         attempts INTEGER NOT NULL DEFAULT 0,
         review_cycles INTEGER NOT NULL DEFAULT 0,
-        pid INTEGER,
         last_error TEXT,
         review_json TEXT,
         created_at TEXT NOT NULL,
@@ -239,7 +237,6 @@ export class StateDatabase {
     commitSha: string;
     attempts: number;
     reviewCycles: number;
-    pid: number | null;
     lastError: string | null;
     reviewJson: string | null;
     finishedAt: string | null;
@@ -255,7 +252,6 @@ export class StateDatabase {
       commitSha: 'commit_sha',
       attempts: 'attempts',
       reviewCycles: 'review_cycles',
-      pid: 'pid',
       lastError: 'last_error',
       reviewJson: 'review_json',
       finishedAt: 'finished_at'
@@ -284,7 +280,6 @@ export class StateDatabase {
       this.updateTask(runId, row.task_id, {
         status: 'changes_requested',
         phase: 'recovered',
-        pid: null,
         lastError: 'Runner restarted while the task was active. Resume from the existing worktree.'
       });
       this.addEvent(runId, row.task_id, 'TASK_RECOVERED');

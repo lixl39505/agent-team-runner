@@ -10,10 +10,10 @@ import type {
   WorkerResult
 } from './types.js';
 import type { AgentBackend, AgentEvent } from '../agent/types.js';
+import type { ApprovalHandler } from '../agent/approval.js';
 import { StateDatabase } from './db.js';
 import { buildBackends, disposeBackends, resolveAgentWithSnapshot, resolveTaskAgent } from '../agent/registry.js';
 import { runAgent } from '../agent/supervise.js';
-import { integratorPolicy, readOnlyPolicy, workerPolicy } from './policy.js';
 import {
   INTEGRATION_SCHEMA,
   REVIEW_SCHEMA,
@@ -58,6 +58,7 @@ export async function runOrchestrator(input: {
   config: RunnerConfig;
   db: StateDatabase;
   runId: string;
+  requestApproval?: ApprovalHandler;
 }): Promise<void> {
   const { config, db, runId } = input;
   let run = db.getRun(runId);
@@ -71,16 +72,25 @@ export async function runOrchestrator(input: {
 
   // 后端进程池：整个 run 共享（codex app-server / opencode serve 常驻复用）
   const backends = buildBackends(config);
-  // 信号兜底：detached 的后端子进程（app-server 等）不会随父进程退出，显式清理
+  // Child backends own process groups, so release them explicitly on terminal interruption.
+  const active = new Map<string, Promise<void>>();
+  const interruptedTasks = new Set<string>();
+  let interrupted = false;
   const onSignal = (): void => {
+    if (interrupted) return;
+    interrupted = true;
+    process.exitCode = 130;
+    for (const taskId of active.keys()) interruptedTasks.add(taskId);
+    db.addEvent(runId, null, 'RUN_INTERRUPTED');
+    db.updateRun(runId, { status: 'running', error: 'Interrupted by user; run again to resume.' });
     disposeBackends(backends);
-    process.exit(0);
   };
   process.once('SIGTERM', onSignal);
   process.once('SIGINT', onSignal);
-  const active = new Map<string, Promise<void>>();
+  process.once('SIGHUP', onSignal);
   try {
     while (true) {
+      if (interrupted) return;
       const tasks = db.listTasks(runId);
       const approved = new Set(tasks.filter((task) => task.status === 'approved').map((task) => task.taskId));
       const terminalProblem = tasks.find((task) => task.status === 'blocked' || task.status === 'failed');
@@ -98,10 +108,13 @@ export async function runOrchestrator(input: {
       }).slice(0, slots);
 
       for (const candidate of candidates) {
-        const promise = executeTask({ config, db, runId, backends, record: candidate })
+        const promise = executeTask({
+          config, db, runId, backends, record: candidate,
+          ...(input.requestApproval ? { requestApproval: input.requestApproval } : {})
+        })
           .catch((error) => {
             db.updateTask(runId, candidate.taskId, {
-              status: 'failed', phase: 'exception', pid: null, lastError: String(error), finishedAt: new Date().toISOString()
+              status: 'failed', phase: 'exception', lastError: String(error), finishedAt: new Date().toISOString()
             });
             db.addEvent(runId, candidate.taskId, 'TASK_EXCEPTION', { error: String(error) });
           })
@@ -120,15 +133,33 @@ export async function runOrchestrator(input: {
       }
     }
 
-    await integrateRun({ config, db, runId, backends });
+    if (interrupted) return;
+    await integrateRun({
+      config, db, runId, backends,
+      isInterrupted: () => interrupted,
+      ...(input.requestApproval ? { requestApproval: input.requestApproval } : {})
+    });
   } catch (error) {
+    if (interrupted) return;
     db.updateRun(runId, { status: 'failed', error: String(error), finishedAt: new Date().toISOString() });
     db.addEvent(runId, null, 'RUN_FAILED', { error: String(error) });
     throw error;
   } finally {
     await Promise.allSettled(active.values());
+    if (interrupted) {
+      for (const taskId of interruptedTasks) {
+        const task = db.getTask(runId, taskId);
+        if (task.status === 'approved') continue;
+        db.updateTask(runId, taskId, {
+          status: 'changes_requested', phase: 'interrupted',
+          attempts: Math.max(0, task.attempts - 1),
+          lastError: 'Interrupted by user; task will resume on the next run.', finishedAt: null
+        });
+      }
+    }
     process.off('SIGTERM', onSignal);
     process.off('SIGINT', onSignal);
+    process.off('SIGHUP', onSignal);
     disposeBackends(backends);
     run = db.getRun(runId);
     if (run.status === 'done') db.addEvent(runId, null, 'RUN_COMPLETED');
@@ -141,6 +172,7 @@ async function executeTask(input: {
   runId: string;
   backends: Record<string, AgentBackend>;
   record: TaskRecord;
+  requestApproval?: ApprovalHandler;
 }): Promise<void> {
   const { config, db, runId, backends } = input;
   let record = db.getTask(runId, input.record.taskId);
@@ -152,7 +184,7 @@ async function executeTask(input: {
   const worktreeInfo = await ensureTaskWorktree({ config, db, runId, record, task, manifest: parseManifest(run.manifestJson) });
   record = db.getTask(runId, task.id);
   const attempts = record.attempts + 1;
-  db.updateTask(runId, task.id, { status: 'running', phase: 'worker', attempts, pid: null });
+  db.updateTask(runId, task.id, { status: 'running', phase: 'worker', attempts });
   db.addEvent(runId, task.id, 'WORKER_STARTED', {
     attempts,
     agent: workerBinding.agent,
@@ -182,11 +214,13 @@ async function executeTask(input: {
     backend: backends[workerBinding.backend]!,
     spec: {
       role: 'worker', cwd: worktreeInfo.path,
+      label: `${runId} ${task.id} worker`,
       prompt: workerPrompt({ task, startSha: worktreeInfo.startSha, runId, worktreePath: worktreeInfo.path, priorFeedback: record.lastError, retry }),
       schema: WORKER_SCHEMA,
       ...(workerBinding.model !== undefined ? { model: workerBinding.model } : {}),
       ...(workerBinding.maxTurns !== undefined ? { maxTurns: workerBinding.maxTurns } : {}),
-      policy: workerPolicy(task, config),
+      access: 'workspace-write',
+      requestApproval: input.requestApproval,
       timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs,
       onEvent
     },
@@ -224,17 +258,27 @@ async function executeTask(input: {
   const reviewOutput = join(runDir, 'reviews', `${task.id}-review-${reviewCycle}.json`);
   const reviewHeadBefore = await currentHead(worktreeInfo.path);
   const reviewStatusBefore = (await git(worktreeInfo.path, ['status', '--porcelain=v1', '-z'])).stdout;
+  const candidateDiff = (await git(worktreeInfo.path, ['diff', '--cached', '--binary'])).stdout;
   // Reviewer 独立解析角色绑定（plan 快照优先），不复用 Worker 的会话
   const reviewerBinding = resolveAgentWithSnapshot('reviewer', config, run.rolesJson);
   const reviewRun = await runAgent<ReviewResult>({
     backend: backends[reviewerBinding.backend]!,
     spec: {
       role: 'reviewer', cwd: worktreeInfo.path,
-      prompt: reviewerPrompt({ task, startSha: worktreeInfo.startSha, worktreePath: worktreeInfo.path, workerResult }),
+      label: `${runId} ${task.id} reviewer`,
+      prompt: reviewerPrompt({
+        task,
+        startSha: worktreeInfo.startSha,
+        worktreePath: worktreeInfo.path,
+        workerResult,
+        candidateDiff,
+        candidateFiles: verification.changedFiles
+      }),
       schema: REVIEW_SCHEMA,
       ...(reviewerBinding.model !== undefined ? { model: reviewerBinding.model } : {}),
       ...(reviewerBinding.maxTurns !== undefined ? { maxTurns: reviewerBinding.maxTurns } : {}),
-      policy: readOnlyPolicy(),
+      access: 'read-only',
+      requestApproval: input.requestApproval,
       timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs
     },
     logPath: join(runDir, 'logs', `${task.id}-review-${reviewCycle}.log`),
@@ -312,12 +356,12 @@ async function retryOrFail(input: {
 }): Promise<void> {
   if (input.attempts >= input.config.maxWorkerAttempts) {
     input.db.updateTask(input.runId, input.taskId, {
-      status: 'failed', phase: 'retry-limit', lastError: input.error, finishedAt: new Date().toISOString(), pid: null
+      status: 'failed', phase: 'retry-limit', lastError: input.error, finishedAt: new Date().toISOString()
     });
     input.db.addEvent(input.runId, input.taskId, 'WORKER_RETRY_LIMIT_REACHED', { error: input.error });
   } else {
     input.db.updateTask(input.runId, input.taskId, {
-      status: 'changes_requested', phase: 'retry', lastError: input.error, pid: null
+      status: 'changes_requested', phase: 'retry', lastError: input.error
     });
     input.db.addEvent(input.runId, input.taskId, 'WORKER_RETRY_SCHEDULED', { error: input.error });
   }
@@ -373,6 +417,8 @@ async function integrateRun(input: {
   db: StateDatabase;
   runId: string;
   backends: Record<string, AgentBackend>;
+  requestApproval?: ApprovalHandler;
+  isInterrupted: () => boolean;
 }): Promise<void> {
   const { config, db, runId } = input;
   const run = db.getRun(runId);
@@ -389,6 +435,7 @@ async function integrateRun(input: {
   const integratorBackend = input.backends[integratorBinding.backend]!;
 
   for (const task of topologicalTasks(manifest.tasks)) {
+    if (input.isInterrupted()) return;
     const record = db.getTask(runId, task.id);
     if (!record.commitSha) throw new Error(`Approved task ${task.id} has no commit`);
     const picked = await cherryPick(worktree, record.commitSha);
@@ -399,16 +446,19 @@ async function integrateRun(input: {
       backend: integratorBackend,
       spec: {
         role: 'integrator', cwd: worktree,
+        label: `${runId} integrator conflict ${task.id}`,
         prompt: integrationPrompt({ manifest, integrationAllowedPaths: config.integration.allowedPaths, mode: 'resolve_conflict', worktreePath: worktree, conflictFiles: conflicts }),
         schema: INTEGRATION_SCHEMA,
         ...(integratorBinding.model !== undefined ? { model: integratorBinding.model } : {}),
         ...(integratorBinding.maxTurns !== undefined ? { maxTurns: integratorBinding.maxTurns } : {}),
-        policy: integratorPolicy('resolve_conflict', config, conflicts),
+        access: 'workspace-write',
+        requestApproval: input.requestApproval,
         timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs
       },
       logPath: join(runDir, 'logs', `integration-conflict-${task.id}.log`),
       outputPath: join(runDir, 'results', `integration-conflict-${task.id}.json`)
     });
+    if (input.isInterrupted()) return;
     if (!conflictResult.ok || !conflictResult.output) {
       await abortCherryPick(worktree);
       throw new Error(`Integrator failed to resolve conflict for ${task.id}`);
@@ -434,21 +484,25 @@ async function integrateRun(input: {
   }
 
   await runGlobalVerification({ worktree, config, logPath: join(runDir, 'logs', 'integration-verification.log') });
+  if (input.isInterrupted()) return;
   if (config.integration.runAgentAfterCherryPick) {
     const integrationRun = await runAgent<IntegrationResult>({
       backend: integratorBackend,
       spec: {
         role: 'integrator', cwd: worktree,
+        label: `${runId} integrator finalize`,
         prompt: integrationPrompt({ manifest, integrationAllowedPaths: config.integration.allowedPaths, mode: 'finalize', worktreePath: worktree }),
         schema: INTEGRATION_SCHEMA,
         ...(integratorBinding.model !== undefined ? { model: integratorBinding.model } : {}),
         ...(integratorBinding.maxTurns !== undefined ? { maxTurns: integratorBinding.maxTurns } : {}),
-        policy: integratorPolicy('finalize', config),
+        access: 'workspace-write',
+        requestApproval: input.requestApproval,
         timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs
       },
       logPath: join(runDir, 'logs', 'integrator.log'),
       outputPath: join(runDir, 'results', 'integrator.json')
     });
+    if (input.isInterrupted()) return;
     if (!integrationRun.ok || !integrationRun.output) throw new Error(`Integrator finalization failed: ${integrationRun.error ?? 'no structured output'}`);
     const integrationResult = validateIntegrationResult(integrationRun.output);
     if (integrationResult.status !== 'completed') throw new Error(integrationResult.blockedReason ?? integrationResult.summary);
@@ -457,10 +511,12 @@ async function integrateRun(input: {
       const policy = checkPaths(files, config.integration.allowedPaths, []);
       if (!policy.ok) throw new Error(`Integrator modified paths outside policy: ${policy.invalid.join(', ')}`);
       await runGlobalVerification({ worktree, config, logPath: join(runDir, 'logs', 'integration-verification-after-docs.log') });
+      if (input.isInterrupted()) return;
       await stageAll(worktree);
       await commit(worktree, '[integration] update architecture and progress documentation');
     }
   }
+  if (input.isInterrupted()) return;
   const integrationCommit = await currentHead(worktree);
   db.updateRun(runId, { status: 'done', integrationCommit, error: null, finishedAt: new Date().toISOString() });
   db.addEvent(runId, null, 'INTEGRATION_COMPLETED', { branch, worktree, integrationCommit });

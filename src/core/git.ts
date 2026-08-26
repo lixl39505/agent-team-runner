@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { spawn } from 'node:child_process';
+import { gitIsolationEnv } from './process-env.js';
 
 export interface ExecResult {
   code: number;
@@ -9,7 +10,10 @@ export interface ExecResult {
 }
 
 export async function git(cwd: string, args: string[], allowFailure = false): Promise<ExecResult> {
-  const result = await execFile('git', args, cwd);
+  const safeArgs = args[0] === 'diff'
+    ? ['diff', '--no-ext-diff', '--no-textconv', ...args.slice(1)]
+    : args;
+  const result = await execFile('git', safeArgs, cwd);
   if (!allowFailure && result.code !== 0) {
     throw new Error(`git ${args.join(' ')} failed (${result.code}): ${result.stderr || result.stdout}`);
   }
@@ -18,7 +22,7 @@ export async function git(cwd: string, args: string[], allowFailure = false): Pr
 
 export async function execFile(program: string, args: string[], cwd: string): Promise<ExecResult> {
   return await new Promise<ExecResult>((resolve, reject) => {
-    const child = spawn(program, args, { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(program, args, { cwd, env: { ...process.env, ...gitIsolationEnv() }, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });

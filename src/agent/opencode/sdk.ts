@@ -14,7 +14,7 @@ import type {
   SessionSpec
 } from '../types.js';
 import type { BackendId } from '../../core/types.js';
-import { compileOpenCode } from './policy.js';
+import { compileOpenCode, compileOpenCodeBasePermission } from './policy.js';
 import { parseAgentJson } from '../parse.js';
 import { sanitizedEnv } from '../env.js';
 
@@ -40,8 +40,8 @@ interface OpenCodeMessage {
 
 /**
  * opencode 后端：受管一个 `opencode serve`（createOpencode 自动起 server+client），
- * 结构化输出双通道（prompt 内嵌 schema + 服务端 format 字段），权限经 SSE 事件
- * 由 Runner 策略应答 once/reject。
+ * 结构化输出双通道（prompt 内嵌 schema + 服务端 format 字段），SSE 权限请求
+ * 转发到前台审批处理器并映射为 once/always/reject。
  */
 export class OpenCodeBackend implements AgentBackend {
   readonly id: BackendId = 'opencode';
@@ -116,7 +116,7 @@ export class OpenCodeBackend implements AgentBackend {
       cwd: scratch,
       prompt: 'Reply with exactly: ok',
       schema: { type: 'string' },
-      policy: { fs: { mode: 'read-only' }, bash: { mode: 'deny' }, network: false },
+      access: 'read-only',
       timeoutMs: 90_000,
       staleAfterMs: 90_000,
       ...(model !== undefined ? { model } : {})
@@ -142,7 +142,10 @@ export class OpenCodeBackend implements AgentBackend {
     });
     const sessionId = created.data?.id;
     if (!sessionId) throw new Error('opencode session creation returned no id');
-    const session = new OpenCodeAgentSession(client, sessionId, spec, compileOpenCode(spec.policy));
+    const session = new OpenCodeAgentSession(
+      client, sessionId, spec, compileOpenCode(spec.access),
+      () => this.sessions.delete(sessionId)
+    );
     this.sessions.set(sessionId, session);
     spec.onEvent?.({ type: 'session', sessionId });
     return session;
@@ -179,6 +182,7 @@ export class OpenCodeBackend implements AgentBackend {
   }
 
   dispose(): void {
+    for (const session of [...this.sessions.values()]) void session.interrupt();
     this.sessions.clear();
     // 终结 SSE 订阅流，释放其底层连接
     if (this.eventStream) {
@@ -208,7 +212,9 @@ export class OpenCodeBackend implements AgentBackend {
     const child = spawn(command, ['serve', `--hostname=${hostname}`, `--port=${port}`], {
       env: {
         ...sanitizedEnv(),
-        OPENCODE_CONFIG_CONTENT: JSON.stringify({ permission: { bash: 'ask', edit: 'ask', webfetch: 'ask' } })
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({
+          permission: compileOpenCodeBasePermission()
+        })
       },
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: process.platform !== 'win32'
@@ -238,6 +244,14 @@ export class OpenCodeBackend implements AgentBackend {
         clearTimeout(timer);
         reject(error);
       });
+    });
+    child.once('exit', () => {
+      if (this.serverChild !== child) return;
+      for (const session of [...this.sessions.values()]) void session.interrupt();
+      this.sessions.clear();
+      this.serverChild = null;
+      this.clientPromise = null;
+      this.subscribed = false;
     });
     return createOpencodeClient({ baseUrl: url });
   }
@@ -300,12 +314,14 @@ class OpenCodeAgentSession implements AgentSession {
   readonly sessionId: string;
   private interrupted = false;
   private readonly resultPromise: Promise<AgentRunOutcome>;
+  private readonly approvalController = new AbortController();
 
   constructor(
     private readonly client: OpencodeClient,
     sessionId: string,
     private readonly spec: SessionSpec,
-    private readonly compiled: ReturnType<typeof compileOpenCode>
+    private readonly compiled: ReturnType<typeof compileOpenCode>,
+    private readonly onClose: () => void
   ) {
     this.sessionId = sessionId;
     this.resultPromise = this.run();
@@ -394,30 +410,53 @@ ${JSON.stringify(this.spec.schema)}`;
   }
 
   async answerPermission(permissionId: string, request: { type: string; pattern?: string | Array<string> | undefined }): Promise<void> {
-    const decision = this.compiled.decide(request, this.spec.cwd);
+    const hardDenied = this.compiled.access === 'read-only' && ['bash', 'edit'].includes(request.type);
+    let response: 'once' | 'always' | 'reject' = 'reject';
+    if (!hardDenied && this.spec.requestApproval) {
+      try {
+        const decision = await this.spec.requestApproval({
+          backend: 'opencode',
+          role: this.spec.role,
+          label: this.spec.label,
+          sessionId: this.sessionId,
+          cwd: this.spec.cwd,
+          kind: openCodeApprovalKind(request.type),
+          tool: request.type,
+          input: { ...(request.pattern !== undefined ? { pattern: request.pattern } : {}) },
+          title: openCodeApprovalTitle(request),
+          allowSession: true
+        }, this.approvalController.signal);
+        response = decision === 'session' ? 'always' : decision === 'once' ? 'once' : 'reject';
+      } catch {
+        response = 'reject';
+      }
+    }
     this.spec.onEvent?.({
       type: 'permission-check',
       tool: request.type,
       input: { ...(request.pattern !== undefined ? { pattern: request.pattern } : {}) },
-      allowed: decision === 'once',
-      ...(decision === 'reject' ? { reason: `runner policy denied ${request.type}` } : {})
+      allowed: response !== 'reject',
+      ...(response === 'reject' ? { reason: hardDenied ? 'read-only role' : 'denied by user' } : {})
     });
     try {
       await this.client.postSessionIdPermissionsPermissionId({
         path: { id: this.sessionId, permissionID: permissionId },
-        body: { response: decision }
+        body: { response }
       });
     } catch { /* session may be gone */ }
   }
 
   async interrupt(): Promise<void> {
     this.interrupted = true;
+    this.approvalController.abort(new Error('OpenCode session interrupted'));
     try {
       await this.client.session.abort({ path: { id: this.sessionId } });
     } catch { /* already idle */ }
   }
 
   async close(): Promise<void> {
+    this.approvalController.abort(new Error('OpenCode session closed'));
+    this.onClose();
     if (this.interrupted) return;
     // 会话保留在服务端（resume 能力预留）；不主动删除
   }
@@ -425,4 +464,17 @@ ${JSON.stringify(this.spec.schema)}`;
   completion(): Promise<AgentRunOutcome> {
     return this.resultPromise;
   }
+}
+
+function openCodeApprovalKind(type: string): 'command' | 'file-change' | 'network' | 'external-directory' | 'tool' {
+  if (type === 'bash') return 'command';
+  if (type === 'edit') return 'file-change';
+  if (type === 'webfetch' || type === 'websearch') return 'network';
+  if (type === 'external_directory') return 'external-directory';
+  return 'tool';
+}
+
+function openCodeApprovalTitle(request: { type: string; pattern?: string | Array<string> | undefined }): string {
+  const pattern = Array.isArray(request.pattern) ? request.pattern.join(', ') : request.pattern;
+  return pattern ? `OpenCode requests ${request.type}: ${pattern}` : `OpenCode requests ${request.type} permission`;
 }

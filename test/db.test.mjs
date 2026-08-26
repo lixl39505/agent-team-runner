@@ -16,5 +16,7 @@ test('persists run and task state', () => {
   db.updateTask('demo', 'T001', { status: 'approved', commitSha: 'def' });
   assert.equal(db.getTask('demo', 'T001').commitSha, 'def');
   assert.equal(db.listTasks('demo').length, 1);
+  const taskColumns = db.db.prepare('PRAGMA table_info(tasks)').all().map((column) => column.name);
+  assert.equal(taskColumns.includes('pid'), false);
   db.close();
 });

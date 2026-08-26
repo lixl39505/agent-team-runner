@@ -5,7 +5,6 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runAgent } from '../dist/agent/supervise.js';
 import { FakeBackend } from '../dist/agent/fake.js';
-import { readOnlyPolicy } from '../dist/core/policy.js';
 
 function spec(overrides = {}) {
   return {
@@ -13,7 +12,7 @@ function spec(overrides = {}) {
     cwd: process.cwd(),
     prompt: 'demo',
     schema: { type: 'object' },
-    policy: readOnlyPolicy(),
+    access: 'read-only',
     timeoutMs: 5_000,
     staleAfterMs: 5_000,
     ...overrides
@@ -100,17 +99,40 @@ test('runAgent reports open-session failures without throwing', async () => {
   assert.match(outcome.error, /binary missing/);
 });
 
-test('runAgent breaks deny-thrash loops instead of burning context', async () => {
+test('runAgent excludes approval waits from hard and stale timeouts', async () => {
   const { logPath, outputPath } = paths();
-  const denied = { type: 'permission-check', tool: 'Bash', input: { command: 'x' }, allowed: false };
-  const granted = { type: 'permission-check', tool: 'Bash', input: { command: 'npm test' }, allowed: true };
-  // 交替拒绝但以 10 连拒收尾 → 熔断
-  const backend = new FakeBackend({
-    events: [denied, denied, granted, denied, denied, denied, denied, denied, denied, denied, denied, denied, denied, denied],
-    output: { ok: true }
+  let resolveApproval;
+  const approval = new Promise((resolve) => { resolveApproval = resolve; });
+  const backend = new FakeBackend();
+  backend.openSession = async (sessionSpec) => {
+    let interrupted = false;
+    const completion = (async () => {
+      await sessionSpec.requestApproval({
+        backend: 'claude', role: 'lead', cwd: sessionSpec.cwd,
+        kind: 'command', tool: 'Bash', input: { command: 'npm test' }, allowSession: true
+      });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return interrupted
+        ? { ok: false, output: null, error: 'interrupted', timedOut: false, stalled: false }
+        : { ok: true, output: { done: true }, timedOut: false, stalled: false };
+    })();
+    return {
+      async interrupt() { interrupted = true; },
+      async close() {},
+      completion() { return completion; }
+    };
+  };
+  const running = runAgent({
+    backend,
+    spec: spec({ timeoutMs: 80, staleAfterMs: 60, requestApproval: async () => await approval }),
+    logPath,
+    outputPath
   });
-  const outcome = await runAgent({ backend, spec: spec({ timeoutMs: 30_000, staleAfterMs: 30_000 }), logPath, outputPath });
-  assert.equal(outcome.ok, false);
-  assert.match(outcome.error, /policy thrash/);
-  assert.equal(backend.sessions[0].interruptCount >= 1, true);
+  await new Promise((resolve) => setTimeout(resolve, 140));
+  resolveApproval('once');
+  const outcome = await running;
+  assert.equal(outcome.ok, true);
+  assert.equal(outcome.timedOut, false);
+  assert.equal(outcome.stalled, false);
+  assert.match(readFileSync(logPath, 'utf8'), /\[approval\] resumed/);
 });

@@ -77,7 +77,12 @@ export class FakeSession implements AgentSession {
           if (!this.script.silent) {
             for (const event of this.script.events ?? []) {
               if (this.interruptCount > 0) break;
-              await sleep(this.script.stepMs ?? 5);
+              let remaining = this.script.stepMs ?? 5;
+              while (remaining > 0 && this.interruptCount === 0) {
+                const wait = Math.min(remaining, 10);
+                await sleep(wait);
+                remaining -= wait;
+              }
               if (this.interruptCount > 0) break;
               this.spec.onEvent?.(event);
             }

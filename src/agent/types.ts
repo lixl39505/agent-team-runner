@@ -1,4 +1,5 @@
-import type { AgentRole, BackendId, PolicySpec } from '../core/types.js';
+import type { AgentRole, BackendId } from '../core/types.js';
+import type { ApprovalHandler } from './approval.js';
 
 export type { BackendId };
 
@@ -33,13 +34,16 @@ export type AgentEvent =
 
 export interface SessionSpec {
   role: AgentRole;
+  /** Human-readable run/task context for terminal approval prompts. */
+  label?: string | undefined;
   cwd: string;
   prompt: string;
   /** 结构化输出 JSON Schema（后端原生通道：outputFormat/outputSchema/format） */
   schema: object;
   model?: string | undefined;
-  /** 角色/任务权限规格，编译为各后端的权限控制 */
-  policy: PolicySpec;
+  /** Coarse role boundary; operation-level decisions stay in the backend's native permission model. */
+  access: 'read-only' | 'workspace-write';
+  requestApproval?: ApprovalHandler | undefined;
   timeoutMs: number;
   /** 静默超时：任何 AgentEvent 重置计时（"无进展"而非"无 stdout"） */
   staleAfterMs: number;
@@ -47,8 +51,6 @@ export interface SessionSpec {
   /** resume 上一个会话（实验开关 worker.resume 预留） */
   resumeSessionId?: string | undefined;
   onEvent?: ((event: AgentEvent) => void) | undefined;
-  /** 仅对自 spawn 会话子进程的传输有意义（如旧 CLI transport） */
-  onPid?: ((pid: number) => void) | undefined;
 }
 
 export interface AgentRunOutcome<T = unknown> {

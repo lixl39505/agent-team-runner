@@ -1,5 +1,7 @@
 import { spawn } from 'node:child_process';
-import { query, type Options, type Query } from '@anthropic-ai/claude-agent-sdk';
+import { readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { query, type Options, type PermissionUpdate, type Query } from '@anthropic-ai/claude-agent-sdk';
 import type {
   AgentBackend,
   AgentEvent,
@@ -21,6 +23,7 @@ export interface ClaudeBackendOptions {
 
 export class ClaudeBackend implements AgentBackend {
   readonly id: BackendId = 'claude';
+  private readonly sessions = new Set<ClaudeAgentSession>();
 
   constructor(
     private readonly options: ClaudeBackendOptions = {},
@@ -115,27 +118,61 @@ export class ClaudeBackend implements AgentBackend {
   }
 
   async openSession(spec: SessionSpec): Promise<AgentSession> {
-    const compiled = compileClaude(spec.policy);
+    const compiled = compileClaude(spec.access);
     const controller = new AbortController();
     const options: Options = this.baseOptions({
       cwd: spec.cwd,
+      sandbox: compileSandbox(spec),
       ...(spec.model !== undefined ? { model: spec.model } : {}),
       permissionMode: compiled.permissionMode,
+      settingSources: spec.access === 'read-only' ? [] : ['user', 'project', 'local'],
       allowedTools: compiled.allowedTools,
       disallowedTools: compiled.disallowedTools,
-      canUseTool: (toolName, input) => {
-        const decision = compiled.decide(toolName, input, spec.cwd);
+      canUseTool: async (toolName, input, context) => {
+        if (spec.access === 'read-only' && !readOnlyApprovableTool(toolName)) {
+          const reason = `tool ${toolName} is outside the read-only role boundary`;
+          spec.onEvent?.({ type: 'permission-check', tool: toolName, input, allowed: false, reason });
+          return { behavior: 'deny', message: reason };
+        }
+        if (!spec.requestApproval) {
+          const reason = 'no approval handler is available';
+          spec.onEvent?.({ type: 'permission-check', tool: toolName, input, allowed: false, reason });
+          return { behavior: 'deny', message: reason };
+        }
+        let decision: 'once' | 'session' | 'deny';
+        try {
+          decision = await spec.requestApproval({
+            backend: 'claude',
+            role: spec.role,
+            label: spec.label,
+            cwd: spec.cwd,
+            kind: claudeApprovalKind(toolName, context.blockedPath),
+            tool: toolName,
+            input,
+            title: context.title,
+            description: context.description,
+            reason: context.decisionReason,
+            allowSession: (context.suggestions?.length ?? 0) > 0
+          }, context.signal);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          spec.onEvent?.({ type: 'permission-check', tool: toolName, input, allowed: false, reason });
+          return { behavior: 'deny', message: reason };
+        }
         spec.onEvent?.({
           type: 'permission-check',
           tool: toolName,
           input,
-          allowed: decision.behavior === 'allow',
-          ...(decision.behavior === 'deny' ? { reason: decision.message } : {})
+          allowed: decision !== 'deny',
+          ...(decision === 'deny' ? { reason: 'denied by user' } : {})
         });
-        if (decision.behavior === 'allow') {
-          return Promise.resolve({ behavior: 'allow', ...(decision.updatedInput ? { updatedInput: decision.updatedInput } : {}) });
-        }
-        return Promise.resolve({ behavior: 'deny', message: decision.message });
+        if (decision === 'deny') return { behavior: 'deny', message: 'Denied by user.' };
+        return {
+          behavior: 'allow',
+          ...(decision === 'session' && context.suggestions ? {
+            updatedPermissions: context.suggestions.map(sessionPermission)
+          } : {})
+        };
       },
       outputFormat: { type: 'json_schema', schema: spec.schema as Record<string, unknown> },
       ...(spec.maxTurns !== undefined ? { maxTurns: spec.maxTurns } : {}),
@@ -144,18 +181,80 @@ export class ClaudeBackend implements AgentBackend {
       ...(spec.resumeSessionId !== undefined ? { resume: spec.resumeSessionId } : {})
     });
     const q = this.queryFactory({ prompt: spec.prompt, options });
-    return new ClaudeAgentSession(q, controller, spec);
+    const session = new ClaudeAgentSession(q, controller, spec, () => this.sessions.delete(session));
+    this.sessions.add(session);
+    return session;
+  }
+
+  dispose(): void {
+    for (const session of [...this.sessions]) void session.close();
+    this.sessions.clear();
   }
 
   private baseOptions(overrides: Partial<Options>): Options {
     return {
       env: sanitizedEnv(),
-      // 不加载用户/项目 settings 的权限规则——spike 实测它们的 allow 规则会 shadow
-      // canUseTool（CLAUDE_SDK_CAN_USE_TOOL_SHADOWED），Runner policy 必须是唯一权威
-      settingSources: [],
+      // Match Claude Code: native settings may pre-authorize operations; remaining asks reach canUseTool.
+      settingSources: ['user', 'project', 'local'],
       ...(this.options.command ? { pathToClaudeCodeExecutable: this.options.command } : {}),
       ...overrides
     } as Options;
+  }
+}
+
+function compileSandbox(spec: SessionSpec): NonNullable<Options['sandbox']> {
+  const gitPaths = gitMetadataPaths(spec.cwd);
+  const denyWrite = spec.access === 'read-only'
+    ? [spec.cwd, ...gitPaths]
+    : gitPaths;
+  return {
+    enabled: true,
+    failIfUnavailable: true,
+    autoAllowBashIfSandboxed: false,
+    allowUnsandboxedCommands: false,
+    excludedCommands: [],
+    filesystem: {
+      disabled: false,
+      denyWrite: [...new Set(denyWrite)]
+    },
+    enableWeakerNestedSandbox: false,
+    enableWeakerNetworkIsolation: false,
+    allowAppleEvents: false
+  };
+}
+
+function sessionPermission(update: PermissionUpdate): PermissionUpdate {
+  return { ...update, destination: 'session' };
+}
+
+function claudeApprovalKind(toolName: string, blockedPath?: string): 'command' | 'file-change' | 'network' | 'external-directory' | 'tool' {
+  if (blockedPath) return 'external-directory';
+  const normalized = toolName.toLowerCase();
+  if (normalized === 'bash') return 'command';
+  if (['edit', 'write', 'notebookedit'].includes(normalized)) return 'file-change';
+  if (['webfetch', 'websearch'].includes(normalized)) return 'network';
+  return 'tool';
+}
+
+function readOnlyApprovableTool(toolName: string): boolean {
+  return ['bash', 'webfetch', 'websearch'].includes(toolName.toLowerCase());
+}
+
+/** Resolve linked-worktree Git metadata so the command sandbox cannot mutate history or hooks. */
+function gitMetadataPaths(cwd: string): string[] {
+  const dotGit = join(cwd, '.git');
+  try {
+    const marker = readFileSync(dotGit, 'utf8').match(/^gitdir:\s*(.+)$/m)?.[1]?.trim();
+    if (!marker) return [dotGit];
+    const gitDir = resolve(cwd, marker);
+    try {
+      const common = readFileSync(join(gitDir, 'commondir'), 'utf8').trim();
+      return [dotGit, gitDir, resolve(gitDir, common)];
+    } catch {
+      return [dotGit, gitDir];
+    }
+  } catch {
+    return [dotGit];
   }
 }
 
@@ -233,7 +332,8 @@ class ClaudeAgentSession implements AgentSession {
   constructor(
     private readonly q: Query,
     private readonly controller: AbortController,
-    private readonly spec: SessionSpec
+    private readonly spec: SessionSpec,
+    private readonly onClose: () => void
   ) {
     this.resultPromise = this.pump();
   }
@@ -253,6 +353,7 @@ class ClaudeAgentSession implements AgentSession {
   async close(): Promise<void> {
     this.controller.abort();
     try { this.q.close(); } catch { /* already closed */ }
+    this.onClose();
   }
 
   completion(): Promise<AgentRunOutcome> {

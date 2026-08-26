@@ -68,7 +68,7 @@ export function workerPrompt(input: {
   task: TaskSpec;
   startSha: string;
   runId: string;
-  /** 任务 worktree 的绝对路径——模型必须在这里工作，写其它绝对路径会被拒绝 */
+  /** 任务 worktree 的绝对路径——模型必须在这里工作，越界变更会被机械验证拒绝 */
   worktreePath?: string;
   priorFeedback?: string | null;
   retry?: WorkerRetryContext | undefined;
@@ -85,13 +85,13 @@ ${input.retry.diff ? `\n## Uncommitted diff (may be truncated)\n\n${truncate(inp
 
 Run ID: ${input.runId}
 Task start SHA: ${input.startSha}
-${input.worktreePath ? `Your working directory (the task worktree): ${input.worktreePath}\nAll file edits MUST use paths inside this directory (relative paths are preferred). Writes to any other absolute path are denied by policy.\n` : ''}
+${input.worktreePath ? `Your working directory (the task worktree): ${input.worktreePath}\nAll file edits MUST use paths inside this directory (relative paths are preferred). The Runner mechanically rejects out-of-scope changes after the turn.\n` : ''}
 
 Task specification:
 ${JSON.stringify(input.task, null, 2)}
 
 ${input.priorFeedback ? `# Previous failure or review feedback\n\n${input.priorFeedback}\n` : ''}${retry}
-The Runner owns staging and commits. Do not run git add, git commit, git merge, git rebase, git push, deployment, or production mutations. Work only inside the current worktree. At the end, return the structured Worker result.`;
+The Runner owns staging and commits. You may run the task verification commands while implementing; the Runner repeats them after your turn. Do not run git add, git commit, git merge, git rebase, git push, deployment, or production mutations. Work only inside the current worktree. At the end, return the structured Worker result.`;
 }
 
 function truncate(text: string, limit: number): string {
@@ -104,6 +104,8 @@ export function reviewerPrompt(input: {
   startSha: string;
   worktreePath?: string;
   workerResult: unknown;
+  candidateDiff?: string | undefined;
+  candidateFiles?: string[] | undefined;
 }): string {
   return `${loadSkill('reviewer')}
 
@@ -113,10 +115,10 @@ Task specification:
 ${JSON.stringify(input.task, null, 2)}
 
 Task start SHA: ${input.startSha}
-${input.worktreePath ? `Your working directory (the task worktree): ${input.worktreePath}\nRun all git commands in this directory — do NOT cd anywhere else; the main repository checkout does not contain the candidate changes.\n` : ''}Worker report:
+${input.worktreePath ? `Your working directory (the task worktree): ${input.worktreePath}\nThe Runner has included the staged candidate diff below; use direct file-reading tools for additional context.\n` : ''}Worker report:
 ${JSON.stringify(input.workerResult, null, 2)}
 
-The candidate changes are staged by the Runner (git add -A already ran). Inspect them with git diff --cached and read the affected files in this worktree. Workers never commit — do not request commits; the Runner commits after your approval. Do not modify, stage, or commit anything. Return the structured review decision.`;
+${input.candidateFiles?.length ? `# Complete changed-file manifest\n\n${input.candidateFiles.map((file) => `- ${file}`).join('\n')}\n\n` : ''}${input.candidateDiff ? `# Staged candidate diff\n\n${truncate(input.candidateDiff, DIFF_LIMIT)}\n\n` : ''}The candidate changes are staged by the Runner (git add -A already ran). Read every affected file needed to cover the complete manifest; the inline diff may be truncated. Workers never commit — do not request commits; the Runner commits after your approval. Do not modify, stage, or commit anything. Return the structured review decision.`;
 }
 
 export function integrationPrompt(input: {

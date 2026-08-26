@@ -14,7 +14,8 @@ import type {
 } from '../types.js';
 import type { BackendId } from '../../core/types.js';
 import { JsonRpcConnection } from './jsonrpc.js';
-import { compileCodex, type CodexApprovalDecision, type CompiledCodexPolicy } from './policy.js';
+import { compileCodex, type CompiledCodexPolicy } from './policy.js';
+import type { ApprovalDecision, ApprovalRequest } from '../approval.js';
 import { sanitizedEnv } from '../env.js';
 import { parseAgentJson } from '../parse.js';
 // 窄类型导入（import type = 零运行时耦合）：只引入我们实际消费的协议类型，
@@ -29,8 +30,16 @@ import type { ThreadItem } from './protocol/v2/ThreadItem.js';
 import type { ThreadTokenUsageUpdatedNotification } from './protocol/v2/ThreadTokenUsageUpdatedNotification.js';
 import type { CommandExecutionRequestApprovalParams } from './protocol/v2/CommandExecutionRequestApprovalParams.js';
 import type { CommandExecutionRequestApprovalResponse } from './protocol/v2/CommandExecutionRequestApprovalResponse.js';
+import type { FileChangeRequestApprovalParams } from './protocol/v2/FileChangeRequestApprovalParams.js';
 import type { FileChangeRequestApprovalResponse } from './protocol/v2/FileChangeRequestApprovalResponse.js';
+import type { FileChangePatchUpdatedNotification } from './protocol/v2/FileChangePatchUpdatedNotification.js';
 import type { ModelListResponse } from './protocol/v2/ModelListResponse.js';
+import type { ApplyPatchApprovalParams } from './protocol/ApplyPatchApprovalParams.js';
+import type { ExecCommandApprovalParams } from './protocol/ExecCommandApprovalParams.js';
+import type { ReviewDecision } from './protocol/ReviewDecision.js';
+import type { PermissionsRequestApprovalParams } from './protocol/v2/PermissionsRequestApprovalParams.js';
+import type { PermissionsRequestApprovalResponse } from './protocol/v2/PermissionsRequestApprovalResponse.js';
+import type { GrantedPermissionProfile } from './protocol/v2/GrantedPermissionProfile.js';
 
 const CLIENT_INFO = { name: 'agent-team-runner', title: null, version: '0.1.0' };
 
@@ -48,7 +57,7 @@ interface TurnRecord {
 /**
  * codex 后端：常驻一个 `codex app-server` 子进程（进程组），跨 turn/thread 复用。
  * 审批请求（item/commandExecution/requestApproval、item/fileChange/requestApproval）
- * 由 Runner policy 程序化应答——codex 的授权闭环。
+ * are forwarded to the foreground Runner CLI and answered with Codex-native decisions.
  */
 export class CodexBackend implements AgentBackend {
   readonly id: BackendId = 'codex';
@@ -114,7 +123,7 @@ export class CodexBackend implements AgentBackend {
       cwd: scratch,
       prompt: 'Reply with exactly: ok',
       schema: { type: 'string' },
-      policy: { fs: { mode: 'read-only' }, bash: { mode: 'deny' }, network: false },
+      access: 'read-only',
       timeoutMs: 60_000,
       staleAfterMs: 60_000,
       ...(model !== undefined ? { model } : {})
@@ -133,7 +142,7 @@ export class CodexBackend implements AgentBackend {
 
   async openSession(spec: SessionSpec): Promise<AgentSession> {
     await this.ensureServer();
-    const compiled = compileCodex(spec.policy, spec.cwd);
+    const compiled = compileCodex(spec.access, spec.cwd);
     const params: ThreadStartParams = {
       cwd: spec.cwd,
       ...(spec.model !== undefined ? { model: spec.model } : {}),
@@ -142,7 +151,10 @@ export class CodexBackend implements AgentBackend {
     };
     const response = await this.connection!.request('thread/start', params, 30_000) as ThreadStartResponse;
     const threadId = response.thread.id;
-    const session = new CodexAgentSession(this.connection!, threadId, spec, compiled);
+    const session = new CodexAgentSession(
+      this.connection!, threadId, spec, compiled,
+      () => this.sessions.delete(threadId)
+    );
     this.sessions.set(threadId, session);
     spec.onEvent?.({ type: 'session', sessionId: threadId });
     return session;
@@ -150,6 +162,7 @@ export class CodexBackend implements AgentBackend {
 
   /** 销毁共享 app-server（runner 退出时调用） */
   dispose(): void {
+    for (const session of [...this.sessions.values()]) void session.close();
     this.sessions.clear();
     this.connection?.close();
     this.connection = null;
@@ -180,46 +193,60 @@ export class CodexBackend implements AgentBackend {
         inputTokens: total.inputTokens,
         outputTokens: total.outputTokens
       });
+      return;
+    }
+    if (method === 'item/fileChange/patchUpdated') {
+      const record = params as FileChangePatchUpdatedNotification;
+      this.sessions.get(record.threadId)?.onFileChangePatch(record.itemId, record.changes.map((change) => change.path));
     }
   }
 
-  handleServerRequest(method: string, params: unknown): Promise<unknown> {
+  async handleServerRequest(method: string, params: unknown): Promise<unknown> {
     if (method === 'item/commandExecution/requestApproval') {
       const record = params as CommandExecutionRequestApprovalParams;
       const session = this.sessions.get(record.threadId);
       const response: CommandExecutionRequestApprovalResponse = {
         decision: session
-          ? session.approveCommand(String(record.command ?? ''))
+          ? await session.approveCommand(String(record.command ?? ''), record)
           : 'decline'
       };
-      return Promise.resolve(response);
+      return response;
     }
-    if (method === 'item/fileChange/requestApproval' || method === 'applyPatchApproval') {
-      const threadId = (params as { threadId?: string }).threadId;
+    if (method === 'item/fileChange/requestApproval') {
+      const record = params as Partial<FileChangeRequestApprovalParams>;
+      const threadId = record.threadId;
       const session = threadId ? this.sessions.get(threadId) : undefined;
       const response: FileChangeRequestApprovalResponse = {
-        decision: session ? session.approveFileChange() : 'decline'
+        decision: session && record.itemId ? await session.approveFileChange(record.itemId, record.grantRoot, record.reason) : 'decline'
       };
-      return Promise.resolve(response);
+      return response;
+    }
+    if (method === 'item/permissions/requestApproval') {
+      const record = params as PermissionsRequestApprovalParams;
+      const session = this.sessions.get(record.threadId);
+      if (!session) return deniedPermissionResponse();
+      return await session.approvePermissions(record);
+    }
+    if (method === 'applyPatchApproval') {
+      const record = params as ApplyPatchApprovalParams;
+      const session = this.sessions.get(record.conversationId);
+      const decision = session
+        ? await session.approveFilePaths(Object.keys(record.fileChanges), record.grantRoot, record.reason)
+        : 'decline';
+      return { decision: legacyReviewDecision(decision) };
     }
     if (method === 'execCommandApproval') {
-      // v1 遗留审批：载荷不带 threadId，保持宽松解析
-      const record = params as { command?: string | Array<{ command?: string }> };
-      const command = typeof record.command === 'string' ? record.command : record.command?.[0]?.command ?? '';
-      const decision = this.approveGlobally(command);
-      return Promise.resolve({ decision });
+      const record = params as ExecCommandApprovalParams;
+      const session = this.sessions.get(record.conversationId);
+      const decision = session
+        ? await session.approveCommand(record.command.join(' '), undefined, record.reason, record.command)
+        : 'decline';
+      return { decision: legacyReviewDecision(decision) };
     }
     if (method === 'item/tool/requestUserInput' || method === 'mcpServer/elicitation/request') {
-      return Promise.reject(new Error('no interactive user is available in headless team runs'));
+      throw new Error('interactive question routing is not implemented');
     }
-    return Promise.reject(new Error(`unhandled app-server request: ${method}`));
-  }
-
-  private approveGlobally(command: string): 'accept' | 'decline' {
-    for (const session of this.sessions.values()) {
-      return session.approveCommand(command) === 'decline' ? 'decline' : 'accept';
-    }
-    return 'decline';
+    throw new Error(`unhandled app-server request: ${method}`);
   }
 
   private ensureServer(): Promise<void> {
@@ -229,15 +256,24 @@ export class CodexBackend implements AgentBackend {
   }
 
   private async startServer(): Promise<void> {
-    this.connection = new JsonRpcConnection(
+    const connection = new JsonRpcConnection(
       this.command,
       ['app-server'],
       {
         onNotification: (method, params) => this.handleNotification(method, params),
-        onServerRequest: (method, params) => this.handleServerRequest(method, params)
+        onServerRequest: (method, params) => this.handleServerRequest(method, params),
+        onExit: () => {
+          if (this.connection !== connection) return;
+          for (const session of [...this.sessions.values()]) void session.close();
+          this.sessions.clear();
+          this.connection = null;
+          this.initialized = false;
+          this.initPromise = null;
+        }
       },
       sanitizedEnv()
     );
+    this.connection = connection;
     try {
       await this.connection.request('initialize', { clientInfo: CLIENT_INFO, capabilities: null }, 30_000);
       this.initialized = true;
@@ -256,12 +292,19 @@ class CodexAgentSession implements AgentSession {
   private interrupted = false;
   private readonly resultPromise: Promise<AgentRunOutcome>;
   private settled = false;
+  private readonly pendingFileChanges = new Map<string, string[]>();
+  private readonly approvalController = new AbortController();
+
+  get cwd(): string {
+    return this.spec.cwd;
+  }
 
   constructor(
     private readonly connection: JsonRpcConnection,
     threadId: string,
     private readonly spec: SessionSpec,
-    private readonly compiled: CompiledCodexPolicy
+    private readonly compiled: CompiledCodexPolicy,
+    private readonly onClose: () => void
   ) {
     this.sessionId = threadId;
     this.resultPromise = new Promise((resolve) => { this.resolveResult = resolve; });
@@ -287,28 +330,86 @@ class CodexAgentSession implements AgentSession {
     }
   }
 
-  approveCommand(command: string): 'accept' | 'acceptForSession' | 'decline' {
-    const decision = this.compiled.decideCommand(command);
+  async approveCommand(
+    command: string,
+    request?: CommandExecutionRequestApprovalParams,
+    legacyReason?: string | null,
+    rawCommand?: unknown
+  ): Promise<'accept' | 'acceptForSession' | 'decline'> {
+    const decision = await this.ask({
+      kind: request?.networkApprovalContext || (request?.proposedNetworkPolicyAmendments?.length ?? 0) > 0 ? 'network' : 'command',
+      tool: 'Bash',
+      input: {
+        command: rawCommand ?? command,
+        ...(request?.cwd ? { cwd: request.cwd } : {}),
+        ...(request?.networkApprovalContext ? { network: request.networkApprovalContext } : {}),
+        ...(request?.proposedNetworkPolicyAmendments ? { proposedNetworkPolicyAmendments: request.proposedNetworkPolicyAmendments } : {})
+      },
+      title: request?.networkApprovalContext
+        ? `Codex wants network access to ${request.networkApprovalContext.host}`
+        : `Codex wants to run: ${rawCommand ? JSON.stringify(rawCommand) : command}`,
+      reason: request?.reason ?? legacyReason ?? undefined,
+      allowSession: true
+    });
     this.spec.onEvent?.({
       type: 'permission-check',
       tool: 'Bash',
       input: { command },
-      allowed: decision !== 'decline',
-      ...(decision === 'decline' ? { reason: `command is not allowlisted for this role: ${command}` } : {})
+      allowed: decision !== 'deny',
+      ...(decision === 'deny' ? { reason: 'denied by user' } : {})
     });
-    return decision;
+    return codexDecision(decision);
   }
 
-  approveFileChange(): CodexApprovalDecision {
-    const decision = this.compiled.decideFileChange();
+  approveFileChange(itemId: string, grantRoot?: string | null, reason?: string | null): Promise<'accept' | 'acceptForSession' | 'decline'> {
+    const paths = this.pendingFileChanges.get(itemId) ?? [];
+    return this.approveFilePaths(paths, grantRoot, reason);
+  }
+
+  async approveFilePaths(paths: string[], grantRoot?: string | null, reason?: string | null): Promise<'accept' | 'acceptForSession' | 'decline'> {
+    if (this.compiled.access === 'read-only') return 'decline';
+    const decision = await this.ask({
+      kind: grantRoot ? 'external-directory' : 'file-change',
+      tool: 'Edit',
+      input: { paths, ...(grantRoot ? { grantRoot } : {}) },
+      title: grantRoot ? `Codex wants write access to ${grantRoot}` : 'Codex wants to modify files',
+      reason: reason ?? undefined,
+      allowSession: true
+    });
     this.spec.onEvent?.({
       type: 'permission-check',
       tool: 'Edit',
-      input: {},
-      allowed: decision === 'accept',
-      ...(decision === 'decline' ? { reason: 'file changes are denied for this role' } : {})
+      input: { paths },
+      allowed: decision !== 'deny',
+      ...(decision === 'deny' ? { reason: 'denied by user' } : {})
     });
-    return decision;
+    return codexDecision(decision);
+  }
+
+  async approvePermissions(request: PermissionsRequestApprovalParams): Promise<PermissionsRequestApprovalResponse> {
+    const grantable = grantablePermissions(request.permissions, this.compiled.access);
+    const decision = await this.ask({
+      kind: request.permissions.network?.enabled ? 'network' : 'external-directory',
+      tool: 'Permissions',
+      input: request.permissions,
+      title: 'Codex requests additional sandbox permissions',
+      reason: request.reason ?? undefined,
+      allowSession: true
+    });
+    this.spec.onEvent?.({
+      type: 'permission-check',
+      tool: 'Permissions',
+      input: request.permissions,
+      allowed: decision !== 'deny',
+      ...(decision === 'deny' ? { reason: 'denied by user' } : {})
+    });
+    if (decision === 'deny') return deniedPermissionResponse();
+    return { permissions: grantable, scope: decision === 'session' ? 'session' : 'turn' };
+  }
+
+  onFileChangePatch(itemId: string, paths: string[]): void {
+    this.pendingFileChanges.set(itemId, paths);
+    this.spec.onEvent?.({ type: 'activity' });
   }
 
   onActivity(): void {
@@ -325,6 +426,7 @@ class CodexAgentSession implements AgentSession {
   }
 
   onItemCompleted(item: ThreadItem): void {
+    if (item.type === 'fileChange') this.pendingFileChanges.delete(item.id);
     if (item.type === 'agentMessage') {
       this.state.agentMessages.push(item.text);
       this.spec.onEvent?.({ type: 'message', text: item.text });
@@ -383,12 +485,14 @@ class CodexAgentSession implements AgentSession {
 
   async interrupt(): Promise<void> {
     this.interrupted = true;
+    this.approvalController.abort(new Error('Codex session interrupted'));
     try {
       await this.connection.request('turn/interrupt', { threadId: this.sessionId }, 10_000);
     } catch { /* server may have exited */ }
   }
 
   async close(): Promise<void> {
+    this.approvalController.abort(new Error('Codex session closed'));
     if (!this.settled) {
       this.settled = true;
       this.resolveResult({
@@ -400,9 +504,56 @@ class CodexAgentSession implements AgentSession {
         sessionId: this.sessionId
       });
     }
+    this.onClose();
   }
 
   completion(): Promise<AgentRunOutcome> {
     return this.resultPromise;
   }
+
+  private async ask(request: Omit<ApprovalRequest, 'backend' | 'role' | 'label' | 'sessionId' | 'cwd'>): Promise<ApprovalDecision> {
+    if (!this.spec.requestApproval) return 'deny';
+    try {
+      return await this.spec.requestApproval({
+        backend: 'codex', role: this.spec.role, label: this.spec.label,
+        sessionId: this.sessionId, cwd: this.spec.cwd, ...request
+      }, this.approvalController.signal);
+    } catch {
+      return 'deny';
+    }
+  }
+}
+
+export function codexDecision(decision: ApprovalDecision): 'accept' | 'acceptForSession' | 'decline' {
+  if (decision === 'session') return 'acceptForSession';
+  return decision === 'once' ? 'accept' : 'decline';
+}
+
+function deniedPermissionResponse(): PermissionsRequestApprovalResponse {
+  return { permissions: {}, scope: 'turn' };
+}
+
+function grantablePermissions(
+  requested: PermissionsRequestApprovalParams['permissions'],
+  access: 'read-only' | 'workspace-write'
+): GrantedPermissionProfile {
+  const permissions: GrantedPermissionProfile = {};
+  if (requested.network) permissions.network = requested.network;
+  if (requested.fileSystem) {
+    permissions.fileSystem = access === 'workspace-write'
+      ? requested.fileSystem
+      : {
+          ...requested.fileSystem,
+          write: [],
+          ...(requested.fileSystem.entries ? {
+            entries: requested.fileSystem.entries.filter((entry) => entry.access !== 'write')
+          } : {})
+        };
+  }
+  return permissions;
+}
+
+export function legacyReviewDecision(decision: 'accept' | 'acceptForSession' | 'decline'): ReviewDecision {
+  if (decision === 'acceptForSession') return 'approved_for_session';
+  return decision === 'decline' ? { denied: { rejection: 'denied by user' } } : 'approved';
 }

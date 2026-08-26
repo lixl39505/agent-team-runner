@@ -1,8 +1,6 @@
 #!/usr/bin/env node
-import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
 import { applyOverrides, initConfig, loadConfig } from './core/config.js';
 import type { ConfigOverride } from './core/config.js';
 import { StateDatabase } from './core/db.js';
@@ -15,8 +13,8 @@ import { buildBackends, disposeBackends, parseSnapshot, resolveAgentByName, snap
 import { generatedProtocolVersion } from './agent/codex/generated.js';
 import { backendCommand, validateAgents } from './core/agent-config.js';
 import { checkAgentAvailability, probeAll } from './core/preflight.js';
-import { terminateTree } from './core/proctree.js';
 import type { AgentBinding, RunnerConfig } from './core/types.js';
+import { TerminalApprovalBroker } from './agent/approval.js';
 
 const argv = process.argv.slice(2);
 const command = argv.shift();
@@ -179,10 +177,15 @@ async function main(): Promise<void> {
     if (agent) config.defaultAgent = agent;
     try {
       await preflight(config, Object.values(snapshotAgents(config).roles), true);
-      const id = await planRun({ config, db, goalFile, ...(runId ? { runId } : {}) });
-      console.log(`Planned run: ${id}`);
-      console.log(formatRunStatus(db.getRun(id), db.listTasks(id)));
-      if (command === 'launch') await runOrchestrator({ config, db, runId: id });
+      const approvals = terminalApprovals();
+      try {
+        const id = await planRun({ config, db, goalFile, ...(runId ? { runId } : {}), requestApproval: approvals.request });
+        console.log(`Planned run: ${id}`);
+        console.log(formatRunStatus(db.getRun(id), db.listTasks(id)));
+        if (command === 'launch') await runOrchestrator({ config, db, runId: id, requestApproval: approvals.request });
+      } finally {
+        approvals.close();
+      }
     } finally {
       db.close();
     }
@@ -191,27 +194,9 @@ async function main(): Promise<void> {
 
   if (command === 'run') {
     const runId = argv.shift();
-    if (!runId) throw new Error('Usage: agent-team run <run-id> [--detach] [--repo PATH]');
-    const detach = flag('--detach');
-    const foreground = flag('--foreground');
+    if (!runId) throw new Error('Usage: agent-team run <run-id> [--repo PATH]');
     const repoRoot = repoOption();
-    if (detach && !foreground) {
-      const config = applyOverrides(loadConfig(repoRoot), configOverrides());
-      const logPath = join(config.stateDir, 'runs', runId, 'runner.log');
-      mkdirSync(join(config.stateDir, 'runs', runId), { recursive: true });
-      const cliPath = fileURLToPath(import.meta.url);
-      const forwarded = rawConfigOverrides.flatMap((entry) => ['-c', entry]);
-      const child = spawn(process.execPath, [cliPath, 'run', runId, '--foreground', '--repo', repoRoot, ...forwarded], {
-        detached: true,
-        stdio: ['ignore', 'ignore', 'ignore'],
-        env: process.env
-      });
-      child.unref();
-      appendFileSync(logPath, `Detached runner pid=${child.pid}\n`, 'utf8');
-      console.log(`Runner started in background. PID: ${child.pid}`);
-      console.log(`Status: agent-team status ${runId} --watch --repo ${repoRoot}`);
-      return;
-    }
+    if (argv.length > 0) throw new Error(`Unknown run option: ${argv[0]}`);
     const { config, db } = database(repoRoot);
     try {
       // -c roles.* 视为对当前 run 的人为强制修改：只更新被覆写的角色，其余保留原快照
@@ -237,8 +222,13 @@ async function main(): Promise<void> {
         }
       }
       await preflight(config, bindings, false);
-      await runOrchestrator({ config, db, runId });
-      console.log(formatRunStatus(db.getRun(runId), db.listTasks(runId)));
+      const approvals = terminalApprovals();
+      try {
+        await runOrchestrator({ config, db, runId, requestApproval: approvals.request });
+        console.log(formatRunStatus(db.getRun(runId), db.listTasks(runId)));
+      } finally {
+        approvals.close();
+      }
     } finally {
       db.close();
     }
@@ -281,35 +271,6 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (command === 'stop') {
-    const runId = argv.shift();
-    if (!runId) throw new Error('Usage: agent-team stop <run-id> [--repo PATH]');
-    const repoRoot = repoOption();
-    const { config, db } = database(repoRoot);
-    try {
-      // SDK 后端的会话没有 per-task pid；杀掉 detached runner 进程，
-      // 其信号处理器会释放共享后端子进程（app-server / opencode serve）
-      const runnerLog = join(config.stateDir, 'runs', runId, 'runner.log');
-      try {
-        const log = readFileSync(runnerLog, 'utf8');
-        const match = log.match(/Detached runner pid=(\d+)/);
-        if (match) terminateTree(Number(match[1]), true);
-      } catch { /* 无 detach 日志 = 前台运行，无需杀 runner */ }
-      for (const task of db.listTasks(runId)) {
-        if (task.pid) {
-          // 兼容仍有 pid 记录的旧 run：杀整个进程组
-          terminateTree(task.pid, true);
-        }
-        if (['running', 'verifying', 'reviewing'].includes(task.status)) {
-          db.updateTask(runId, task.taskId, { pid: null, status: 'changes_requested', phase: 'stopped', lastError: 'Stopped by user.' });
-        }
-      }
-      db.updateRun(runId, { status: 'stopped', error: 'Stopped by user.' });
-      console.log(`Stopped run ${runId}`);
-    } finally { db.close(); }
-    return;
-  }
-
   throw new Error(`Unknown command: ${command}`);
 }
 
@@ -322,10 +283,9 @@ Commands:
   skills sync [--repo PATH]          Mirror portable skills for Codex/OpenCode/Claude
   plan <goal.md> [options]           Ask Lead to create and validate a task DAG
   launch <goal.md> [options]         Plan and run end-to-end
-  run <run-id> [--detach]            Execute Workers, Reviews, and Integration
+  run <run-id>                       Execute Workers, Reviews, and Integration
   status [run-id] [--watch]          Show live state
   list [--repo PATH]                 List runs
-  stop <run-id> [--repo PATH]        Stop active agent processes
 
 Options:
   --repo PATH
@@ -335,6 +295,13 @@ Options:
                                      -c roles.lead=lead-agent -c concurrency=5
                                  Priority: -c flags > config.yml > defaults
 `);
+}
+
+function terminalApprovals(): TerminalApprovalBroker {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error('Planning and running require an interactive terminal for backend permission requests.');
+  }
+  return new TerminalApprovalBroker();
 }
 
 main().catch((error) => {

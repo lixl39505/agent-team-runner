@@ -4,7 +4,7 @@ import type { LeadResult, RunnerConfig } from './types.js';
 import { StateDatabase } from './db.js';
 import { buildBackends, disposeBackends, resolveAgent, snapshotAgents } from '../agent/registry.js';
 import { runAgent } from '../agent/supervise.js';
-import { readOnlyPolicy } from './policy.js';
+import type { ApprovalHandler } from '../agent/approval.js';
 import { agentList } from './agent-config.js';
 import { LEAD_SCHEMA, validateLeadResult } from './validation.js';
 import { ensureGitRepo, revParse } from './git.js';
@@ -21,6 +21,7 @@ export async function planRun(input: {
   db: StateDatabase;
   goalFile: string;
   runId?: string;
+  requestApproval?: ApprovalHandler;
 }): Promise<string> {
   const repoRoot = input.config.repoRoot;
   await ensureGitRepo(repoRoot);
@@ -45,8 +46,19 @@ export async function planRun(input: {
     const backends = buildBackends(input.config);
     let manifest: LeadResult | null = null;
     let priorError = '';
+    let interrupted = false;
+    const onSignal = (): void => {
+      if (interrupted) return;
+      interrupted = true;
+      process.exitCode = 130;
+      disposeBackends(backends);
+    };
+    process.once('SIGTERM', onSignal);
+    process.once('SIGINT', onSignal);
+    process.once('SIGHUP', onSignal);
     try {
       for (let attempt = 1; attempt <= input.config.maxPlanAttempts; attempt += 1) {
+        if (interrupted) break;
         const registry = agentList(input.config);
         const prompt = leadPrompt({
           goal, goalFile, repoRoot, baseRef: input.config.baseRef, baseSha,
@@ -62,11 +74,13 @@ Return a corrected full manifest.` : '');
           backend: backends[leadBinding.backend],
           spec: {
             role: 'lead', cwd: repoRoot,
+            label: `${runId} lead`,
             prompt,
             schema: LEAD_SCHEMA,
             ...(leadBinding.model !== undefined ? { model: leadBinding.model } : {}),
             ...(leadBinding.maxTurns !== undefined ? { maxTurns: leadBinding.maxTurns } : {}),
-            policy: readOnlyPolicy(),
+            access: 'read-only',
+            requestApproval: input.requestApproval,
             timeoutMs: input.config.taskTimeoutMs, staleAfterMs: input.config.staleAfterMs
           },
           logPath: join(runDir, 'logs', `lead-${attempt}.log`),
@@ -90,8 +104,12 @@ Return a corrected full manifest.` : '');
         }
       }
     } finally {
+      process.off('SIGTERM', onSignal);
+      process.off('SIGINT', onSignal);
+      process.off('SIGHUP', onSignal);
       disposeBackends(backends);
     }
+    if (interrupted) throw new Error('Planning interrupted by user.');
     if (!manifest) throw new Error(`Lead could not produce a valid manifest: ${priorError}`);
     writeJson(join(runDir, 'manifest.json'), manifest);
     for (const task of manifest.tasks) {

@@ -1,0 +1,21 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { sanitizedEnv } from '../dist/agent/env.js';
+import { verificationEnv } from '../dist/core/process-env.js';
+
+test('agent environments keep auth but force non-interactive Git isolation', () => {
+  const env = sanitizedEnv({ ANTHROPIC_API_KEY: 'test-key', GIT_PAGER: 'less' });
+  assert.equal(env.ANTHROPIC_API_KEY, 'test-key');
+  assert.equal(env.GIT_PAGER, 'cat');
+  assert.equal(env.GIT_OPTIONAL_LOCKS, '0');
+  assert.equal(env.GIT_TERMINAL_PROMPT, '0');
+});
+
+test('verification environments exclude provider credentials', () => {
+  const env = verificationEnv('/isolated-home');
+  for (const key of ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'CODEX_API_KEY']) {
+    assert.equal(key in env, false);
+  }
+  assert.equal(env.HOME, '/isolated-home');
+  assert.equal(env.GIT_PAGER, 'cat');
+});

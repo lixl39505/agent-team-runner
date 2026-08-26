@@ -54,7 +54,7 @@ Runner 在调用 Agent 时会直接读取打包的 Skill 内容并编译进运�
 - 事件流心跳（真实"无进展"检测）、静默超时和硬超时
 - Worker 失败自动重试（重试 prompt 嵌入 diff + reviewer 反馈原文 + 上次 summary）
 - agents 注册表：为不同 role 配置不同 agent（后端 + model + turn 上限）
-- Runner 统一权限策略：Bash 命令前缀、路径 glob、网络开关，在工具调用时实时裁决
+- 三后端原生权限请求统一转发到当前终端，支持 once / session / deny
 - YAML 配置文件 + `-c` 命令行任意层级覆写
 - 启动前闭环预检：后端 discover + 真实 model 枚举 + 1-token 试跑（持久缓存）
 - 修改路径 allowlist / blocklist 机械校验
@@ -67,7 +67,7 @@ Runner 在调用 Agent 时会直接读取打包的 Skill 内容并编译进运�
 - 限定范围的冲突解决 Agent
 - 全局验证命令
 - Integrator 统一更新架构和进度文档
-- 前台运行、后台运行、状态查看和停止
+- 前台运行、FIFO 审批队列、状态查看和 Ctrl-C 停止
 
 ## 环境要求
 
@@ -236,8 +236,10 @@ Lead 只能生成以 `allowedCommandPrefixes` 开头的验证命令。Runner 还
 - 重定向
 - 命令替换
 - 多行命令
+- Git helper / output 重定向参数
+- `find -exec/-delete`、`rg --pre` 和构建工具的 helper/path override 参数
 
-命令不通过 shell 执行，而是拆分为程序和参数后直接 `spawn`。
+命令不通过 shell 执行，而是拆分为程序和参数后直接 `spawn`。验证进程只收到基础环境变量，不会继承 Provider 密钥；每条命令后 Runner 都重新校验 HEAD 和路径。Agent 可以在实现期间自行运行测试，Runner 会在 turn 结束后独立重跑清单中的验证命令。
 
 不要把 `node`、`bash`、`sh`、`python -c` 之类的通用执行器随意放进 allowlist，否则验证命令实际上可以执行任意代码。
 
@@ -300,12 +302,6 @@ agent-team launch specs/goals/order-export.md \
   --agent lead-agent
 ```
 
-### 后台无人值守运行
-
-```bash
-agent-team run order-export --detach
-```
-
 ### Ghostty 状态窗格
 
 ```bash
@@ -320,13 +316,21 @@ tail -f .agent-team/runs/order-export/logs/T001-review-1.log
 tail -f .agent-team/runs/order-export/logs/integration-verification.log
 ```
 
-### 停止
+`plan`、`launch` 和 `run` 都是前台终端命令。运行中使用 Ctrl-C 停止；再次执行 `agent-team run <runId>` 会恢复遗留任务状态和 Worktree。
 
-```bash
-agent-team stop order-export
+### 终端审批
+
+Claude、Codex 和 OpenCode 的原生权限请求统一显示在运行命令所在终端。并发 Agent 的请求进入 FIFO 队列，避免同时读取 stdin：
+
+```text
+[Approval] codex / worker / order-export T001 worker
+Codex wants to run: npm test
+Working directory: /path/to/worktree
+
+[o] once  [s] session  [d] deny:
 ```
 
-停止会终止 detached runner 进程（其信号处理器释放共享后端子进程）与仍有 pid 记录的旧任务进程，并把任务保留为可恢复状态，不删除 Worktree。
+网络、外部目录和文件修改使用同一流程。等待人工审批的时间不计入 hard timeout 或 stale timeout。`session` 只在对应后端支持时显示；拒绝会作为原生工具结果返回 Agent，而不是由 Runner 直接判定任务失败。
 
 ## Worker 生命周期
 
@@ -387,8 +391,9 @@ Runner 重启时，会把遗留的 `running`、`verifying` 和 `reviewing` 任�
 
 | 后端 | 集成方式 | 结构化输出 | 权限闭环 |
 |---|---|---|---|
-| claude | `@anthropic-ai/claude-agent-sdk` | `outputFormat: json_schema` | `canUseTool` 回调实时裁决 Bash/Edit/Write |
-| codex | 直连 `codex app-server`（JSON-RPC/stdio，常驻复用） | `turn/start` 的 `outputSchema` | `item/*/requestApproval` 审批请求 → Runner 应答 accept/decline |
+| claude | `@anthropic-ai/claude-agent-sdk` | `outputFormat: json_schema` | `canUseTool` 请求 → once/deny；SDK suggestions → session 权限更新 |
+| codex | 直连 `codex app-server`（JSON-RPC/stdio，常驻复用） | `turn/start` 的 `outputSchema` | command/file/permissions 请求 → accept/acceptForSession/decline 或 turn/session grant |
+| opencode | 受管 `opencode serve` + `@opencode-ai/sdk` | `format: json_schema`（+ prompt 内嵌兜底） | SSE `permission.updated` → once/always/reject |
 
 **codex 协议升级流程**：app-server 协议是 experimental 的，vendored 类型（`src/agent/codex/protocol/`）是针对 `GENERATED_FROM` 记录的版本生成的快照，`agent/codex/` 传输代码窄类型导入其中实际消费的类型。codex 升级后：
 
@@ -398,15 +403,13 @@ npm run check       # 上游破坏性变更在这里变成编译错误，改完�
 ```
 
 `agent-team doctor` 会比对 `GENERATED_FROM` 与实际安装的 CLI 版本，不一致时提示重新生成。终局方案是等 `@openai/codex-sdk` 补齐审批回调与 model 枚举后切回 SDK（`AgentBackend` 接口即为切换预留）。
-| opencode | 受管 `opencode serve` + `@opencode-ai/sdk` | `format: json_schema`（+ prompt 内嵌兜底） | SSE 权限事件 → Runner 应答 once/reject |
 
-权限的唯一事实来源是 `src/core/policy.ts`：角色 → `{fs, bash 前缀, network}` 规格，编译到各后端原生控制；同一套纯函数同时被事后机械验证器使用。三级执行：
+Runner 不解析 Agent 命令语义，也不维护网络开关或工具 allowlist。权限分为两层：
 
-1. OS 级 sandbox（codex `sandboxPolicy`，workspace-write 默认断网）
-2. 工具调用时实时裁决（拒绝原因会返回给模型，避免反复重试）
-3. 事后机械验证（HEAD 校验、路径检查、命令重跑）
+1. 后端原生角色边界：Lead/Reviewer 为 read-only，Worker/Integrator 为 workspace-write；网络和额外目录由后端发起审批。
+2. Runner 确定性验证：turn 后检查 HEAD 和实际修改路径、重跑验证命令、Reviewer 复查 staged diff，最后才提交。
 
-已知不对称（诚实记录）：codex 的 sandbox 粒度是根目录而非 glob，任务级 `allowedPaths` 的精细约束在 codex 上由事后验证器兜底；opencode 的模型侧错误（如 provider 401）会以明确错误终止该次尝试。
+Read-only 是不可由终端审批提升的角色边界。Workspace-write 会话中的 Bash、网络、编辑和外部目录访问由后端原生权限模型决定，Runner 只展示请求并传回用户选择。`allowedPaths` / `blockedPaths` 仍用于 turn 后机械检查，而不是冒充进程沙箱。
 
 环境变量默认净化：只传 PATH/HOME/LANG 等基础变量和后端认证变量，防止把父进程全部秘密泄漏给能执行命令的 agent。
 
@@ -419,7 +422,7 @@ npm run check       # 上游破坏性变更在这里变成编译错误，改完�
 - 部署
 - 修改生产数据库
 - 修改云资源
-- 执行任意 shell 字符串
+- 未经后端权限模型和用户授权执行受管操作
 - 删除 Worktree
 
 Integration 的默认可写范围只有：
@@ -441,9 +444,9 @@ npm test
 - DAG 校验和拓扑排序
 - 路径 Glob 策略与 blocked 优先级
 - 验证命令安全解析
-- 权限策略决策表（前缀命令、glob 路径、网络、只读角色）
-- 三后端 policy 编译（含 claude allowedTools 防 shadow 回归守卫）
-- 监督器全生命周期（fake 后端：成功 / 超时 / 静默 / 传输异常 / 中断）
+- FIFO 终端审批队列与 once/session/deny 映射
+- 三后端原生权限编译和协议响应映射
+- 监督器全生命周期（成功 / 超时 / 静默 / 审批暂停计时 / 传输异常）
 - codex JSON-RPC 帧编解码
 - probe 缓存（TTL / 版本隔离）
 - agents 注册表解析、v1 配置迁移、快照兼容
@@ -465,11 +468,11 @@ npm run test:integration   # 全会话层：真实推理（claude 权限矩阵 s
 
 ```text
 src/
-  agent/             后端层：types / supervise / registry / fake
+  agent/             后端层：types / approval / supervise / registry / fake
     claude/          Agent SDK 传输 + policy 编译
     codex/           app-server JSON-RPC 客户端 + policy 编译 + protocol/（生成的协议类型）
     opencode/        serve + SDK 传输 + policy 编译
-  core/              SQLite、Git、状态、Prompt、校验、编排、policy、preflight
+  core/              SQLite、Git、状态、Prompt、机械校验、编排、preflight
 skills/
   team-lead/
   team-worker/
@@ -488,7 +491,6 @@ test/
 - macOS 通知、Slack 或邮件通知
 - 每任务独立预算（角色级 model 已支持，见 roles 配置）
 - Token / 成本统计
-- 更严格的命令策略 DSL
 - 自动生成 Pull Request，但仍要求人工合并
 - 容器化 Worker
 - 任务取消、暂停和优先级

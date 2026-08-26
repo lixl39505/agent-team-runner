@@ -1,4 +1,8 @@
 import { spawn } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { verificationEnv } from './process-env.js';
 
 export function splitCommand(input: string): string[] {
   if (/[\n\r;&|<>`]/.test(input) || input.includes('$(')) {
@@ -27,6 +31,7 @@ export function splitCommand(input: string): string[] {
 
 export function assertAllowedCommand(command: string, prefixes: string[]): void {
   const tokens = splitCommand(command);
+  assertNoCapabilityBearingArguments(tokens);
   const normalized = tokens.join(' ');
   const allowed = prefixes.some((prefix) => {
     const prefixTokens = splitCommand(prefix);
@@ -35,13 +40,47 @@ export function assertAllowedCommand(command: string, prefixes: string[]): void 
   if (!allowed) throw new Error(`Verification command is not allowlisted: ${normalized}`);
 }
 
+/** Reject options that turn nominally read/test commands into write, exec, or policy-escalation primitives. */
+function assertNoCapabilityBearingArguments(tokens: string[]): void {
+  const [program, subcommand] = tokens;
+  const args = tokens.slice(1);
+  const reject = (reason: string): never => {
+    throw new Error(`Unsafe command arguments are not allowed (${reason}): ${tokens.join(' ')}`);
+  };
+  const hasOption = (values: string[]): boolean => args.some((arg) =>
+    values.some((value) => arg === value
+      || arg.startsWith(`${value}=`)
+      || (value.length === 2 && value.startsWith('-') && !value.startsWith('--') && arg.startsWith(value)))
+  );
+
+  if (program === 'git' && ['status', 'diff', 'log', 'show', 'rev-parse', 'ls-files'].includes(subcommand ?? '')) {
+    if (hasOption(['--output', '--ext-diff', '--textconv', '--show-signature', '--exec-path', '--html-path', '--man-path', '--info-path']) || args.includes('--help') || args.includes('-h')) {
+      reject('git helper execution or output redirection');
+    }
+  }
+  if (program === 'rg' && hasOption(['--pre', '--pre-glob'])) reject('ripgrep preprocessor execution');
+  if (program === 'find' && args.some((arg) => ['-delete', '-exec', '-execdir', '-ok', '-okdir', '-fls', '-fprint', '-fprint0', '-fprintf'].includes(arg))) {
+    reject('find action with side effects');
+  }
+  if (program === 'sort' && hasOption(['-o', '--output'])) reject('sort output file');
+  if (program === 'npm' && hasOption(['--prefix', '--userconfig', '--globalconfig', '--script-shell'])) reject('npm path, config, or shell override');
+  if (program === 'pnpm' && hasOption(['--dir', '-C', '--global-dir', '--config'])) reject('pnpm directory or config override');
+  if (program === 'yarn' && hasOption(['--cwd', '--use-yarnrc', '--install-state-path'])) reject('yarn directory or config override');
+  if (program === 'go' && subcommand === 'test' && hasOption(['-C', '-exec', '-toolexec', '-o', '-modfile', '-overlay'])) reject('go test helper, path, or output override');
+  if (program === 'bun' && subcommand === 'test' && hasOption(['--cwd', '--config', '--preload'])) reject('bun test path, config, or preload');
+  if (program === 'cargo' && subcommand === 'test' && hasOption(['--manifest-path', '--target-dir', '--config'])) reject('cargo test path or config override');
+  if (program === 'make' && hasOption(['-f', '--file', '--makefile', '-C', '--directory', '--eval'])) reject('makefile, directory, or eval override');
+}
+
 export async function runCommand(command: string, cwd: string, log?: (line: string) => void): Promise<number> {
   const [program, ...args] = splitCommand(command);
   return await new Promise<number>((resolve, reject) => {
-    const child = spawn(program!, args, { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const home = mkdtempSync(join(tmpdir(), 'agent-team-verification-home-'));
+    const child = spawn(program!, args, { cwd, env: verificationEnv(home), stdio: ['ignore', 'pipe', 'pipe'] });
+    const cleanup = (): void => { rmSync(home, { recursive: true, force: true }); };
     child.stdout.on('data', (chunk) => log?.(chunk.toString()));
     child.stderr.on('data', (chunk) => log?.(chunk.toString()));
-    child.on('error', reject);
-    child.on('close', (code) => resolve(code ?? 1));
+    child.on('error', (error) => { cleanup(); reject(error); });
+    child.on('close', (code) => { cleanup(); resolve(code ?? 1); });
   });
 }

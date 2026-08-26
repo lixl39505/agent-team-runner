@@ -16,7 +16,6 @@ import { JsonRpcConnection } from '../dist/agent/codex/jsonrpc.js';
 import { sanitizedEnv } from '../dist/agent/env.js';
 import { OpenCodeBackend } from '../dist/agent/opencode/sdk.js';
 import { runAgent } from '../dist/agent/supervise.js';
-import { workerPolicy } from '../dist/core/policy.js';
 
 const protocolEnabled = process.env.AGENT_TEAM_PROTOCOL === '1' || process.env.AGENT_TEAM_INTEGRATION === '1';
 const integrationEnabled = process.env.AGENT_TEAM_INTEGRATION === '1';
@@ -29,15 +28,6 @@ function workspace() {
   writeFileSync(join(dir, 'src', 'a.txt'), 'base\n', 'utf8');
   return dir;
 }
-
-const config = {
-  verification: { allowedCommandPrefixes: [], globalCommands: [] },
-  integration: { allowedPaths: [], runAgentAfterCherryPick: false }
-};
-const task = {
-  id: 'SPIKE', title: 'spike', description: 'spike', dependsOn: [],
-  allowedPaths: ['src/**'], blockedPaths: [], acceptance: [], verificationCommands: []
-};
 
 // ---------------------------------------------------------------------------
 // 协议层（零推理）
@@ -95,7 +85,8 @@ protocolTest('opencode: serve lifecycle and session creation without inference',
       cwd,
       prompt: '(not sent in this tier)',
       schema: { type: 'object' },
-      policy: workerPolicy(task, config),
+      access: 'workspace-write',
+      requestApproval: async () => 'once',
       timeoutMs: 10_000,
       staleAfterMs: 10_000
     });
@@ -110,7 +101,7 @@ protocolTest('opencode: serve lifecycle and session creation without inference',
 // 全会话层（真实推理）
 // ---------------------------------------------------------------------------
 
-maybeTest('codex: full session with structured output and in-flight policy', { timeout: 180_000 }, async () => {
+maybeTest('codex: full session with structured output and native approval routing', { timeout: 180_000 }, async () => {
   const backend = new CodexBackend();
   const cwd = workspace();
   const events = [];
@@ -124,11 +115,12 @@ maybeTest('codex: full session with structured output and in-flight policy', { t
           'Perform these steps in order:',
           '1. Read the file src/a.txt',
           "2. Edit src/a.txt appending a line 'changed'",
-          '3. Try to run the shell command: ls / (it may be denied — acknowledge and continue)',
+          '3. Run the shell command: node --version',
           `4. Return JSON {"done": true, "note": "ok"}`
         ].join('\n'),
         schema: { type: 'object', properties: { done: { type: 'boolean' }, note: { type: 'string' } }, required: ['done', 'note'] },
-        policy: workerPolicy(task, config),
+        access: 'workspace-write',
+        requestApproval: async () => 'once',
         timeoutMs: 150_000,
         staleAfterMs: 60_000,
         onEvent: (event) => events.push(event)
@@ -142,7 +134,7 @@ maybeTest('codex: full session with structured output and in-flight policy', { t
     assert.equal(outcome.ok, true, `turn succeeded: ${outcome.error}`);
     assert.equal(outcome.output?.done, true);
     // 审批路由已验证：至少一个权限请求被送到 Runner 裁决
-    assert.ok(permissionChecks.length >= 1, 'at least one approval routed to the runner policy');
+    assert.ok(permissionChecks.length >= 1, 'at least one approval routed to the Runner approval handler');
   } finally {
     backend.dispose();
   }
@@ -166,7 +158,8 @@ opencodeSessionTest('opencode: full session with structured output', { timeout: 
         cwd,
         prompt: 'Read src/a.txt, then return JSON {"done": true, "note": "<first line of the file>"}',
         schema: { type: 'object', properties: { done: { type: 'boolean' }, note: { type: 'string' } }, required: ['done', 'note'] },
-        policy: workerPolicy(task, config),
+        access: 'workspace-write',
+        requestApproval: async () => 'once',
         timeoutMs: 150_000,
         staleAfterMs: 60_000,
         ...(preferred ? { model: preferred } : {})

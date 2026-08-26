@@ -6,9 +6,6 @@ import { writeJson } from '../core/files.js';
 /** interrupt 之后等待 completion 自然结算的宽限期，超时则强 close */
 const TERMINATION_GRACE_MS = 15_000;
 
-/** 连续权限拒绝熔断阈值：模型陷入 deny-thrash 时快速失败，避免烧尽上下文/预算 */
-const MAX_CONSECUTIVE_DENIES = 10;
-
 export interface RunAgentInput {
   backend: AgentBackend;
   spec: SessionSpec;
@@ -28,18 +25,38 @@ export async function runAgent<T = unknown>(input: RunAgentInput): Promise<Agent
   const append = (line: string): void => { appendFileSync(input.logPath, `${line}\n`, 'utf8'); };
 
   let session: AgentSession;
-  let lastActivity = Date.now();
-  // 后置钩子：session 打开后才挂上 deny-thrash 跟踪（避免 TDZ）
-  let postEvent: ((event: AgentEvent) => void) | null = null;
+  const startedAt = Date.now();
+  let pausedAt: number | null = null;
+  let pausedMs = 0;
+  let pendingApprovals = 0;
+  const activeNow = (): number => Date.now() - pausedMs - (pausedAt === null ? 0 : Date.now() - pausedAt);
+  let lastActivity = activeNow();
   try {
     const wrapped: SessionSpec = {
       ...spec,
       onEvent: (event) => {
-        lastActivity = Date.now();
+        lastActivity = activeNow();
         append(`[event] ${JSON.stringify(event)}`);
         spec.onEvent?.(event);
-        postEvent?.(event);
-      }
+      },
+      ...(spec.requestApproval ? {
+        requestApproval: async (request, signal) => {
+          pendingApprovals += 1;
+          if (pendingApprovals === 1) pausedAt = Date.now();
+          append(`[approval] waiting ${JSON.stringify({ backend: request.backend, tool: request.tool, kind: request.kind })}`);
+          try {
+            return await spec.requestApproval!(request, signal);
+          } finally {
+            pendingApprovals -= 1;
+            if (pendingApprovals === 0 && pausedAt !== null) {
+              pausedMs += Date.now() - pausedAt;
+              pausedAt = null;
+              lastActivity = activeNow();
+              append('[approval] resumed');
+            }
+          }
+        }
+      } : {})
     };
     session = await backend.openSession(wrapped);
     append(`[session] opened on backend ${backend.id}`);
@@ -49,26 +66,11 @@ export async function runAgent<T = unknown>(input: RunAgentInput): Promise<Agent
 
   let timedOut = false;
   let stalled = false;
-  let deniedInARow = 0;
-  let thrashed = false;
   let settled = false;
   let graceTimer: NodeJS.Timeout | null = null;
 
-  // 权限拒绝计数（防 deny-thrash）：任何放行的裁决或非权限事件都会重置
-  const trackDenies = (event: AgentEvent): void => {
-    if (event.type === 'permission-check' && !event.allowed) {
-      deniedInARow += 1;
-      if (deniedInARow >= MAX_CONSECUTIVE_DENIES) {
-        thrashed = true;
-        requestInterrupt();
-      }
-    } else {
-      deniedInARow = 0;
-    }
-  };
-
   const requestInterrupt = (): void => {
-    append(`[supervisor] interrupt requested (timedOut=${timedOut} stalled=${stalled} thrashed=${thrashed})`);
+    append(`[supervisor] interrupt requested (timedOut=${timedOut} stalled=${stalled})`);
     if (!graceTimer) {
       graceTimer = setTimeout(() => {
         append('[supervisor] grace expired, closing transport');
@@ -77,18 +79,20 @@ export async function runAgent<T = unknown>(input: RunAgentInput): Promise<Agent
     }
     void session.interrupt().catch(() => {});
   };
-  postEvent = trackDenies;
 
-  const timeoutTimer = setTimeout(() => {
-    timedOut = true;
-    requestInterrupt();
-  }, spec.timeoutMs);
-  const stallInterval = setInterval(() => {
-    if (Date.now() - lastActivity > spec.staleAfterMs) {
+  const timerInterval = setInterval(() => {
+    if (pendingApprovals > 0) return;
+    const now = activeNow();
+    if (!timedOut && now - startedAt > spec.timeoutMs) {
+      timedOut = true;
+      requestInterrupt();
+      return;
+    }
+    if (!stalled && now - lastActivity > spec.staleAfterMs) {
       stalled = true;
       requestInterrupt();
     }
-  }, Math.min(5000, Math.max(1000, Math.floor(spec.staleAfterMs / 4))));
+  }, Math.min(1000, Math.max(20, Math.floor(Math.min(spec.timeoutMs, spec.staleAfterMs) / 4))));
 
   let outcome: AgentRunOutcome;
   try {
@@ -102,8 +106,7 @@ export async function runAgent<T = unknown>(input: RunAgentInput): Promise<Agent
     append(`[session] transport failure: ${errorMessage(error)}`);
     outcome = failure(`session failed: ${errorMessage(error)}`);
   } finally {
-    clearTimeout(timeoutTimer);
-    clearInterval(stallInterval);
+    clearInterval(timerInterval);
     if (graceTimer) clearTimeout(graceTimer);
     await session.close().catch(() => {});
     append(`[session] closed (settled=${String(settled)})`);
@@ -114,10 +117,7 @@ export async function runAgent<T = unknown>(input: RunAgentInput): Promise<Agent
     timedOut: outcome.timedOut || timedOut,
     stalled: outcome.stalled || stalled
   };
-  if (!merged.ok && thrashed) {
-    // 覆盖后端自己的 "interrupted" 之类消息，给出可行动的监督原因
-    merged.error = `agent hit ${MAX_CONSECUTIVE_DENIES} consecutive permission denials (policy thrash); widen the role's command prefixes or fix the task instructions`;
-  } else if (!merged.ok && (timedOut || stalled)) {
+  if (!merged.ok && (timedOut || stalled)) {
     merged.error = timedOut
       ? `agent exceeded timeout of ${spec.timeoutMs}ms`
       : `agent made no progress for ${spec.staleAfterMs}ms`;

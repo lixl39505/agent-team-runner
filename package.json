@@ -14,7 +14,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
     "dev": "tsx src/cli.ts",
     "gen:codex": "codex app-server generate-ts --out src/agent/codex/protocol && find src/agent/codex/protocol -name '*.ts' -exec sed -i '' -E 's/from \"\\./([A-Za-z0-9_/]+)\"/from \".\\/\\1.js\"/g; s/from \"\\.\\./([A-Za-z0-9_/]+)\"/from \"..\\/\\1.js\"/g' {} + && codex --version > src/agent/codex/protocol/GENERATED_FROM",
     "test": "npm run build && node --test test/*.test.mjs",

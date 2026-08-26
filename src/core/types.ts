@@ -10,8 +10,7 @@ export type RunStatus =
   | 'needs_attention'
   | 'integrating'
   | 'done'
-  | 'failed'
-  | 'stopped';
+  | 'failed';
 
 export type TaskStatus =
   | 'pending'
@@ -55,21 +54,6 @@ export interface AgentSnapshot {
   version: 2;
   roles: Record<AgentRole, AgentBinding>;
   agents: Record<string, AgentEntry>;
-}
-
-/**
- * 角色/任务的权限规格——role 权力的唯一定义处（core/policy.ts 构造）。
- * 编译到各后端：claude canUseTool / codex 审批应答 / opencode 权限配置；
- * 事后机械验证器继续作为 defense in depth。
- */
-export interface PolicySpec {
-  fs:
-    | { mode: 'read-only' }
-    | { mode: 'workspace-write'; allowedPaths: string[]; blockedPaths: string[] };
-  bash:
-    | { mode: 'deny' }
-    | { mode: 'prefixes'; prefixes: string[] };
-  network: boolean;
 }
 
 export interface RunnerConfig {
@@ -194,11 +178,9 @@ export interface TaskRecord {
   commitSha: string | null;
   attempts: number;
   reviewCycles: number;
-  pid: number | null;
   lastError: string | null;
   reviewJson: string | null;
   createdAt: string;
   updatedAt: string;
   finishedAt: string | null;
 }
-

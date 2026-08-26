@@ -1,3 +1,5 @@
+import { gitIsolationEnv } from '../core/process-env.js';
+
 /**
  * 子进程环境净化：默认只保留安全的基础变量 + 后端认证变量，
  * 防止把父进程的全部秘密（云凭证、token）泄漏给能执行命令的 agent。
@@ -24,5 +26,5 @@ export function sanitizedEnv(extraEnv: Record<string, string | undefined> = {}):
   for (const [key, value] of Object.entries(extraEnv)) {
     if (value !== undefined && !(key in result)) result[key] = value;
   }
-  return result;
+  return { ...result, ...gitIsolationEnv() };
 }

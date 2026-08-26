@@ -9,6 +9,7 @@ src/
   cli.ts                  CLI 入口，命令解析与路由
   agent/                  后端层（取代旧 adapters/）
     types.ts              AgentBackend / AgentSession / AgentEvent / SessionSpec / AgentRunOutcome
+    approval.ts           FIFO 终端审批队列；原生请求统一映射 once/session/deny
     registry.ts           buildBackends 工厂；resolveAgent/snapshotAgents/resolveTaskAgent（取代 profiles.ts）
     supervise.ts          runAgent 监督器：事件泵、日志、心跳、超时/静默、中断与宽限强杀
     fake.ts               脚本化 AgentBackend（单测核心）
@@ -16,19 +17,18 @@ src/
     parse.ts              最终 agent 消息 → JSON 的确定性解析
     claude/
       sdk.ts              @anthropic-ai/claude-agent-sdk 传输（query/canUseTool/outputFormat/supportedModels）
-      policy.ts           compileClaude：permissionMode 'default' + 只读 allowedTools + decide
+      policy.ts           compileClaude：permissionMode 'default' + read-only 角色边界
     codex/
       jsonrpc.ts          stdio JSON-RPC 客户端（帧编解码纯函数可测）
       app-server.ts       常驻 codex app-server：initialize 握手、thread/turn、审批应答、model/list
-      policy.ts           compileCodex：sandboxPolicy + approvalPolicy untrusted + decide
+      policy.ts           compileCodex：readOnly/workspaceWrite sandbox + untrusted 原生审批
       protocol/           `npm run gen:codex` 生成的协议类型（vendored）
     opencode/
       sdk.ts              自管 opencode serve 子进程 + @opencode-ai/sdk client：session.prompt/SSE 权限应答
-      policy.ts           compileOpenCode：服务端 ask 门禁 + 运行时 once/reject
+      policy.ts           compileOpenCode：服务端原生 ask 门禁 + read-only 角色边界
   core/
     config.ts             配置初始化、加载（YAML/JSON）、v2 默认值合并、-c 覆写
     agent-config.ts       v1→v2 内存迁移、agents 注册表校验、backendCommand
-    policy.ts             PolicySpec：role 权力的唯一定义处 + decideBash/decideWrite/decideTool
     preflight.ts          闭环预检：discover + listModels + probe（probe-cache 持久缓存）
     probe-cache.ts        probe 结果持久缓存（backend|model|version 键，TTL）
     db.ts                 SQLite 状态数据库（runs / tasks / events 三表）
@@ -37,7 +37,6 @@ src/
     planner.ts            规划阶段：运行 Lead Agent 生成 DAG
     orchestrator.ts       编排器主循环与单任务执行引擎（后端进程池共享）
     git.ts                Git 操作封装（worktree / cherry-pick / commit / resetWorktree 等）
-    proctree.ts           进程组终止（stop 命令用，SIGTERM→SIGKILL 升级）
     verifier.ts           机械验证：路径策略 + 重跑验证命令
     shell.ts              命令安全解析与执行（不允许 shell 元字符）
     path-policy.ts        文件路径 Glob 匹配与 allowlist/blocklist 检查
@@ -143,7 +142,8 @@ const result = await runAgent<LeadResult>({
     role: 'lead', cwd: repoRoot,
     prompt: leadPrompt({ goal, goalFile, repoRoot, agents: 注册表清单, ... }),
     schema: LEAD_SCHEMA, model: leadBinding.model,
-    policy: readOnlyPolicy(),        // 只读角色：只读 git 命令、禁写、禁网络
+    access: 'read-only',             // 粗粒度角色边界
+    requestApproval,                 // 原生权限请求送到前台 FIFO 队列
     timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs
   },
   logPath, outputPath
@@ -215,7 +215,7 @@ SELECT task_id FROM tasks
 WHERE run_id = ? AND status IN ('running', 'verifying', 'reviewing')
 ```
 
-> **只修改 DB，不杀进程。** 后端子进程（codex app-server / opencode serve）以独立进程组常驻，Runner 崩溃时不会自动退出。Runner 自身在 SIGTERM/SIGINT 时会 `disposeBackends` 释放；崩溃残留用 `agent-team stop <runId>` 清理（读取 runner.log 中的 detached pid 杀进程组）。
+> **只修改 DB，不杀旧进程。** 正常前台运行时，SIGTERM/SIGINT/SIGHUP handler 会调用 `disposeBackends` 释放当前 Runner 持有的 Agent 会话和子进程组。终端中使用 Ctrl-C，随后可重新执行 `run` 恢复 Worktree。
 
 ### 3.2 核心事件循环
 
@@ -305,7 +305,8 @@ const worker = await runAgent<WorkerResult>({
     role: 'worker', cwd: worktreeInfo.path,
     prompt: workerPrompt({ task, startSha, runId, priorFeedback, retry }),
     schema: WORKER_SCHEMA, model: workerBinding.model, maxTurns: workerBinding.maxTurns,
-    policy: workerPolicy(task, config),   // 任务 allowedPaths/blockedPaths + 验证命令前缀
+    access: 'workspace-write',
+    requestApproval,                     // 前台 FIFO 审批处理器
     timeoutMs, staleAfterMs,
     onEvent: (event) => { /* 节流 3s 更新 phase 为 'worker-active' */ }
   },
@@ -330,15 +331,16 @@ loadSkill('worker')
 
 ### 步骤 3：会话监督
 
-`agent/supervise.ts` 的 `runAgent` 为会话设置三层守护：
+`agent/supervise.ts` 的 `runAgent` 为会话设置两层守护，并包装权限等待：
 
 | 守护层 | 触发条件 | 动作 |
 |--------|---------|------|
 | 硬超时 | `timeoutMs`（默认 2 小时）到期 | `session.interrupt()` → 15s 宽限后 `close()` 强杀 |
 | 静默超时 | 任何 AgentEvent 之外静默 `staleAfterMs`（默认 10 分钟） | 同上 |
-| deny-thrash 熔断 | 连续 10 次 `permission-check` 被拒且中间无放行 | 同上 + 错误提示放宽命令前缀（实测模型会 584 次 Bash/263 次拒绝烧尽上下文） |
 
 - `lastActivity` 在**任何 AgentEvent**（消息增量、工具调用、权限裁决、用量）时重置——"无进展"取代旧"无 stdout"
+- `requestApproval` 等待期间暂停 hard/stale 有效时钟；返回后恢复计时
+- 用户拒绝作为后端原生工具结果返回；单次或重复拒绝本身不会被 Runner 判定为任务失败
 - 事件以 JSONL 追加到 logPath；结构化输出落盘 outputPath
 - 传输异常（completion reject）转为 `ok:false` outcome，走既有 retryOrFail
 
@@ -384,15 +386,17 @@ if (workerResult.status === 'failed')  → retryOrFail()
    for each verificationCommand:
      assertAllowedCommand(command, config.verification.allowedCommandPrefixes)
      splitCommand(command)              ← 拒绝 ; & | < > ` $()
-     spawn(program, args)               ← 不经 shell，直接执行
+     assertNoCapabilityBearingArguments ← 拒绝 helper/重定向/路径覆盖参数
+     spawn(program, args, verificationEnv) ← 不经 shell，不传 Provider 密钥
      输出写入 verification log
      非零退出码 → 失败
+     重新校验 HEAD + changedFiles + path policy
 ```
 
 命令安全检查 (`shell.ts`)：
 
 - `splitCommand`: 手工解析命令字符串（处理引号、转义），**拒绝任何 shell 元字符**
-- `assertAllowedCommand`: 逐 token 与 allowlist 前缀匹配
+- `assertAllowedCommand`: 逐 token 与 allowlist 前缀匹配，并拒绝 Git helper/output、`find -exec/-delete`、`rg --pre`、构建工具 helper/path override
 - `runCommand`: `spawn(program!, args)` — 不经过 shell
 
 ### 步骤 6：Reviewer 审查
@@ -414,8 +418,7 @@ loadSkill('reviewer')
    Inspect them with git diff --cached ... Workers never commit ..."
 ```
 
-Reviewer 以 `readOnlyPolicy()` 运行：只读 git/探索命令可用，一切写入被 in-flight 裁决拒绝
-（claude `canUseTool` / codex 审批 decline / opencode reject），外加下方的 git 状态快照兜底。
+Reviewer 以 `access: 'read-only'` 运行：Claude/Codex 使用原生只读 sandbox，OpenCode 对 Bash/Edit 硬拒绝；外加下方的 Git 状态快照兜底。
 
 **安全校验** — Reviewer 不能修改任何东西 (`orchestrator.ts:200-206`)：
 
@@ -498,7 +501,7 @@ for (const task of topologicalTasks(manifest.tasks)) {
     spec: {
       role: 'integrator',
       prompt: integrationPrompt({ mode: 'resolve_conflict', worktreePath: worktree, conflictFiles: conflicts }),
-      policy: integratorPolicy('resolve_conflict', config, conflicts),   // 只能改冲突文件
+      access: 'workspace-write', requestApproval,
       ...
     }
   });
@@ -534,7 +537,7 @@ if (config.integration.runAgentAfterCherryPick) {
     spec: {
       role: 'integrator',
       prompt: integrationPrompt({ manifest, integrationAllowedPaths, mode: 'finalize', worktreePath: worktree }),
-      policy: integratorPolicy('finalize', config),   // 只能改 integration.allowedPaths
+      access: 'workspace-write', requestApproval,
       ...
     }
   });
@@ -663,9 +666,10 @@ export interface AgentBackend {
 }
 
 export interface SessionSpec {
-  role: AgentRole; cwd: string; prompt: string;
+  role: AgentRole; label?: string; cwd: string; prompt: string;
   schema: object;                                           // 结构化输出 JSON Schema
-  model?: string; policy: PolicySpec;                       // 权限规格（唯一事实来源 core/policy.ts）
+  model?: string; access: 'read-only' | 'workspace-write';  // 不可提升的角色边界
+  requestApproval?: ApprovalHandler;                        // once/session/deny
   timeoutMs: number; staleAfterMs: number; maxTurns?: number;
   resumeSessionId?: string;                                 // 实验开关预留
   onEvent?: (event: AgentEvent) => void;
@@ -693,17 +697,19 @@ export interface AgentRunOutcome<T> {
 
 ### 监督器（`agent/supervise.ts:runAgent`）
 
-`openSession`（包装 onEvent：记日志 + 重置静默计时 + 转发）→ 并发跑 `completion()` 与两层守护（硬超时 / 静默超时，均 `interrupt()` + 15s 宽限后 `close()` 强杀）→ `close()` → 结构化输出写 outputPath。传输异常转为 `ok:false` outcome。
+`openSession`（包装 onEvent：记日志 + 重置静默计时 + 转发；包装 requestApproval：暂停有效时钟）→ 并发跑 `completion()` 与两层守护（硬超时 / 静默超时，均 `interrupt()` + 15s 宽限后 `close()` 强杀）→ `close()` → 结构化输出写 outputPath。传输异常转为 `ok:false` outcome。审批排队和等待用户输入的墙钟时间不计入 hard/stale timeout。
 
-### 权限编译（`core/policy.ts` + 各后端 policy.ts）
+### 原生权限路由（`agent/approval.ts` + 各后端 policy.ts）
 
-`PolicySpec {fs, bash, network}` 是角色权力的唯一定义处；`decideBash`（复用 `shell.assertAllowedCommand` 的 token 前缀语义）与 `decideWrite`（复用 `path-policy.checkPaths` 的 glob 语义）是共用纯函数，**同时**被 in-flight 裁决与事后验证器使用：
+Runner 只传递 `read-only | workspace-write` 角色边界，不实现 Bash 解析、路径实时裁决或网络开关。后端产生的原生请求由共享 `ApprovalQueue` 串行显示，用户返回 `once | session | deny`；具体协议值由适配器映射：
 
 | 后端 | sandbox | in-flight 裁决 | 说明 |
 |---|---|---|---|
-| claude | —（SDK 内部） | `canUseTool`：Bash→前缀策略，Edit/Write→路径策略，WebFetch/WebSearch→network，AskUserQuestion→拒（无头） | `permissionMode:'default'` + 只读工具进 allowedTools + `settingSources: []`（用户 settings 的 allow 规则会 shadow 回调）；**Bash/Edit/Write 绝不能进 allowedTools**（绕过回调）——单测有回归守卫。CLI 自身会自动放行部分无害只读命令（如 git status），等价于只读允许清单，无害 |
-| codex | `sandboxPolicy`：readOnly / workspaceWrite(writableRoots=[cwd], networkAccess=false) | `approvalPolicy:'untrusted'` + `item/commandExecution/requestApproval`→decideCommand（allowlisted 给 acceptForSession 减少往返）+ `item/fileChange/requestApproval`→decideFileChange | 诚实不对称：sandbox 粒度是根目录非 glob，任务级 allowedPaths 精细约束由事后验证器兜底 |
-| opencode | — | 服务端 config `permission:{bash/edit/webfetch:'ask'}` 全门禁 + SSE `permission.updated`→decide→`POST /session/:id/permissions/:id` `{once\|reject}` | 未知会话的权限请求 fail-closed 拒绝 |
+| claude | SDK sandbox：`failIfUnavailable`、禁止 unsandboxed、只读角色 deny cwd；Git metadata denyWrite | `canUseTool` → allow/deny；session 选择把 SDK suggestions 的 destination 改为 session | 读取工具可原生预授权，AskUserQuestion 暂不路由 |
+| codex | `sandboxPolicy`：readOnly / workspaceWrite(writableRoots=[cwd], networkAccess=false) | command/file → accept/acceptForSession/decline；permissions profile → turn/session grant | 泛化权限请求支持网络和额外目录；只读角色不授予写权限 |
+| opencode | 无进程 sandbox；read-only 角色硬拒绝 Bash/Edit | SSE permission.updated → once/always/reject | Workspace 角色的 Bash/Web/Edit/external_directory 全部使用原生 ask |
+
+`allowedPaths` / `blockedPaths` 不参与 in-flight 审批。它们在 Agent turn 完成后由 `verifier.ts` 检查实际 Git 变更；Reviewer 的只读 sandbox 和前后 Git fingerprint 提供另一条独立边界。
 
 ### claude 后端（`agent/claude/sdk.ts`）
 
@@ -715,7 +721,7 @@ export interface AgentRunOutcome<T> {
 ### codex 后端（`agent/codex/`）
 
 - `jsonrpc.ts`：stdio 换行分隔 JSON 客户端，帧编解码 `parseFrames` 纯函数可测；服务端主动请求（审批）异步应答；进程以独立进程组 spawn，`close()` 进程组 SIGTERM → **ref'd** 3s SIGKILL 升级（unref 版会在 SIGTERM 被忽略时留下孤儿与未释放的管道句柄）。
-- `app-server.ts`：常驻 `codex app-server` 子进程；`initialize` 握手（clientInfo）→ `thread/start`（cwd/model/approvalPolicy/sandbox）→ `turn/start`（input 文本 + `outputSchema` + per-turn 覆盖）；通知路由：`turn/completed`→完成、`item/completed`（agentMessage/commandExecution）→事件、`item/*/delta`→activity、`thread/tokenUsage/updated`→usage；审批请求→会话级 decide。
+- `app-server.ts`：常驻 `codex app-server` 子进程；`initialize` 握手（clientInfo）→ `thread/start`（cwd/model/approvalPolicy/sandbox）→ `turn/start`（input 文本 + `outputSchema` + per-turn 覆盖）；通知路由：`turn/completed`→完成、`item/completed`（agentMessage/commandExecution）→事件、`item/*/delta`→activity、`thread/tokenUsage/updated`→usage；command/file/permissions 审批请求异步等待终端决定。
 - `protocol/` 是 `npm run gen:codex`（`codex app-server generate-ts`）生成的 vendored 类型；`protocol/GENERATED_FROM` 记录生成时的 CLI 版本，`agent/codex/generated.ts` 在 doctor 中与实际版本比对（不一致 → warn 提示重新生成）。`app-server.ts` / `policy.ts` 窄类型导入实际消费的协议类型（`TurnStartParams`、`SandboxPolicy`、审批 params/response、通知载荷、`ModelListResponse` 等，均为 `import type` 零运行时耦合）——上游破坏性变更在 `npm run check` 直接变成编译错误，升级流程是机械的 `gen:codex` → `check` → 集成测试。
 
 ### opencode 后端（`agent/opencode/sdk.ts`）
@@ -815,7 +821,7 @@ return { ok: denied 和 invalid 都为空 }
 `types.ts:4-12`
 
 ```
-planning → planned → running → needs_attention / integrating → done / failed / stopped
+planning → planned → running → needs_attention / integrating → done / failed
 ```
 
 ### Task 状态
@@ -836,7 +842,6 @@ Runner 重启时 (`db.ts:266-281` `resetInterrupted`)：
 任务状态为 running/verifying/reviewing
     → 重置为 changes_requested
     → phase = 'recovered'
-    → pid = null
     → lastError = 'Runner restarted while the task was active...'
     → 保留 worktree 和修改文件
 ```
@@ -886,7 +891,6 @@ CREATE TABLE tasks (
   commit_sha TEXT,
   attempts INTEGER NOT NULL DEFAULT 0,
   review_cycles INTEGER NOT NULL DEFAULT 0,
-  pid INTEGER,
   last_error TEXT,
   review_json TEXT,
   created_at TEXT NOT NULL,
@@ -962,7 +966,7 @@ Git 分支:
 ## 测试分层
 
 ```
-npm test                  # 48 个单元测试：纯函数，无 CLI / 无网络 / 无密钥（CI 可跑）
+npm test                  # 单元与本地 CLI 测试；无真实模型调用、无网络、无后端密钥
 npm run test:protocol     # 协议层集成（AGENT_TEAM_PROTOCOL=1）：discover / model 枚举 /
                           # app-server 握手与 thread 生命周期 / opencode serve 启动——零推理零 token
 npm run test:integration  # 全会话层（AGENT_TEAM_INTEGRATION=1）：真实推理，需要各 CLI 本地登录
@@ -972,23 +976,6 @@ npm run test:integration  # 全会话层（AGENT_TEAM_INTEGRATION=1）：真实�
 - opencode 全会话额外需要 `AGENT_TEAM_OPENCODE_SPIKE=1`（本机 provider 挂起，纯 SDK 复现，非集成问题）。
 - codex 升级验证顺序：`npm run gen:codex` → `npm run check`（窄类型导入让破坏性变更变成编译错误）→ `npm run test:protocol` → 需要时 `npm run test:integration`。
 
-## 后台运行 (`--detach`)
+## 前台运行与终止
 
-`cli.ts:112-127` — `--detach` 模式：
-
-```typescript
-const child = spawn(process.execPath, [
-  cliPath, 'run', runId, '--foreground', '--repo', repoRoot
-], {
-  detached: true,
-  stdio: ['ignore', 'ignore', 'ignore'],
-  env: process.env
-});
-child.unref();
-```
-
-- 父进程立即返回
-- 子进程的 stdio 全部 `'ignore'` → **所有 `console.log` 输出被丢弃**
-- Agent 日志仍然通过 `appendFileSync` 写入 `logs/` 目录
-- 与前台运行的关键差异：最终状态面板不显示，错误不输出到 stderr，必须通过 `agent-team status` 检查结果
-- 终止需要用 `agent-team stop`，Ctrl+C 无效
+`plan`、`launch` 和 `run` 要求交互终端，因为任一后端都可能在 turn 中发起权限请求。Ctrl-C 触发 `disposeBackends`，释放当前 Runner 的 Agent 会话和子进程组；下次 `run` 通过 `resetInterrupted` 恢复数据库状态并复用 Worktree。
