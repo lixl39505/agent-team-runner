@@ -88,3 +88,14 @@ test('run bindings include manifest task-level agents', () => {
 
   assert.equal(bindings.some((binding) => binding.agent === 'specialist' && binding.backend === 'codex'), true);
 });
+
+test('preflight rejects maxTurns when the backend does not support it', async () => {
+  const value = input({ ok: true, degraded: false, detail: 'sandbox ready' });
+  value.bindings = [{ agent: 'limited', backend: 'claude', maxTurns: 10, source: 'test' }];
+  value.backends.claude.capabilities = { maxTurns: false, resumeSession: false };
+
+  const result = await checkAgentAvailability(value);
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.errors, ['agent "limited" configures maxTurns, but backend "claude" does not support it']);
+});

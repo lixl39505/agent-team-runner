@@ -20,6 +20,7 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 
 export class FakeBackend implements AgentBackend {
   readonly id: BackendId;
+  readonly capabilities = { maxTurns: true, resumeSession: true };
   readonly sessions: FakeSession[] = [];
 
   constructor(

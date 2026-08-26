@@ -159,13 +159,13 @@ agents:
     backend: codex
     model: gpt-5.6-terra
     description: strong planner
-    maxTurns: 80
   fast-worker:
     backend: opencode
     model: zhipuai-coding-plan/glm-5.2
   careful-review:
     backend: claude
     model: claude-sonnet-5
+    maxTurns: 80 # maxTurns is currently supported by Claude only
 
 # 角色 → agent 名（未配置的角色回退 defaultAgent）
 roles:
@@ -348,7 +348,7 @@ workspace-write 角色在当前 Worktree 内的直接编辑默认允许；命令
 
 ## Worker 生命周期
 
-**每任务、每次尝试都是全新会话**。普通失败或 Reviewer 驳回重试时，prompt 会注入厚重试上下文（当前 git diff + reviewer 反馈原文 + 上次 worker summary），Worktree 是这类重试的记忆载体。Ctrl-C/进程异常中断则在下次调度前从 `startSha` 重建 Worktree，不继承半成品 diff。任务间共享知识靠 Integrator 更新的 specs 文档，不靠会话记忆。`AgentSession` 接口保留 resume 能力（三后端原生支持），留作未来实验开关。
+**每任务、每次尝试都是全新会话**。普通失败或 Reviewer 驳回重试时，prompt 会注入厚重试上下文（当前 git diff + reviewer 反馈原文 + 上次 worker summary），Worktree 是这类重试的记忆载体。Ctrl-C/进程异常中断则在下次调度前从 `startSha` 重建 Worktree，不继承半成品 diff。任务间共享知识靠 Integrator 更新的 specs 文档，不靠会话记忆。`maxTurns` 与 `resumeSessionId` 通过后端能力协商：当前只有 Claude 支持；Codex 和 OpenCode 收到这些选项会明确拒绝，不会静默忽略。
 
 ## 完成判定
 

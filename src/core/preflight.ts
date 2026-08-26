@@ -48,6 +48,7 @@ export async function checkAgentAvailability(input: PreflightInput): Promise<Pre
 
   const backendIds = [...new Set(input.bindings.map((binding) => binding.backend))];
   const versions = new Map<BackendId, string | undefined>();
+  const unsupportedTurnLimits = new Set<string>();
   for (const id of backendIds) {
     const backend = input.backends[id];
     if (!backend) {
@@ -63,6 +64,12 @@ export async function checkAgentAvailability(input: PreflightInput): Promise<Pre
       }
       if (discovery.authed === false) {
         errors.push(`backend "${id}" is installed but not authenticated; run its login command`);
+      }
+      for (const binding of input.bindings) {
+        if (binding.backend !== id || binding.maxTurns === undefined || backend.capabilities.maxTurns) continue;
+        if (unsupportedTurnLimits.has(binding.agent)) continue;
+        unsupportedTurnLimits.add(binding.agent);
+        errors.push(`agent "${binding.agent}" configures maxTurns, but backend "${id}" does not support it`);
       }
       if (backend.checkPlatform) {
         const platform = await backend.checkPlatform();

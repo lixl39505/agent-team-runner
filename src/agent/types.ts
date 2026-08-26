@@ -28,6 +28,12 @@ export interface PlatformCheckResult {
   detail: string;
 }
 
+/** Optional session controls supported by a backend's currently implemented protocol path. */
+export interface AgentCapabilities {
+  maxTurns: boolean;
+  resumeSession: boolean;
+}
+
 /** 后端事件流：真实心跳/进度/权限/用量信号（取代 stdout 静默判断） */
 export type AgentEvent =
   | { type: 'activity' }
@@ -54,8 +60,9 @@ export interface SessionSpec {
   timeoutMs: number;
   /** 静默超时：任何 AgentEvent 重置计时（"无进展"而非"无 stdout"） */
   staleAfterMs: number;
+  /** Only valid when the selected backend advertises maxTurns support. */
   maxTurns?: number | undefined;
-  /** resume 上一个会话（实验开关 worker.resume 预留） */
+  /** Only valid when the selected backend advertises resumeSession support. */
   resumeSessionId?: string | undefined;
   onEvent?: ((event: AgentEvent) => void) | undefined;
 }
@@ -81,6 +88,7 @@ export interface AgentSession {
 
 export interface AgentBackend {
   readonly id: BackendId;
+  readonly capabilities: AgentCapabilities;
   /** CLI 安装/版本/认证状态 */
   discover(): Promise<DiscoveryResult>;
   /** 枚举本地可用 model（claude supportedModels / codex model/list / opencode /config/providers） */
@@ -90,4 +98,14 @@ export interface AgentBackend {
   /** Host-specific sandbox/process capability check, called by preflight before model enumeration. */
   checkPlatform?(): Promise<PlatformCheckResult>;
   openSession(spec: SessionSpec): Promise<AgentSession>;
+}
+
+/** Reject unsupported session options rather than silently dropping user configuration. */
+export function assertSessionCapabilities(backend: AgentBackend, spec: SessionSpec): void {
+  if (spec.maxTurns !== undefined && !backend.capabilities.maxTurns) {
+    throw new Error(`backend "${backend.id}" does not support maxTurns`);
+  }
+  if (spec.resumeSessionId !== undefined && !backend.capabilities.resumeSession) {
+    throw new Error(`backend "${backend.id}" does not support resumeSessionId`);
+  }
 }

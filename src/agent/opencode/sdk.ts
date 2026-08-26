@@ -9,6 +9,7 @@ import {
   type OpencodeClient as OpencodeV2Client,
   type QuestionInfo
 } from '@opencode-ai/sdk/v2/client';
+import { assertSessionCapabilities } from '../types.js';
 import type {
   AgentBackend,
   AgentEvent,
@@ -58,6 +59,7 @@ interface OpenCodeMessage {
  */
 export class OpenCodeBackend implements AgentBackend {
   readonly id: BackendId = 'opencode';
+  readonly capabilities = { maxTurns: false, resumeSession: false };
   private clientPromise: Promise<OpencodeClient> | null = null;
   private questionClient: OpencodeV2Client | null = null;
   private serverChild: ChildProcess | null = null;
@@ -159,6 +161,7 @@ export class OpenCodeBackend implements AgentBackend {
   }
 
   async openSession(spec: SessionSpec): Promise<AgentSession> {
+    assertSessionCapabilities(this, spec);
     const platform = await this.checkPlatform();
     if (!platform.ok) throw new Error(platform.detail);
     const client = await this.ensureClient();

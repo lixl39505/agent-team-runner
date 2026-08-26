@@ -2,6 +2,7 @@ import spawn from 'cross-spawn';
 import { readFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { query, type Options, type PermissionUpdate, type Query } from '@anthropic-ai/claude-agent-sdk';
+import { assertSessionCapabilities } from '../types.js';
 import type {
   AgentBackend,
   AgentEvent,
@@ -29,6 +30,7 @@ export interface ClaudeBackendOptions {
 
 export class ClaudeBackend implements AgentBackend {
   readonly id: BackendId = 'claude';
+  readonly capabilities = { maxTurns: true, resumeSession: true };
   private readonly sessions = new Set<ClaudeAgentSession>();
   private readonly platform: NodeJS.Platform;
   private readonly nativeWindowsSandbox: NativeWindowsSandboxPolicy;
@@ -133,6 +135,7 @@ export class ClaudeBackend implements AgentBackend {
   }
 
   async openSession(spec: SessionSpec): Promise<AgentSession> {
+    assertSessionCapabilities(this, spec);
     const platform = await this.checkPlatform();
     if (!platform.ok) throw new Error(platform.detail);
     const compiled = compileClaude(spec.access);

@@ -2,6 +2,7 @@ import spawn from 'cross-spawn';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { assertSessionCapabilities } from '../types.js';
 import type {
   AgentBackend,
   AgentEvent,
@@ -70,6 +71,7 @@ interface TurnRecord {
  */
 export class CodexBackend implements AgentBackend {
   readonly id: BackendId = 'codex';
+  readonly capabilities = { maxTurns: false, resumeSession: false };
   private connection: JsonRpcConnection | null = null;
   private initialized = false;
   private initPromise: Promise<void> | null = null;
@@ -175,6 +177,7 @@ export class CodexBackend implements AgentBackend {
   }
 
   async openSession(spec: SessionSpec): Promise<AgentSession> {
+    assertSessionCapabilities(this, spec);
     const platform = await this.checkPlatform();
     if (!platform.ok) throw new Error(platform.detail);
     await this.ensureServer();
