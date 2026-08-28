@@ -1,6 +1,6 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { parseFrames } from '../dist/agent/codex/jsonrpc.js';
+import { parseFrames } from '../src/agent/codex/jsonrpc.ts';
 
 test('parseFrames splits newline-delimited JSON across chunk boundaries', () => {
   const first = parseFrames('{"method":"a","id":1,"para');

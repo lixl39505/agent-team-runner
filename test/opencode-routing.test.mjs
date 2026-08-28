@@ -1,6 +1,6 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { OpenCodeBackend } from '../dist/agent/opencode/sdk.js';
+import { OpenCodeBackend } from '../src/agent/opencode/sdk.ts';
 
 function spec() {
   return {

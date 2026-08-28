@@ -1,9 +1,9 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ClaudeBackend } from '../dist/agent/claude/sdk.js';
+import { ClaudeBackend } from '../src/agent/claude/sdk.ts';
 
 async function captureSessionOptions(access, requestApproval, requestUserInput) {
   const cwd = mkdtempSync(join(tmpdir(), 'agent-team-claude-cwd-'));

@@ -1,9 +1,9 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createWorktree, resetWorktree, currentHead, changedFiles, git } from '../dist/core/git.js';
+import { createWorktree, resetWorktree, currentHead, changedFiles, git } from '../src/core/git.ts';
 
 async function tempRepo() {
   const repoRoot = mkdtempSync(join(tmpdir(), 'agent-team-git-'));

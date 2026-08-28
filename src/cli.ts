@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { applyOverrides, initConfig, loadConfig } from './core/config.js';
 import type { ConfigOverride } from './core/config.js';
 import { StateDatabase } from './core/db.js';
@@ -16,18 +17,9 @@ import { bindingsForRun, checkAgentAvailability, probeAll } from './core/preflig
 import type { AgentBinding, RunnerConfig } from './core/types.js';
 import { TerminalApprovalBroker } from './agent/approval.js';
 
-const argv = process.argv.slice(2);
-const command = argv.shift();
-
-const rawConfigOverrides: string[] = [];
-while (true) {
-  const index = argv.indexOf('-c');
-  if (index < 0) break;
-  const value = argv[index + 1];
-  if (!value || value.startsWith('--')) throw new Error('-c requires a value like roles.lead=codex.terra');
-  argv.splice(index, 2);
-  rawConfigOverrides.push(value);
-}
+let argv: string[] = [];
+let command: string | undefined;
+let rawConfigOverrides: string[] = [];
 
 function configOverrides(): ConfigOverride[] {
   return rawConfigOverrides.map((entry) => {
@@ -281,6 +273,21 @@ async function main(): Promise<void> {
   throw new Error(`Unknown command: ${command}`);
 }
 
+export async function runCli(args: string[] = process.argv.slice(2)): Promise<void> {
+  argv = [...args];
+  command = argv.shift();
+  rawConfigOverrides = [];
+  while (true) {
+    const index = argv.indexOf('-c');
+    if (index < 0) break;
+    const value = argv[index + 1];
+    if (!value || value.startsWith('--')) throw new Error('-c requires a value like roles.lead=codex.terra');
+    argv.splice(index, 2);
+    rawConfigOverrides.push(value);
+  }
+  await main();
+}
+
 function printHelp(): void {
   console.log(`agent-team-runner
 
@@ -311,7 +318,14 @@ function terminalApprovals(): TerminalApprovalBroker {
   return new TerminalApprovalBroker();
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
-  process.exitCode = 1;
-});
+export function formatCliError(error: unknown): string {
+  return error instanceof Error ? error.stack ?? error.message : String(error);
+}
+
+const isMain = process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  runCli().catch((error) => {
+    console.error(formatCliError(error));
+    process.exitCode = 1;
+  });
+}

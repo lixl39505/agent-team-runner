@@ -37,7 +37,7 @@ export function globMatch(path: string, glob: string): boolean {
 export function patternMatches(file: string, pattern: string): boolean {
   if (globMatch(file, pattern)) return true;
   if (!/[*?]/.test(pattern)) {
-    const lastSegment = pattern.replace(/\\/g, '/').split('/').pop() ?? '';
+    const lastSegment = pattern.replace(/\\/g, '/').split('/').pop()!;
     if (!lastSegment.includes('.')) {
       return file === pattern || file.startsWith(`${pattern}/`) || globMatch(file, `${pattern}/**`);
     }

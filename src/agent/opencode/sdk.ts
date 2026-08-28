@@ -36,6 +36,8 @@ export interface OpenCodeBackendOptions {
   nativeWindowsSandbox?: NativeWindowsSandboxPolicy | undefined;
   /** Test seam; production always uses process.platform. */
   platform?: NodeJS.Platform | undefined;
+  /** Test seam; production uses cross-spawn. */
+  spawn?: typeof spawn | undefined;
 }
 
 interface OpenCodeMessagePart {
@@ -85,11 +87,15 @@ export class OpenCodeBackend implements AgentBackend {
     return this.options.command ?? 'opencode';
   }
 
+  private get spawn(): typeof spawn {
+    return this.options.spawn ?? spawn;
+  }
+
   async discover(): Promise<DiscoveryResult> {
     return await new Promise<DiscoveryResult>((resolve) => {
       let child;
       try {
-        child = spawn(this.command, ['--version'], { stdio: ['ignore', 'pipe', 'ignore'] });
+        child = this.spawn(this.command, ['--version'], { stdio: ['ignore', 'pipe', 'ignore'] });
       } catch {
         resolve({ backend: 'opencode', installed: false, detail: `failed to spawn ${this.command}` });
         return;
@@ -267,7 +273,7 @@ export class OpenCodeBackend implements AgentBackend {
     const command = this.options.command ?? 'opencode';
     const hostname = this.options.hostname ?? '127.0.0.1';
     const port = this.options.port ?? 4100 + Math.floor(Math.random() * 800);
-    const child = spawn(command, ['serve', `--hostname=${hostname}`, `--port=${port}`], {
+    const child = this.spawn(command, ['serve', `--hostname=${hostname}`, `--port=${port}`], {
       env: {
         ...sanitizedEnv(),
         OPENCODE_CONFIG_CONTENT: JSON.stringify({
@@ -438,7 +444,7 @@ ${JSON.stringify(this.spec.schema)}`;
           format: { type: 'json_schema', schema: this.spec.schema, retryCount: 1 }
         } as never
       });
-      const info = (response.data?.info ?? {}) as NonNullable<OpenCodeMessage['info']> & { error?: { name?: string; data?: { message?: string } } };
+      const info = Object(response.data?.info) as NonNullable<OpenCodeMessage['info']> & { error?: { name?: string; data?: { message?: string } } };
       const tokens = info.tokens;
       const usage = tokens ? { inputTokens: tokens.input, outputTokens: tokens.output } : undefined;
       // opencode 把 provider 错误放在 info.error（如 401 认证失败）——显式透出
@@ -479,7 +485,7 @@ ${JSON.stringify(this.spec.schema)}`;
         return {
           ok: false,
           output: null,
-          error: error instanceof Error ? error.message : String(error),
+          error: (error as Error).message,
           timedOut: this.interrupted,
           stalled: false,
           sessionId: this.sessionId
@@ -503,6 +509,7 @@ ${JSON.stringify(this.spec.schema)}`;
 
   async answerPermission(permissionId: string, request: { type: string; pattern?: string | Array<string> | undefined }): Promise<void> {
     const hardDenied = this.compiled.access === 'read-only' && ['bash', 'edit'].includes(request.type);
+    const kind = openCodeApprovalKind(request.type);
     let response: 'once' | 'always' | 'reject' = 'reject';
     if (!hardDenied && this.compiled.access === 'workspace-write' && request.type === 'edit') {
       response = 'once';
@@ -514,7 +521,7 @@ ${JSON.stringify(this.spec.schema)}`;
           label: this.spec.label,
           sessionId: this.sessionId,
           cwd: this.spec.cwd,
-          kind: openCodeApprovalKind(request.type),
+          kind,
           tool: request.type,
           input: { ...(request.pattern !== undefined ? { pattern: request.pattern } : {}) },
           title: openCodeApprovalTitle(request),

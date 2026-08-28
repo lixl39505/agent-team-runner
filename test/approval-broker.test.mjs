@@ -1,6 +1,6 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { ApprovalQueue } from '../dist/agent/approval.js';
+import { ApprovalQueue } from '../src/agent/approval.ts';
 
 function request(label, allowSession = true) {
   return {
@@ -87,4 +87,29 @@ test('ApprovalQueue serializes questions with approvals and returns structured a
     features: ['Auth', 'Search'],
     detail: ['custom value']
   });
+});
+
+test('ApprovalQueue handles headings, invalid selections, custom input, and aborted active prompts', async () => {
+  const answers = ['', '9', '2', 'custom', 'free text'];
+  const output = [];
+  const queue = new ApprovalQueue(async () => answers.shift(), (text) => output.push(text));
+  assert.deepEqual(await queue.requestUserInput({
+    backend: 'opencode', role: 'reviewer', label: 'review', cwd: '/repo',
+    questions: [
+      { id: 'choice', header: 'Pick', question: 'Choose', options: [{ label: 'One', description: 'first' }, { label: 'Two' }], allowCustom: false, secret: true },
+      { id: 'custom', question: 'Custom', options: [{ label: 'Known' }], allowCustom: true },
+      { id: 'free', question: 'Explain' }
+    ]
+  }), { choice: ['Two'], custom: ['custom'], free: ['free text'] });
+  assert.match(output.join(''), /\[Question\] opencode \/ reviewer \/ review/);
+  assert.match(output.join(''), /Note: this terminal input is not masked/);
+  assert.match(output.join(''), /Enter an answer/);
+  assert.match(output.join(''), /a valid option number/);
+
+  const controller = new AbortController();
+  const pending = new ApprovalQueue(async () => await new Promise(() => {}), () => {});
+  const activeRequest = pending.request(request('active'), controller.signal);
+  await new Promise((resolve) => setTimeout(resolve, 1));
+  controller.abort(new Error('stopped'));
+  await assert.rejects(activeRequest, /stopped/);
 });

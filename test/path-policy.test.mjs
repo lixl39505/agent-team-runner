@@ -1,6 +1,6 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { checkPaths, globMatch } from '../dist/core/path-policy.js';
+import { checkPaths, globMatch } from '../src/core/path-policy.ts';
 
 test('globMatch handles recursive and single-segment wildcards', () => {
   assert.equal(globMatch('apps/api/src/order/export.ts', 'apps/api/**'), true);
@@ -19,7 +19,7 @@ test('blocked paths take precedence', () => {
 });
 
 test('bare directory patterns match their subtree (lead-friendly semantics)', async () => {
-  const { checkPaths } = await import('../dist/core/path-policy.js');
+  const { checkPaths } = await import('../src/core/path-policy.ts');
   // 裸目录名 'src' → 匹配子树；'package.json'（含点）→ 仅匹配自身
   const verdict = checkPaths(['src/a.ts', 'src/deep/b.ts', 'package.json', 'test/x.test.ts'], ['src', 'package.json'], []);
   assert.deepEqual(verdict.invalid, ['test/x.test.ts']);

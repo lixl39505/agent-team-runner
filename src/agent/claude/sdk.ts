@@ -26,6 +26,8 @@ export interface ClaudeBackendOptions {
   nativeWindowsSandbox?: NativeWindowsSandboxPolicy | undefined;
   /** Test seam; production always uses process.platform. */
   platform?: NodeJS.Platform | undefined;
+  /** Test seam; production uses cross-spawn. */
+  spawn?: typeof spawn | undefined;
 }
 
 export class ClaudeBackend implements AgentBackend {
@@ -52,7 +54,7 @@ export class ClaudeBackend implements AgentBackend {
     return await new Promise<DiscoveryResult>((resolve) => {
       let child;
       try {
-        child = spawn(command, ['--version'], { stdio: ['ignore', 'pipe', 'ignore'] });
+        child = (this.options.spawn ?? spawn)(command, ['--version'], { stdio: ['ignore', 'pipe', 'ignore'] });
       } catch {
         resolve({ backend: 'claude', installed: false, detail: `failed to spawn ${command}` });
         return;
@@ -348,7 +350,7 @@ function gitMetadataPaths(cwd: string): string[] {
 }
 
 /** SDKMessage → AgentEvent 的映射（纯函数，单测核心） */
-export function mapClaudeMessage(message: { type: string } & Record<string, unknown>): AgentEvent[] | null {
+export function mapClaudeMessage(message: { type: string } & Record<string, unknown>): AgentEvent[] {
   switch (message.type) {
     case 'stream_event':
       return [{ type: 'activity' }];
@@ -456,7 +458,7 @@ class ClaudeAgentSession implements AgentSession {
           this.sessionUuid = message.session_id;
           this.spec.onEvent?.({ type: 'session', sessionId: message.session_id });
         }
-        for (const event of mapClaudeMessage(message as unknown as { type: string } & Record<string, unknown>) ?? []) {
+        for (const event of mapClaudeMessage(message as unknown as { type: string } & Record<string, unknown>)) {
           this.spec.onEvent?.(event);
         }
         if (message.type === 'result') {

@@ -1,9 +1,9 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { ProbeCache } from '../dist/core/probe-cache.js';
+import { ProbeCache } from '../src/core/probe-cache.ts';
 
 test('probe cache round-trips, expires by TTL, and isolates by version', () => {
   const dir = mkdtempSync(join(tmpdir(), 'agent-team-probe-'));

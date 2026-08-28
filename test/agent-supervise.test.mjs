@@ -1,10 +1,10 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { runAgent } from '../dist/agent/supervise.js';
-import { FakeBackend } from '../dist/agent/fake.js';
+import { runAgent } from '../src/agent/supervise.ts';
+import { FakeBackend } from '../src/agent/fake.ts';
 
 function spec(overrides = {}) {
   return {

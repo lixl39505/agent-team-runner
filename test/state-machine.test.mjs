@@ -1,14 +1,14 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { DEFAULT_CONFIG } from '../dist/core/config.js';
-import { StateDatabase } from '../dist/core/db.js';
-import { currentHead, git } from '../dist/core/git.js';
-import { snapshotAgents } from '../dist/agent/registry.js';
-import { planRun } from '../dist/core/planner.js';
-import { runOrchestrator } from '../dist/core/orchestrator.js';
+import { DEFAULT_CONFIG } from '../src/core/config.ts';
+import { StateDatabase } from '../src/core/db.ts';
+import { currentHead, git } from '../src/core/git.ts';
+import { snapshotAgents } from '../src/agent/registry.ts';
+import { planRun } from '../src/core/planner.ts';
+import { runOrchestrator } from '../src/core/orchestrator.ts';
 
 async function repository() {
   const repoRoot = mkdtempSync(join(tmpdir(), 'agent-team-state-machine-'));

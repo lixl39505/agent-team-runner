@@ -17,7 +17,8 @@
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
     "dev": "tsx src/cli.ts",
     "gen:codex": "codex app-server generate-ts --out src/agent/codex/protocol && find src/agent/codex/protocol -name '*.ts' -exec sed -i '' -E 's/from \"\\./([A-Za-z0-9_/]+)\"/from \".\\/\\1.js\"/g; s/from \"\\.\\./([A-Za-z0-9_/]+)\"/from \"..\\/\\1.js\"/g' {} + && codex --version > src/agent/codex/protocol/GENERATED_FROM",
-    "test": "npm run build && node --test test/*.test.mjs",
+    "test": "npm run build && vitest run",
+    "test:coverage": "npm run build && vitest run --coverage",
     "check": "npm run build && npm test",
     "test:protocol": "npm run build && AGENT_TEAM_PROTOCOL=1 node --test --test-force-exit test/integration-backends.test.mjs",
     "test:integration": "npm run build && AGENT_TEAM_INTEGRATION=1 node --test --test-force-exit test/integration-backends.test.mjs test/integration-claude.test.mjs"
@@ -34,8 +35,10 @@
   "devDependencies": {
     "@types/cross-spawn": "^6.0.6",
     "@types/node": "^24.0.0",
+    "@vitest/coverage-istanbul": "^4.1.11",
     "tsx": "^4.20.0",
-    "typescript": "^5.8.0"
+    "typescript": "^5.8.0",
+    "vitest": "^4.1.11"
   },
   "license": "MIT"
 }

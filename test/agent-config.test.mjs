@@ -1,11 +1,11 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { loadConfig } from '../dist/core/config.js';
-import { validateAgents, parseInlineAgentSpec } from '../dist/core/agent-config.js';
-import { resolveAgent, resolveTaskAgent, snapshotAgents, parseSnapshot } from '../dist/agent/registry.js';
+import { loadConfig } from '../src/core/config.ts';
+import { validateAgents, parseInlineAgentSpec } from '../src/core/agent-config.ts';
+import { resolveAgent, resolveTaskAgent, snapshotAgents, parseSnapshot } from '../src/agent/registry.ts';
 
 function tempRepo() {
   const repo = mkdtempSync(join(tmpdir(), 'agent-team-agents-'));

@@ -97,7 +97,7 @@ export function validateTaskGraph(tasks: TaskSpec[]): void {
     if (visiting.has(id)) throw new Error(`Task graph contains a cycle at ${id}`);
     if (visited.has(id)) return;
     visiting.add(id);
-    for (const dep of byId.get(id)?.dependsOn ?? []) visit(dep);
+    for (const dep of byId.get(id)!.dependsOn) visit(dep);
     visiting.delete(id);
     visited.add(id);
   };
@@ -131,7 +131,7 @@ function validateParallelPathOwnership(tasks: TaskSpec[]): void {
   const reaches = (from: string, target: string, seen = new Set<string>()): boolean => {
     if (seen.has(from)) return false;
     seen.add(from);
-    for (const dep of byId.get(from)?.dependsOn ?? []) {
+    for (const dep of byId.get(from)!.dependsOn) {
       if (dep === target || reaches(dep, target, seen)) return true;
     }
     return false;

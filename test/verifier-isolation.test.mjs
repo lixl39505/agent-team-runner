@@ -1,10 +1,10 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { verifyTaskWorktree, runGlobalVerification } from '../dist/core/verifier.js';
+import { verifyTaskWorktree, runGlobalVerification } from '../src/core/verifier.ts';
 
 function repository() {
   const dir = mkdtempSync(join(tmpdir(), 'agent-team-verifier-isolation-'));

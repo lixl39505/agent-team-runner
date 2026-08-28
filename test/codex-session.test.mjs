@@ -1,0 +1,95 @@
+import { test } from 'vitest';
+import assert from 'node:assert/strict';
+import { CodexBackend, codexDecision, codexWindowsSandboxCapability, legacyReviewDecision } from '../src/agent/codex/app-server.ts';
+
+function spec(overrides = {}) {
+  return {
+    role: 'worker', cwd: '/workspace', prompt: 'Return JSON', schema: { type: 'object' },
+    access: 'workspace-write', timeoutMs: 1_000, staleAfterMs: 1_000,
+    ...overrides
+  };
+}
+
+async function open(overrides = {}) {
+  const backend = new CodexBackend();
+  const requests = [];
+  const connection = {
+    exited: false,
+    async request(method, params) {
+      requests.push({ method, params });
+      if (method === 'thread/start') return { thread: { id: 'thread-1' } };
+      return {};
+    },
+    close() {}
+  };
+  backend.ensureServer = async () => {};
+  backend.connection = connection;
+  const events = [];
+  const session = await backend.openSession(spec({ onEvent: (event) => events.push(event), ...overrides }));
+  return { backend, connection, events, requests, session };
+}
+
+test('Codex session maps notifications to events and a structured turn result', async () => {
+  const value = await open();
+  assert.equal(value.session.sessionId, 'thread-1');
+  assert.equal(value.events[0].type, 'session');
+  value.backend.handleNotification('thread/tokenUsage/updated', { threadId: 'thread-1', tokenUsage: { total: { inputTokens: 2, outputTokens: 3 } } });
+  value.backend.handleNotification('item/agentMessage/delta', { threadId: 'thread-1' });
+  value.backend.handleNotification('item/fileChange/patchUpdated', { threadId: 'thread-1', itemId: 'patch', changes: [{ path: 'src/a.ts' }] });
+  value.backend.handleNotification('item/completed', { threadId: 'thread-1', item: { type: 'agentMessage', text: '{"status":"completed"}' } });
+  value.backend.handleNotification('item/completed', { threadId: 'thread-1', item: { type: 'commandExecution', exitCode: 0, aggregatedOutput: 'passed' } });
+  value.backend.handleNotification('turn/completed', { threadId: 'thread-1', turn: { status: 'completed', error: null } });
+  assert.deepEqual(await value.session.completion(), {
+    ok: true, output: { status: 'completed' }, timedOut: false, stalled: false, sessionId: 'thread-1',
+    usage: { inputTokens: 2, outputTokens: 3 }
+  });
+  assert.equal(value.events.some((event) => event.type === 'tool-result' && event.ok), true);
+});
+
+test('Codex sessions return parse and failed-turn errors and settle on close', async () => {
+  const invalid = await open();
+  invalid.backend.handleNotification('item/completed', { threadId: 'thread-1', item: { type: 'agentMessage', text: 'not JSON' } });
+  invalid.backend.handleNotification('turn/completed', { threadId: 'thread-1', turn: { status: 'completed', error: null } });
+  assert.match((await invalid.session.completion()).error, /not parseable JSON/);
+
+  const failed = await open();
+  failed.backend.handleNotification('turn/completed', { threadId: 'thread-1', turn: { status: 'failed', error: { message: 'boom' } } });
+  assert.match((await failed.session.completion()).error, /codex turn failed.*boom/);
+
+  const closed = await open();
+  await closed.session.close();
+  assert.match((await closed.session.completion()).error, /session closed/);
+});
+
+test('Codex routes approval, user input, and unknown server requests safely', async () => {
+  const approvals = [];
+  const value = await open({
+    requestApproval: async (request) => { approvals.push(request); return 'session'; },
+    requestUserInput: async () => ({ choice: ['yes'] })
+  });
+  value.backend.handleNotification('item/fileChange/patchUpdated', { threadId: 'thread-1', itemId: 'change', changes: [{ path: 'src/a.ts' }] });
+  assert.deepEqual(await value.backend.handleServerRequest('item/commandExecution/requestApproval', { threadId: 'thread-1', command: 'npm test' }), { decision: 'acceptForSession' });
+  assert.deepEqual(await value.backend.handleServerRequest('item/fileChange/requestApproval', { threadId: 'thread-1', itemId: 'change', grantRoot: '/outside' }), { decision: 'acceptForSession' });
+  assert.deepEqual(await value.backend.handleServerRequest('item/permissions/requestApproval', {
+    threadId: 'thread-1', permissions: { network: { enabled: true }, fileSystem: { read: ['/tmp'], write: ['/tmp'] } }
+  }), { permissions: { network: { enabled: true }, fileSystem: { read: ['/tmp'], write: ['/tmp'] } }, scope: 'session' });
+  assert.deepEqual(await value.backend.handleServerRequest('item/tool/requestUserInput', {
+    threadId: 'thread-1', questions: [{ id: 'choice', question: 'Continue?', options: null, isOther: true, isSecret: false }]
+  }), { answers: { choice: { answers: ['yes'] } } });
+  assert.deepEqual(await value.backend.handleServerRequest('item/tool/requestUserInput', { threadId: 'missing', questions: [] }), { answers: {} });
+  assert.deepEqual(await value.backend.handleServerRequest('mcpServer/elicitation/request', {}), { action: 'decline', content: null, _meta: null });
+  await assert.rejects(value.backend.handleServerRequest('unknown', {}), /unhandled/);
+  assert.equal(approvals.length, 3);
+});
+
+test('Codex policy helpers map decisions and Windows capability consistently', () => {
+  assert.equal(codexDecision('once'), 'accept');
+  assert.equal(codexDecision('session'), 'acceptForSession');
+  assert.equal(codexDecision('deny'), 'decline');
+  assert.equal(legacyReviewDecision('accept'), 'approved');
+  assert.deepEqual(legacyReviewDecision('decline'), { denied: { rejection: 'denied by user' } });
+  assert.equal(legacyReviewDecision('acceptForSession'), 'approved_for_session');
+  assert.equal(codexWindowsSandboxCapability('ready', 'require', 'win32').ok, true);
+  assert.equal(codexWindowsSandboxCapability('notInstalled', 'require', 'win32').ok, false);
+  assert.equal(codexWindowsSandboxCapability('unavailable', 'allow-degraded', 'win32', 'missing').degraded, true);
+});

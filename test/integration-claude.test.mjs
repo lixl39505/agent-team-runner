@@ -1,12 +1,12 @@
 // Real backend integration test; enabled only with local Claude authentication.
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
-import { ClaudeBackend } from '../dist/agent/claude/sdk.js';
-import { runAgent } from '../dist/agent/supervise.js';
+import { ClaudeBackend } from '../src/agent/claude/sdk.ts';
+import { runAgent } from '../src/agent/supervise.ts';
 
 const maybeTest = process.env.AGENT_TEAM_INTEGRATION === '1' ? test : test.skip;
 

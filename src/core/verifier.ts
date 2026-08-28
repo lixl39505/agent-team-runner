@@ -32,7 +32,7 @@ export async function verifyTaskWorktree(input: {
     const code = await runCommand(command, input.worktree, log);
     const inspected = await inspectTaskState(input);
     if (!inspected.ok) {
-      return code === 0 ? inspected : { ...inspected, error: `Verification command failed (${code}) and changed protected state: ${command}. ${inspected.error ?? ''}`.trim() };
+      return code === 0 ? inspected : { ...inspected, error: `Verification command failed (${code}) and changed protected state: ${command}. ${inspected.error}` };
     }
     state = inspected;
     if (code !== 0) return { ok: false, changedFiles: state.changedFiles, error: `Verification command failed (${code}): ${command}` };

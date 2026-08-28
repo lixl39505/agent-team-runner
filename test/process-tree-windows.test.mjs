@@ -1,11 +1,11 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { spawn, execFile } from 'node:child_process';
 import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
-import { killProcessTree } from '../dist/agent/process-tree.js';
+import { killProcessTree } from '../src/agent/process-tree.ts';
 
 const windowsTest = process.platform === 'win32' ? test : test.skip;
 const execFileAsync = promisify(execFile);

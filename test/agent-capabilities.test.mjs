@@ -1,8 +1,8 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { ClaudeBackend } from '../dist/agent/claude/sdk.js';
-import { CodexBackend } from '../dist/agent/codex/app-server.js';
-import { OpenCodeBackend } from '../dist/agent/opencode/sdk.js';
+import { ClaudeBackend } from '../src/agent/claude/sdk.ts';
+import { CodexBackend } from '../src/agent/codex/app-server.ts';
+import { OpenCodeBackend } from '../src/agent/opencode/sdk.ts';
 
 function spec(overrides = {}) {
   return {

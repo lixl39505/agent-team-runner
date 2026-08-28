@@ -55,6 +55,8 @@ export interface CodexBackendOptions {
   nativeWindowsSandbox?: NativeWindowsSandboxPolicy | undefined;
   /** Test seam; production always uses process.platform. */
   platform?: NodeJS.Platform | undefined;
+  /** Test seam; production uses cross-spawn. */
+  spawn?: typeof spawn | undefined;
 }
 
 interface TurnRecord {
@@ -93,7 +95,7 @@ export class CodexBackend implements AgentBackend {
     return await new Promise<DiscoveryResult>((resolve) => {
       let child;
       try {
-        child = spawn(this.command, ['--version'], { stdio: ['ignore', 'pipe', 'ignore'] });
+        child = (this.options.spawn ?? spawn)(this.command, ['--version'], { stdio: ['ignore', 'pipe', 'ignore'] });
       } catch {
         resolve({ backend: 'codex', installed: false, detail: `failed to spawn ${this.command}` });
         return;
@@ -569,7 +571,7 @@ class CodexAgentSession implements AgentSession {
         this.resolveResult({
           ok: false,
           output: null,
-          error: error instanceof Error ? error.message : String(error),
+          error: (error as Error).message,
           timedOut: false,
           stalled: false,
           sessionId: this.sessionId

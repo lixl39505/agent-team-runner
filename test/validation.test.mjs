@@ -1,6 +1,6 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { topologicalTasks, validateLeadResult } from '../dist/core/validation.js';
+import { topologicalTasks, validateLeadResult } from '../src/core/validation.ts';
 
 const task = (id, dependsOn = []) => ({
   id,

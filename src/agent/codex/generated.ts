@@ -10,8 +10,7 @@ const packageRoot = fileURLToPath(new URL('../../../', import.meta.url));
  * 与 discover() 探测的实际 CLI 版本比对，不一致说明协议类型过期——
  * 升级流程：npm run gen:codex && npm run check。
  */
-export function generatedProtocolVersion(): string | undefined {
-  const path = join(packageRoot, 'src', 'agent', 'codex', 'protocol', 'GENERATED_FROM');
+export function generatedProtocolVersion(path = join(packageRoot, 'src', 'agent', 'codex', 'protocol', 'GENERATED_FROM')): string | undefined {
   try {
     const text = existsSync(path) ? readFileSync(path, 'utf8').trim() : '';
     return text.length > 0 ? text : undefined;

@@ -1,7 +1,7 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { unsupportedNativeWindowsSandbox } from '../dist/agent/platform.js';
-import { codexWindowsSandboxCapability } from '../dist/agent/codex/app-server.js';
+import { unsupportedNativeWindowsSandbox } from '../src/agent/platform.ts';
+import { codexWindowsSandboxCapability } from '../src/agent/codex/app-server.ts';
 
 test('native Windows backends fail closed until degradation is explicitly allowed', () => {
   const required = unsupportedNativeWindowsSandbox('claude', 'require', 'win32');

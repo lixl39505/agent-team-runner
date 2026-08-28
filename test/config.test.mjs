@@ -1,9 +1,9 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { applyOverrides, configPath, initConfig, loadConfig } from '../dist/core/config.js';
+import { applyOverrides, configPath, initConfig, loadConfig } from '../src/core/config.ts';
 
 function tempRepo() {
   const repo = mkdtempSync(join(tmpdir(), 'agent-team-config-'));

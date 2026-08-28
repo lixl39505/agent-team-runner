@@ -1,7 +1,7 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { sanitizedEnv } from '../dist/agent/env.js';
-import { verificationEnv } from '../dist/core/process-env.js';
+import { sanitizedEnv } from '../src/agent/env.ts';
+import { verificationEnv } from '../src/core/process-env.ts';
 
 test('agent environments keep auth but force non-interactive Git isolation', () => {
   const env = sanitizedEnv({ ANTHROPIC_API_KEY: 'test-key', GIT_PAGER: 'less' });

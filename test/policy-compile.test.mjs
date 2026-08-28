@@ -1,8 +1,8 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { compileClaude } from '../dist/agent/claude/policy.js';
-import { compileCodex } from '../dist/agent/codex/policy.js';
-import { compileOpenCode, compileOpenCodeBasePermission } from '../dist/agent/opencode/policy.js';
+import { compileClaude } from '../src/agent/claude/policy.ts';
+import { compileCodex } from '../src/agent/codex/policy.ts';
+import { compileOpenCode, compileOpenCodeBasePermission } from '../src/agent/opencode/policy.ts';
 
 test('claude compile preserves native asks behind coarse role boundaries', () => {
   const worker = compileClaude('workspace-write');
