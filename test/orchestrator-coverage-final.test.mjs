@@ -23,18 +23,17 @@ async function repository() {
 }
 
 function configFor(repoRoot, overrides = {}) {
+  const { workspace, retry, status, ...rest } = overrides;
   const name = basename(repoRoot);
   return {
     ...DEFAULT_CONFIG,
-    repoRoot,
-    stateDir: join(tmpdir(), `${name}-state`),
-    worktreesDir: join(tmpdir(), `${name}-worktrees`),
+    workspace: { ...DEFAULT_CONFIG.workspace, repoRoot, stateDir: join(tmpdir(), `${name}-state`), worktreesDir: join(tmpdir(), `${name}-worktrees`), ...workspace },
     concurrency: 1,
-    maxWorkerAttempts: 1,
-    maxReviewCycles: 2,
+    retry: { ...DEFAULT_CONFIG.retry, maxWorkerAttempts: 1, maxReviewCycles: 2, ...retry },
+    status: { ...DEFAULT_CONFIG.status, ...status },
     integration: { ...DEFAULT_CONFIG.integration, runAgentAfterCherryPick: false },
     verification: { ...DEFAULT_CONFIG.verification, globalCommands: [] },
-    ...overrides
+    ...rest
   };
 }
 
@@ -84,8 +83,8 @@ function pool(backend) {
 }
 
 async function planned(db, config, tasks = [task()], manifestTasks = tasks) {
-  const baseSha = await currentHead(config.repoRoot);
-  db.createRun({ id: 'run', repoRoot: config.repoRoot, goalFile: 'goal.md', baseRef: 'HEAD', baseSha, adapter: 'claude' });
+  const baseSha = await currentHead(config.workspace.repoRoot);
+  db.createRun({ id: 'run', repoRoot: config.workspace.repoRoot, goalFile: 'goal.md', baseRef: 'HEAD', baseSha, adapter: 'claude' });
   for (const spec of tasks) db.insertTask('run', spec);
   db.updateRun('run', {
     status: 'planned',
@@ -101,8 +100,8 @@ function worker(status = 'blocked', extra = {}) {
 
 test('orchestrator exercises worker fallback paths and retry context persistence', async () => {
   const repoRoot = await repository();
-  const config = configFor(repoRoot, { maxWorkerAttempts: 2 });
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const config = configFor(repoRoot, { retry: { maxWorkerAttempts: 2 } });
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new Backend((spec) => {
     assert.equal(spec.role, 'worker');
     spec.onEvent({ type: 'progress' });
@@ -112,13 +111,13 @@ test('orchestrator exercises worker fallback paths and retry context persistence
   });
   try {
     const baseSha = await planned(db, config);
-    const worktree = join(config.worktreesDir, basename(repoRoot), 'run', 'T001');
-    mkdirSync(join(config.worktreesDir, basename(repoRoot), 'run'), { recursive: true });
+    const worktree = join(config.workspace.worktreesDir, basename(repoRoot), 'run', 'T001');
+    mkdirSync(join(config.workspace.worktreesDir, basename(repoRoot), 'run'), { recursive: true });
     await git(repoRoot, ['worktree', 'add', '-q', '-b', 'coverage-retry', worktree, baseSha]);
     writeFileSync(join(worktree, 'src', 'feature.txt'), 'changed\n', 'utf8');
     writeFileSync(join(worktree, 'src', 'untracked.txt'), 'untracked\n', 'utf8');
-    mkdirSync(join(config.stateDir, 'runs', 'run', 'results'), { recursive: true });
-    writeFileSync(join(config.stateDir, 'runs', 'run', 'results', 'T001-worker-1.json'), '{"summary":7}', 'utf8');
+    mkdirSync(join(config.workspace.stateDir, 'runs', 'run', 'results'), { recursive: true });
+    writeFileSync(join(config.workspace.stateDir, 'runs', 'run', 'results', 'T001-worker-1.json'), '{"summary":7}', 'utf8');
     db.updateTask('run', 'T001', { status: 'changes_requested', phase: 'retry', attempts: 1, worktree, branch: 'coverage-retry', startSha: baseSha });
 
     await runOrchestrator({ config, db, runId: 'run', backends: pool(backend) });
@@ -132,7 +131,7 @@ test('orchestrator exercises worker fallback paths and retry context persistence
 test('orchestrator handles missing worker and reviewer fallback values', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   let calls = 0;
   const backend = new Backend((spec) => {
     calls += 1;
@@ -155,7 +154,7 @@ test('orchestrator handles missing worker and reviewer fallback values', async (
 test('orchestrator records worker and verification fallback failures', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new Backend(() => worker('completed'));
   try {
     await planned(db, config);
@@ -169,7 +168,7 @@ test('orchestrator records worker and verification fallback failures', async () 
 test('orchestrator uses a blocked worker summary when no explicit reason is supplied', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new Backend(() => worker('blocked'));
   try {
     await planned(db, config);
@@ -182,8 +181,8 @@ test('orchestrator uses a blocked worker summary when no explicit reason is supp
 
 test('orchestrator records non-terminal review feedback for a clean retry', async () => {
   const repoRoot = await repository();
-  const config = configFor(repoRoot, { maxWorkerAttempts: 2 });
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const config = configFor(repoRoot, { retry: { maxWorkerAttempts: 2 } });
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   let workerCalls = 0;
   const backend = new Backend((spec) => {
     if (spec.role === 'worker') {

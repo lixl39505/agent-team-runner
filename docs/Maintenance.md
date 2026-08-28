@@ -28,8 +28,8 @@ src/
       sdk.ts              自管 opencode serve 子进程 + @opencode-ai/sdk client：session.prompt/SSE 权限应答
       policy.ts           compileOpenCode：服务端原生 ask 门禁 + read-only 角色边界
   core/
-    config.ts             配置初始化、加载（YAML/JSON）、v2 默认值合并、-c 覆写
-    agent-config.ts       v1→v2 内存迁移、agents 注册表校验、backendCommand
+    config.ts             配置初始化、加载（YAML/JSON）、v3 默认值合并、-c 覆写
+    agent-config.ts       agents 注册表校验、backendCommand
     preflight.ts          闭环预检：discover + listModels + probe（probe-cache 持久缓存）
     probe-cache.ts        probe 结果持久缓存（backend|model|version 键，TTL）
     db.ts                 SQLite 状态数据库（runs / tasks / events 三表）
@@ -179,7 +179,7 @@ validateLeadResult(value, validAgentNames)
       └── 无依赖关系的并行任务之间 allowedPaths 不能重叠
 ```
 
-Lead 最多尝试 `maxPlanAttempts` 次（默认 2）。失败后，错误信息会附加到下一次 prompt 中。
+Lead 最多尝试 `retry.maxPlanAttempts` 次（默认 2）。失败后，错误信息会附加到下一次 prompt 中。
 
 ### 2.5 落地
 
@@ -287,7 +287,7 @@ while (true) {
 
 **入口**：`orchestrator.ts:123-231`
 
-每个任务按严格顺序经历以下 7 个步骤。任一步骤失败触发 `retryOrFail`（第 233-252 行）：未超过 `maxWorkerAttempts`（默认 2）→ `changes_requested`；超过 → `failed`。
+每个任务按严格顺序经历以下 7 个步骤。任一步骤失败触发 `retryOrFail`（第 233-252 行）：未超过 `retry.maxWorkerAttempts`（默认 2）→ `changes_requested`；超过 → `failed`。
 
 ### 步骤 1：注入依赖 (`ensureTaskWorktree`)
 
@@ -298,9 +298,9 @@ while (true) {
    - phase 为 `interrupted/recovered` → 从 `startSha` 删除并重建，再复用路径
    - 其他 phase → 直接复用（普通 retry 仍保留 diff 和 Reviewer 反馈）
 2. 否则创建:
-   repoName = safeSegment(basename(repoRoot))
-   path     = worktreesDir/repoName/runId/taskId
-   branch   = branchPrefix/runId/taskId
+   repoName = safeSegment(basename(workspace.repoRoot))
+   path     = workspace.worktreesDir/repoName/runId/taskId
+   branch   = workspace.branchPrefix/runId/taskId
    git worktree add -b <branch> <path> <baseSha>
 
 3. 注入祖先提交:
@@ -475,7 +475,7 @@ if (review.decision === 'approved') {
 } else {
   // changes_requested
   await unstageAll(worktreeInfo.path);        // git reset
-  if (reviewCycle >= maxReviewCycles) → failed
+  if (reviewCycle >= retry.maxReviewCycles) → failed
   else {
     db.updateTask(runId, task.id, {
       status: 'changes_requested',
@@ -497,8 +497,8 @@ if (review.decision === 'approved') {
 
 ```typescript
 // orchestrator.ts integrateRun 顶部
-const worktree = join(config.worktreesDir, repoName, safeSegment(runId), 'integration');
-const branch = `${config.branchPrefix}/${safeSegment(runId)}/integration`;
+const worktree = join(config.workspace.worktreesDir, repoName, safeSegment(runId), 'integration');
+const branch = `${config.workspace.branchPrefix}/${safeSegment(runId)}/integration`;
 // resetWorktree：集成 worktree 是一次性的——无论上次集成停在什么状态（脏文件/冲突/
 // cherry-pick 中断），都强制清掉 worktree 与分支、从 baseSha 重建（git.ts，幂等可重跑）
 await resetWorktree({ repoRoot, path: worktree, branch, baseSha: run.baseSha });
@@ -607,10 +607,15 @@ writeFileSync(join(runDir, 'summary.txt'), `...`, 'utf8');
 
 ## agents 注册表与角色解析
 
-### config v2 三层结构
+### config v3 三层结构
 
 ```yaml
-version: 2
+version: 3
+workspace:                   # 仓库与 Worktree
+  repoRoot: .
+  stateDir: .agent-team
+retry:                       # 重试上限
+  maxWorkerAttempts: 2
 backends:                    # 传输层接线
   claude: { nativeWindowsSandbox: require }
   codex: { command: codex, nativeWindowsSandbox: require }
@@ -624,7 +629,6 @@ roles:                       # role → agent 名
 defaultAgent: <注册表名>     # 未配置角色的回退
 ```
 
-- v1 配置（`adapters`/`defaultAdapter`/`models` 字段）由 `agent-config.ts:migrateV1Fields` **内存内迁移**：roles 字符串物化为注册表条目、别名表展开、打印等价 v2 YAML + 弃用警告，不重写磁盘。
 - 自定义 `agents:` 整体替换默认注册表；用户未显式指定 `defaultAgent` 时自动取注册表第一个条目。
 - `roles.<role>` 也接受内联 `<backend>.<model>` 规格（`-c roles.lead=codex.gpt-5.6-terra` 快速覆写）。
 - `backends.<id>.nativeWindowsSandbox` 仅影响 native Windows：`require`（默认）要求等价 sandbox，`allow-degraded` 是用户明确选择的宿主权限降级。WSL2 作为 Linux 运行，不触发该策略。
@@ -639,7 +643,7 @@ roles.<role> 是内联规格   → 解析 backend.model
 
 ### plan 快照（`snapshotAgents` / `resolveAgentWithSnapshot`）
 
-- `planRun` 成功后把 `{version: 2, roles: 全部角色绑定, agents: 注册表}` 整体写入 `runs.roles_json`——run 对配置文件后续变化完全 hermetic（含 task.agent 引用的 agent 定义）。
+- `planRun` 成功后把 `{version: 2, roles: 全部角色绑定, agents: 注册表}` 整体写入 `runs.roles_json`——这是独立于 config.yml 的 AgentSnapshot 版本；run 对配置文件后续变化完全 hermetic（含 task.agent 引用的 agent 定义）。
 - `parseSnapshot` 兼容旧 v1 快照形状（`{cli, model}` 逐角色翻译）。
 - `agent-team run <id> -c roles.worker=...` 人为强制修改：只更新被覆写的角色，其余保留快照（`cli.ts` run 分支）。
 
@@ -656,7 +660,7 @@ Lead/Reviewer/Integrator: 角色绑定 > defaultAgent
 - 文件优先级：`.agent-team/config.yml` > `config.yaml` > `config.json`（首个存在者）。
 - YAML 用 `yaml` npm 包解析；JSON 走 `JSON.parse`。
 - `applyOverrides(config, entries)` 处理 `-c path=value`：按 `.` 逐层写入，值先尝试 `JSON.parse`（数字/布尔/JSON 结构），失败按字符串。
-- `initConfig` 生成带注释的 v2 `config.yml` 模板（含 agents/roles 示例）。
+- `initConfig` 生成带注释的 v3 `config.yml` 模板（含 agents/roles 示例）。
 
 ### 预检闭环（`core/preflight.ts`）
 

@@ -21,7 +21,10 @@ function writeUnavailableConfig(repo) {
   const stateDir = join(repo, '.agent-team');
   mkdirSync(stateDir, { recursive: true });
   writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
-    stateDir: '.agent-team',
+    version: 3,
+    workspace: { stateDir: '.agent-team' },
+    retry: {},
+    status: {},
     defaultAgent: 'default-agent',
     agents: {
       'default-agent': { backend: 'claude' },
@@ -140,7 +143,10 @@ process.exit(process.argv.includes('--version') ? 0 : 1);
 `, 'utf8');
     chmodSync(fakeClaude, 0o755);
     writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
-      stateDir: '.agent-team',
+      version: 3,
+      workspace: { stateDir: '.agent-team' },
+      retry: {},
+      status: {},
       defaultAgent: 'local-agent',
       agents: { 'local-agent': { backend: 'claude' } },
       roles: {},

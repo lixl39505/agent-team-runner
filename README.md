@@ -124,23 +124,35 @@ agent-team init
 
 ## 配置
 
-配置文件为 `.agent-team/config.yml`（`agent-team init` 自动生成；加载顺序 `config.yml` > `config.yaml` > 旧版 `config.json`，支持注释。v1 配置会在内存内自动迁移成 v2 并打印等价配置）：
+配置文件为 `.agent-team/config.yml`（`agent-team init` 自动生成；加载顺序 `config.yml` > `config.yaml` > 旧版 `config.json`，支持注释；必须声明 `version: 3`）：
 
 ```yaml
-version: 2
-repoRoot: .
-stateDir: .agent-team
-worktreesDir: ../.agent-team-worktrees
-baseRef: HEAD
+version: 3
+
+# 常用控制
 defaultAgent: default-claude
 concurrency: 3
-pollIntervalMs: 2000
 staleAfterMs: 600000
 taskTimeoutMs: 7200000
-maxPlanAttempts: 2
-maxWorkerAttempts: 2
-maxReviewCycles: 2
-branchPrefix: agent-team
+interactionAlert:
+  background: '#7C3AED' # human-input prompt background
+  foreground: '#FFFFFF' # human-input prompt text
+
+# 仓库与 Worktree
+workspace:
+  repoRoot: .
+  stateDir: .agent-team
+  worktreesDir: ../.agent-team-worktrees
+  baseRef: HEAD
+  branchPrefix: agent-team
+
+# 重试与状态刷新
+retry:
+  maxPlanAttempts: 2
+  maxWorkerAttempts: 2
+  maxReviewCycles: 2
+status:
+  pollIntervalMs: 2000
 
 # 后端接线：CLI 命令缺省用 backend 名本身
 backends:
@@ -463,7 +475,7 @@ npm test
 - 监督器全生命周期（成功 / 超时 / 静默 / 审批暂停计时 / 传输异常）
 - codex JSON-RPC 帧编解码
 - probe 缓存（TTL / 版本隔离）
-- agents 注册表解析、v1 配置迁移、快照兼容
+- agents 注册表解析、v3 配置校验、快照兼容
 - YAML 配置加载与 `-c` 覆写
 - SQLite 状态持久化
 

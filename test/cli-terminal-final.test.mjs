@@ -13,6 +13,8 @@ function repository() {
   const root = mkdtempSync(join(tmpdir(), 'agent-team-cli-terminal-final-'));
   const initialized = spawnSync('git', ['init', '-q', root], { encoding: 'utf8' });
   assert.equal(initialized.status, 0, initialized.stderr);
+  mkdirSync(join(root, '.agent-team'), { recursive: true });
+  writeFileSync(join(root, '.agent-team', 'config.json'), JSON.stringify({ version: 3, workspace: {}, retry: {}, status: {} }));
   return root;
 }
 
@@ -55,7 +57,10 @@ function writeConfig(repo, command) {
   const stateDir = join(repo, '.agent-team');
   mkdirSync(stateDir, { recursive: true });
   writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
-    stateDir: '.agent-team',
+    version: 3,
+    workspace: { stateDir: '.agent-team' },
+    retry: {},
+    status: {},
     defaultAgent: 'local-agent',
     agents: { 'local-agent': { backend: 'codex' } },
     roles: {},

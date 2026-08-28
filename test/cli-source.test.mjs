@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test, vi } from 'vitest';
@@ -47,6 +47,8 @@ test('runCli executes help, repository setup, and command validation in process'
 test('runCli lists runs and stops an in-process status watch', async () => {
   const repository = mkdtempSync(join(tmpdir(), 'agent-team-cli-watch-'));
   assert.equal(spawnSync('git', ['init', '-q', repository]).status, 0);
+  mkdirSync(join(repository, '.agent-team'), { recursive: true });
+  writeFileSync(join(repository, '.agent-team', 'config.json'), JSON.stringify({ version: 3, workspace: {}, retry: {}, status: {} }));
   const db = new StateDatabase(join(repository, '.agent-team', 'state.sqlite'));
   db.createRun({ id: 'watched', repoRoot: repository, goalFile: 'goal.md', baseRef: 'HEAD', baseSha: 'base', adapter: 'claude' });
   db.close();

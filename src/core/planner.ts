@@ -27,21 +27,21 @@ export async function planRun(input: {
   /** Test seam: production creates its own managed backend pool. */
   backends?: Record<BackendId, AgentBackend>;
 }): Promise<string> {
-  const repoRoot = input.config.repoRoot;
+  const repoRoot = input.config.workspace.repoRoot;
   await ensureGitRepo(repoRoot);
   const goalFile = resolve(repoRoot, input.goalFile);
   const goal = readFileSync(goalFile, 'utf8');
   const leadBinding = resolveAgent('lead', input.config);
-  const baseSha = await revParse(repoRoot, input.config.baseRef);
+  const baseSha = await revParse(repoRoot, input.config.workspace.baseRef);
   const runId = input.runId ?? `${slug(basename(goalFile).replace(/\.[^.]+$/, ''))}-${new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14)}`;
-  const runDir = join(input.config.stateDir, 'runs', runId);
+  const runDir = join(input.config.workspace.stateDir, 'runs', runId);
   mkdirSync(runDir, { recursive: true });
 
   input.db.createRun({
     id: runId,
     repoRoot,
     goalFile,
-    baseRef: input.config.baseRef,
+    baseRef: input.config.workspace.baseRef,
     baseSha,
     adapter: leadBinding.backend
   });
@@ -61,11 +61,11 @@ export async function planRun(input: {
     process.once('SIGINT', onSignal);
     process.once('SIGHUP', onSignal);
     try {
-      for (let attempt = 1; attempt <= input.config.maxPlanAttempts; attempt += 1) {
+      for (let attempt = 1; attempt <= input.config.retry.maxPlanAttempts; attempt += 1) {
         if (interrupted) break;
         const registry = agentList(input.config);
         const prompt = leadPrompt({
-          goal, goalFile, repoRoot, baseRef: input.config.baseRef, baseSha,
+          goal, goalFile, repoRoot, baseRef: input.config.workspace.baseRef, baseSha,
           allowedCommandPrefixes: input.config.verification.allowedCommandPrefixes,
           agents: registry.map(({ name, backend, model, description }) => ({ name, backend, model, description }))
         }) + (priorError ? `

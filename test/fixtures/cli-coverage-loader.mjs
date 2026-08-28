@@ -7,7 +7,7 @@ const mockSources = {
         error.stack = undefined;
         throw error;
       }
-      return { repoRoot, stateDir: repoRoot + '/state', agents: {
+      return { version: 3, workspace: { repoRoot, stateDir: repoRoot + '/state', worktreesDir: repoRoot + '/worktrees', baseRef: 'HEAD', branchPrefix: 'agent-team' }, retry: { maxPlanAttempts: 2, maxWorkerAttempts: 2, maxReviewCycles: 2 }, status: { pollIntervalMs: 2000 }, agents: {
         'with-model': { backend: 'claude', model: 'alpha' },
         'without-model': { backend: 'opencode' }
       }, roles: {} };

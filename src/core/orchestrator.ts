@@ -185,7 +185,7 @@ async function executeTask(input: {
   let record = db.getTask(runId, input.record.taskId);
   const task = taskSpec(record);
   const run = db.getRun(runId);
-  const runDir = join(config.stateDir, 'runs', runId);
+  const runDir = join(config.workspace.stateDir, 'runs', runId);
   // Worker：Lead manifest 的 task.agent 优先（连带 model），否则用 plan 时固化的角色快照（回退当前 config）
   const workerBinding = resolveTaskAgent(task, config, run.rolesJson);
   const worktreeInfo = await ensureTaskWorktree({ config, db, runId, record, task, manifest: parseManifest(run.manifestJson) });
@@ -309,7 +309,7 @@ async function executeTask(input: {
   db.updateTask(runId, task.id, { reviewCycles: reviewCycle, reviewJson: JSON.stringify(review) });
   if (review.decision === 'changes_requested') {
     await unstageAll(worktreeInfo.path);
-    if (reviewCycle >= config.maxReviewCycles) {
+    if (reviewCycle >= config.retry.maxReviewCycles) {
       db.updateTask(runId, task.id, { status: 'failed', phase: 'review', lastError: reviewFeedback(review), finishedAt: new Date().toISOString() });
       db.addEvent(runId, task.id, 'REVIEW_LIMIT_REACHED', review);
     } else {
@@ -363,7 +363,7 @@ async function retryOrFail(input: {
   attempts: number;
   error: string;
 }): Promise<void> {
-  if (input.attempts >= input.config.maxWorkerAttempts) {
+  if (input.attempts >= input.config.retry.maxWorkerAttempts) {
     input.db.updateTask(input.runId, input.taskId, {
       status: 'failed', phase: 'retry-limit', lastError: input.error, finishedAt: new Date().toISOString()
     });
@@ -388,7 +388,7 @@ async function ensureTaskWorktree(input: {
     if (input.record.phase === 'interrupted' || input.record.phase === 'recovered') {
       if (!input.record.branch) throw new Error(`Interrupted task ${input.task.id} has no worktree branch`);
       await resetWorktree({
-        repoRoot: input.config.repoRoot,
+        repoRoot: input.config.workspace.repoRoot,
         path: input.record.worktree,
         branch: input.record.branch,
         baseSha: input.record.startSha
@@ -401,10 +401,10 @@ async function ensureTaskWorktree(input: {
     return { path: input.record.worktree, startSha: input.record.startSha };
   }
   const run = input.db.getRun(input.runId);
-  const repoName = safeSegment(basename(input.config.repoRoot));
-  const path = join(input.config.worktreesDir, repoName, safeSegment(input.runId), input.task.id);
-  const branch = `${input.config.branchPrefix}/${safeSegment(input.runId)}/${input.task.id}`;
-  await createWorktree({ repoRoot: input.config.repoRoot, path, branch, baseSha: run.baseSha });
+  const repoName = safeSegment(basename(input.config.workspace.repoRoot));
+  const path = join(input.config.workspace.worktreesDir, repoName, safeSegment(input.runId), input.task.id);
+  const branch = `${input.config.workspace.branchPrefix}/${safeSegment(input.runId)}/${input.task.id}`;
+  await createWorktree({ repoRoot: input.config.workspace.repoRoot, path, branch, baseSha: run.baseSha });
   const ancestorIds = collectAncestors(input.task.id, input.manifest.tasks);
   const ordered = topologicalTasks(input.manifest.tasks).filter((task) => ancestorIds.has(task.id));
   for (const dep of ordered) {
@@ -448,12 +448,12 @@ async function integrateRun(input: {
   const manifest = parseManifest(run.manifestJson);
   db.updateRun(runId, { status: 'integrating' });
   db.addEvent(runId, null, 'INTEGRATION_STARTED');
-  const repoName = safeSegment(basename(config.repoRoot));
-  const worktree = join(config.worktreesDir, repoName, safeSegment(runId), 'integration');
-  const branch = `${config.branchPrefix}/${safeSegment(runId)}/integration`;
-  await resetWorktree({ repoRoot: config.repoRoot, path: worktree, branch, baseSha: run.baseSha });
+  const repoName = safeSegment(basename(config.workspace.repoRoot));
+  const worktree = join(config.workspace.worktreesDir, repoName, safeSegment(runId), 'integration');
+  const branch = `${config.workspace.branchPrefix}/${safeSegment(runId)}/integration`;
+  await resetWorktree({ repoRoot: config.workspace.repoRoot, path: worktree, branch, baseSha: run.baseSha });
   db.updateRun(runId, { integrationBranch: branch, integrationWorktree: worktree });
-  const runDir = join(config.stateDir, 'runs', runId);
+  const runDir = join(config.workspace.stateDir, 'runs', runId);
   const integratorBinding = resolveAgentWithSnapshot('integrator', config, run.rolesJson);
   const integratorBackend = input.backends[integratorBinding.backend]!;
 

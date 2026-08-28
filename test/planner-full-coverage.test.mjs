@@ -20,13 +20,14 @@ function repository() {
 }
 
 function configFor(repoRoot, overrides = {}) {
+  const { workspace, retry, status, ...rest } = overrides;
   return {
     ...DEFAULT_CONFIG,
-    repoRoot,
-    stateDir: join(repoRoot, '.state'),
-    worktreesDir: join(repoRoot, '.worktrees'),
+    workspace: { ...DEFAULT_CONFIG.workspace, repoRoot, stateDir: join(repoRoot, '.state'), worktreesDir: join(repoRoot, '.worktrees'), ...workspace },
+    retry: { ...DEFAULT_CONFIG.retry, ...retry },
+    status: { ...DEFAULT_CONFIG.status, ...status },
     verification: { ...DEFAULT_CONFIG.verification, globalCommands: [] },
-    ...overrides
+    ...rest
   };
 }
 
@@ -57,9 +58,9 @@ test('planner stops a retry after repeated signals while passing configured lead
   const config = configFor(repoRoot, {
     agents: { lead: { backend: 'claude', model: 'test-model', maxTurns: 2 } },
     defaultAgent: 'lead',
-    maxPlanAttempts: 2
+    retry: { maxPlanAttempts: 2 }
   });
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new LeadBackend(async () => {
     process.emit('SIGTERM');
     process.emit('SIGTERM');
@@ -86,8 +87,8 @@ test('planner stops a retry after repeated signals while passing configured lead
 
 test('planner creates and disposes its managed backend pool when none is supplied', async () => {
   const repoRoot = repository();
-  const config = configFor(repoRoot, { maxPlanAttempts: 0 });
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const config = configFor(repoRoot, { retry: { maxPlanAttempts: 0 } });
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   try {
     await assert.rejects(
       planRun({ config, db, goalFile: 'goal.md', runId: 'managed-pool' }),

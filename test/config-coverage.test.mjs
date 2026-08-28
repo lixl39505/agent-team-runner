@@ -9,7 +9,7 @@ function repository(config) {
   const root = mkdtempSync(join(tmpdir(), 'agent-team-config-coverage-'));
   const directory = join(root, '.agent-team');
   mkdirSync(directory);
-  writeFileSync(join(directory, 'config.json'), JSON.stringify(config));
+  writeFileSync(join(directory, 'config.json'), JSON.stringify({ version: 3, workspace: {}, retry: {}, status: {}, ...config }));
   return root;
 }
 

@@ -23,18 +23,17 @@ async function repository() {
 }
 
 function configFor(repoRoot, overrides = {}) {
+  const { workspace, retry, status, ...rest } = overrides;
   const name = basename(repoRoot);
   return {
     ...DEFAULT_CONFIG,
-    repoRoot,
-    stateDir: join(tmpdir(), `${name}-state`),
-    worktreesDir: join(tmpdir(), `${name}-worktrees`),
+    workspace: { ...DEFAULT_CONFIG.workspace, repoRoot, stateDir: join(tmpdir(), `${name}-state`), worktreesDir: join(tmpdir(), `${name}-worktrees`), ...workspace },
     concurrency: 1,
-    maxWorkerAttempts: 2,
-    maxReviewCycles: 2,
+    retry: { ...DEFAULT_CONFIG.retry, maxWorkerAttempts: 2, maxReviewCycles: 2, ...retry },
+    status: { ...DEFAULT_CONFIG.status, ...status },
     integration: { ...DEFAULT_CONFIG.integration, runAgentAfterCherryPick: false },
     verification: { ...DEFAULT_CONFIG.verification, globalCommands: [] },
-    ...overrides
+    ...rest
   };
 }
 
@@ -96,9 +95,9 @@ function backendPool(backend) {
 }
 
 async function createPlannedRun(db, config, tasks = [task()], id = 'run') {
-  const baseSha = await currentHead(config.repoRoot);
+  const baseSha = await currentHead(config.workspace.repoRoot);
   const manifest = { version: 1, title: 'Run', summary: 'scheduler test', tasks };
-  db.createRun({ id, repoRoot: config.repoRoot, goalFile: 'goal.md', baseRef: 'HEAD', baseSha, adapter: 'claude' });
+  db.createRun({ id, repoRoot: config.workspace.repoRoot, goalFile: 'goal.md', baseRef: 'HEAD', baseSha, adapter: 'claude' });
   for (const spec of tasks) db.insertTask(id, spec);
   db.updateRun(id, {
     status: 'planned', manifestJson: JSON.stringify(manifest), rolesJson: JSON.stringify(snapshotAgents(config))
@@ -112,7 +111,7 @@ function eventTypes(db, runId = 'run') {
 test('orchestrator rejects invalid run states and no-ops completed runs', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new ScriptBackend(() => {
     throw new Error('agent must not start');
   });
@@ -141,7 +140,7 @@ test('orchestrator stops when a dependency has already failed or is blocked', as
   for (const status of ['failed', 'blocked']) {
     const repoRoot = await repository();
     const config = configFor(repoRoot);
-    const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+    const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
     const backend = new ScriptBackend(() => {
       throw new Error('dependent task must not start');
     });
@@ -164,7 +163,7 @@ test('orchestrator stops when a dependency has already failed or is blocked', as
 test('orchestrator records an invalid worker result as a task exception', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new ScriptBackend((spec) => {
     assert.equal(spec.role, 'worker');
     return { status: 'unknown' };
@@ -187,8 +186,8 @@ test('orchestrator records an invalid worker result as a task exception', async 
 
 test('orchestrator fails a task when reviewer feedback reaches the cycle limit', async () => {
   const repoRoot = await repository();
-  const config = configFor(repoRoot, { maxReviewCycles: 1 });
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const config = configFor(repoRoot, { retry: { maxReviewCycles: 1 } });
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new ScriptBackend((spec) => {
     if (spec.role === 'worker') {
       writeFileSync(join(spec.cwd, 'src', 'feature.txt'), 'changed\n', 'utf8');
@@ -216,7 +215,7 @@ test('orchestrator fails a task when reviewer feedback reaches the cycle limit',
 test('orchestrator reports pending work when concurrency leaves no runnable slot', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot, { concurrency: 0 });
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new ScriptBackend(() => {
     throw new Error('no worker slot is available');
   });
@@ -236,7 +235,7 @@ test('orchestrator reports pending work when concurrency leaves no runnable slot
 test('orchestrator records a blocked worker without starting a reviewer', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new ScriptBackend((spec) => {
     assert.equal(spec.role, 'worker');
     return { ...workerResult(), status: 'blocked', summary: 'cannot continue', blockedReason: 'missing credential' };
@@ -256,8 +255,8 @@ test('orchestrator records a blocked worker without starting a reviewer', async 
 
 test('orchestrator rejects reviewer changes to the task worktree', async () => {
   const repoRoot = await repository();
-  const config = configFor(repoRoot, { maxWorkerAttempts: 1 });
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const config = configFor(repoRoot, { retry: { maxWorkerAttempts: 1 } });
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new ScriptBackend((spec) => {
     if (spec.role === 'worker') {
       writeFileSync(join(spec.cwd, 'src', 'feature.txt'), 'worker change\n');

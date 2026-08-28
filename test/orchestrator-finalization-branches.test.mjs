@@ -25,13 +25,13 @@ async function repository(scripts = {}) {
 }
 
 function configFor(repoRoot, overrides = {}) {
-  const { integration, verification, ...rest } = overrides;
+  const { integration, verification, workspace, retry, status, ...rest } = overrides;
   const name = basename(repoRoot);
   return {
     ...DEFAULT_CONFIG,
-    repoRoot,
-    stateDir: join(tmpdir(), `${name}-state`),
-    worktreesDir: join(tmpdir(), `${name}-worktrees`),
+    workspace: { ...DEFAULT_CONFIG.workspace, repoRoot, stateDir: join(tmpdir(), `${name}-state`), worktreesDir: join(tmpdir(), `${name}-worktrees`), ...workspace },
+    retry: { ...DEFAULT_CONFIG.retry, ...retry },
+    status: { ...DEFAULT_CONFIG.status, ...status },
     concurrency: 1,
     integration: { ...DEFAULT_CONFIG.integration, allowedPaths: ['docs/**'], ...integration },
     verification: { ...DEFAULT_CONFIG.verification, globalCommands: [], ...verification },
@@ -93,30 +93,30 @@ function eventTypes(db, runId) {
 }
 
 async function createApprovedRun(db, config, id = 'run') {
-  const baseSha = await currentHead(config.repoRoot);
+  const baseSha = await currentHead(config.workspace.repoRoot);
   const manifest = { version: 1, title: 'Run', summary: 'test run', tasks: [task()] };
-  db.createRun({ id, repoRoot: config.repoRoot, goalFile: 'goal.md', baseRef: 'HEAD', baseSha, adapter: 'claude' });
+  db.createRun({ id, repoRoot: config.workspace.repoRoot, goalFile: 'goal.md', baseRef: 'HEAD', baseSha, adapter: 'claude' });
   db.insertTask(id, task());
   db.updateRun(id, {
     status: 'planned', manifestJson: JSON.stringify(manifest), rolesJson: JSON.stringify(snapshotAgents(config))
   });
-  mkdirSync(join(config.stateDir, 'runs', id), { recursive: true });
+  mkdirSync(join(config.workspace.stateDir, 'runs', id), { recursive: true });
 
   const seed = mkdtempSync(join(tmpdir(), 'agent-team-finalization-seed-'));
   const worktree = join(seed, 'task');
-  await git(config.repoRoot, ['worktree', 'add', '-q', '-b', `seed-${basename(seed)}`, worktree, baseSha]);
+  await git(config.workspace.repoRoot, ['worktree', 'add', '-q', '-b', `seed-${basename(seed)}`, worktree, baseSha]);
   writeFileSync(join(worktree, 'src', 'feature.txt'), 'implemented\n', 'utf8');
   await git(worktree, ['add', 'src/feature.txt']);
   await git(worktree, ['commit', '-q', '-m', 'task implementation']);
   const commitSha = await currentHead(worktree);
   db.updateTask(id, 'T001', { status: 'approved', phase: 'done', commitSha });
-  return { commitSha, runDir: join(config.stateDir, 'runs', id) };
+  return { commitSha, runDir: join(config.workspace.stateDir, 'runs', id) };
 }
 
 test('orchestrator finalizes without documentation changes and writes the terminal summary', async () => {
   const repoRoot = await repository({ verify: 'node -e ""' });
   const config = configFor(repoRoot, { verification: { globalCommands: ['npm run verify'] } });
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new ScriptBackend((spec) => {
     assert.equal(spec.role, 'integrator');
     assert.match(spec.label, /finalize$/);
@@ -141,7 +141,7 @@ test('orchestrator finalizes without documentation changes and writes the termin
 test('orchestrator revalidates and commits permitted finalizer documentation', async () => {
   const repoRoot = await repository({ verify: 'node -e ""' });
   const config = configFor(repoRoot, { verification: { globalCommands: ['npm run verify'] } });
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new ScriptBackend((spec) => {
     assert.equal(spec.role, 'integrator');
     mkdirSync(join(spec.cwd, 'docs'), { recursive: true });
@@ -167,7 +167,7 @@ test('orchestrator revalidates and commits permitted finalizer documentation', a
 test('orchestrator rejects finalizer documentation outside the integration policy', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new ScriptBackend((spec) => {
     writeFileSync(join(spec.cwd, 'outside.md'), 'not allowed\n', 'utf8');
     return integrationResult();
@@ -187,7 +187,7 @@ test('orchestrator rejects finalizer documentation outside the integration polic
 test('orchestrator stops before finalization when initial global verification fails', async () => {
   const repoRoot = await repository({ fail: 'node -e "process.exit(1)"' });
   const config = configFor(repoRoot, { verification: { globalCommands: ['npm run fail'] } });
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new ScriptBackend(() => {
     throw new Error('finalizer must not start after failed global verification');
   });
@@ -210,7 +210,7 @@ test('orchestrator rejects documentation when post-finalization global verificat
     verify: 'node -e "process.exit(require(\'node:fs\').existsSync(\'docs/progress.md\') ? 1 : 0)"'
   });
   const config = configFor(repoRoot, { verification: { globalCommands: ['npm run verify'] } });
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new ScriptBackend((spec) => {
     mkdirSync(join(spec.cwd, 'docs'), { recursive: true });
     writeFileSync(join(spec.cwd, 'docs', 'progress.md'), 'needs verification\n', 'utf8');
@@ -234,7 +234,7 @@ test('orchestrator rejects documentation when post-finalization global verificat
 test('orchestrator rejects a blocked finalizer result', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new ScriptBackend(() => ({
     ...integrationResult('blocked', 'documentation needs a decision'),
     blockedReason: 'documentation needs a decision'
@@ -254,7 +254,7 @@ test('orchestrator rejects a blocked finalizer result', async () => {
 test('orchestrator records a failed run when finalizer transport returns no result', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new ScriptBackend(() => ({
     ok: false, output: null, error: 'finalizer transport closed', timedOut: false, stalled: false
   }));
@@ -273,7 +273,7 @@ test('orchestrator records a failed run when finalizer transport returns no resu
 test('orchestrator rebuilds an interrupted integration worktree before finalization resumes', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const exitCode = process.exitCode;
   const interruptedBackend = new ScriptBackend((spec) => {
     assert.equal(spec.role, 'integrator');

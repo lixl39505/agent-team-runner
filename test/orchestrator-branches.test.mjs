@@ -23,18 +23,17 @@ async function repository() {
 }
 
 function configFor(repoRoot, overrides = {}) {
+  const { workspace, retry, status, ...rest } = overrides;
   const name = basename(repoRoot);
   return {
     ...DEFAULT_CONFIG,
-    repoRoot,
-    stateDir: join(tmpdir(), `${name}-state`),
-    worktreesDir: join(tmpdir(), `${name}-worktrees`),
+    workspace: { ...DEFAULT_CONFIG.workspace, repoRoot, stateDir: join(tmpdir(), `${name}-state`), worktreesDir: join(tmpdir(), `${name}-worktrees`), ...workspace },
     concurrency: 1,
-    maxWorkerAttempts: 2,
-    maxReviewCycles: 2,
+    retry: { ...DEFAULT_CONFIG.retry, maxWorkerAttempts: 2, maxReviewCycles: 2, ...retry },
+    status: { ...DEFAULT_CONFIG.status, ...status },
     integration: { ...DEFAULT_CONFIG.integration, runAgentAfterCherryPick: false },
     verification: { ...DEFAULT_CONFIG.verification, globalCommands: [] },
-    ...overrides
+    ...rest
   };
 }
 
@@ -90,9 +89,9 @@ function backendPool(backend) {
 }
 
 async function createPlannedRun(db, config, id = 'run') {
-  const baseSha = await currentHead(config.repoRoot);
+  const baseSha = await currentHead(config.workspace.repoRoot);
   const manifest = { version: 1, title: 'Run', summary: 'test run', tasks: [task()] };
-  db.createRun({ id, repoRoot: config.repoRoot, goalFile: 'goal.md', baseRef: 'HEAD', baseSha, adapter: 'claude' });
+  db.createRun({ id, repoRoot: config.workspace.repoRoot, goalFile: 'goal.md', baseRef: 'HEAD', baseSha, adapter: 'claude' });
   db.insertTask(id, task());
   db.updateRun(id, {
     status: 'planned', manifestJson: JSON.stringify(manifest), rolesJson: JSON.stringify(snapshotAgents(config))
@@ -107,7 +106,7 @@ function eventTypes(db, runId) {
 test('orchestrator retries missing worker output and a failed worker result until the retry limit', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   let workers = 0;
   const backend = new ScriptBackend((spec) => {
     assert.equal(spec.role, 'worker');
@@ -137,7 +136,7 @@ test('orchestrator retries missing worker output and a failed worker result unti
 test('orchestrator retries a reviewer transport failure and then integrates the approved retry', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   let workers = 0;
   let reviews = 0;
   const backend = new ScriptBackend((spec) => {
@@ -173,7 +172,7 @@ test('orchestrator retries a reviewer transport failure and then integrates the 
 test('orchestrator resumes a failed run by resetting its interrupted worktree before retrying', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new ScriptBackend((spec) => {
     if (spec.role === 'worker') {
       assert.equal(readFileSync(join(spec.cwd, 'src', 'feature.txt'), 'utf8'), 'base\n');
@@ -185,9 +184,9 @@ test('orchestrator resumes a failed run by resetting its interrupted worktree be
   });
   try {
     const baseSha = await createPlannedRun(db, config);
-    const worktree = join(config.worktreesDir, basename(repoRoot), 'run', 'T001');
-    const branch = `${config.branchPrefix}/run/T001`;
-    mkdirSync(join(config.worktreesDir, basename(repoRoot), 'run'), { recursive: true });
+    const worktree = join(config.workspace.worktreesDir, basename(repoRoot), 'run', 'T001');
+    const branch = `${config.workspace.branchPrefix}/run/T001`;
+    mkdirSync(join(config.workspace.worktreesDir, basename(repoRoot), 'run'), { recursive: true });
     await git(repoRoot, ['worktree', 'add', '-q', '-b', branch, worktree, baseSha]);
     writeFileSync(join(worktree, 'src', 'feature.txt'), 'abandoned\n', 'utf8');
     db.updateTask('run', 'T001', {

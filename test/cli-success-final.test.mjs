@@ -11,6 +11,8 @@ function repository() {
   const root = mkdtempSync(join(tmpdir(), 'agent-team-cli-success-final-'));
   const initialized = spawnSync('git', ['init', '-q', root], { encoding: 'utf8' });
   assert.equal(initialized.status, 0, initialized.stderr);
+  mkdirSync(join(root, '.agent-team'), { recursive: true });
+  writeFileSync(join(root, '.agent-team', 'config.json'), JSON.stringify({ version: 3, workspace: {}, retry: {}, status: {} }));
   return root;
 }
 
@@ -63,7 +65,10 @@ function writeConfig(repo, codexCommand, model) {
   const stateDir = join(repo, '.agent-team');
   mkdirSync(stateDir, { recursive: true });
   writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
-    stateDir: '.agent-team',
+    version: 3,
+    workspace: { stateDir: '.agent-team' },
+    retry: {},
+    status: {},
     defaultAgent: 'local-agent',
     agents: { 'local-agent': { backend: 'codex', ...(model ? { model } : {}) } },
     roles: {},
@@ -160,7 +165,7 @@ test('init preserves an existing configuration and skills handles unknown and ex
   const repo = repository();
   try {
     const configDir = join(repo, '.agent-team');
-    const existing = 'version: 2\ndefaultAgent: existing-agent\n';
+    const existing = 'version: 3\nworkspace: {}\nretry: {}\nstatus: {}\ndefaultAgent: existing-agent\n';
     mkdirSync(configDir, { recursive: true });
     writeFileSync(join(configDir, 'config.yml'), existing, 'utf8');
 

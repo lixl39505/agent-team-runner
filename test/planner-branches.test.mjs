@@ -22,10 +22,8 @@ async function repository() {
 function configFor(repoRoot, maxPlanAttempts = 2) {
   return {
     ...DEFAULT_CONFIG,
-    repoRoot,
-    stateDir: join(tmpdir(), `${repoRoot.split('/').at(-1)}-state`),
-    worktreesDir: join(tmpdir(), `${repoRoot.split('/').at(-1)}-worktrees`),
-    maxPlanAttempts,
+    workspace: { ...DEFAULT_CONFIG.workspace, repoRoot, stateDir: join(tmpdir(), `${repoRoot.split('/').at(-1)}-state`), worktreesDir: join(tmpdir(), `${repoRoot.split('/').at(-1)}-worktrees`) },
+    retry: { ...DEFAULT_CONFIG.retry, maxPlanAttempts },
     verification: { ...DEFAULT_CONFIG.verification, globalCommands: [] }
   };
 }
@@ -78,7 +76,7 @@ function eventTypes(db, runId) {
 test('planner retries after a lead produces no structured output', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new ScriptBackend((attempt) => attempt === 1
     ? { ok: true, output: null, timedOut: false, stalled: false }
     : { ok: true, output: manifest(), timedOut: false, stalled: false });
@@ -98,7 +96,7 @@ test('planner retries after a lead produces no structured output', async () => {
 test('planner records a failed run after every lead retry has no output', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new ScriptBackend(() => ({
     ok: false, output: null, error: 'lead backend unavailable', timedOut: false, stalled: false
   }));

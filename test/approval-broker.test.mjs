@@ -89,6 +89,21 @@ test('ApprovalQueue serializes questions with approvals and returns structured a
   });
 });
 
+test('ApprovalQueue alerts only when an approval or question becomes active', async () => {
+  const alerts = [];
+  const queue = new ApprovalQueue(
+    async () => 'o',
+    () => {},
+    (kind) => alerts.push(kind)
+  );
+  await queue.request(request('approval'));
+  await queue.requestUserInput({
+    backend: 'claude', role: 'worker', cwd: '/repo',
+    questions: [{ id: 'continue', question: 'Continue?' }]
+  });
+  assert.deepEqual(alerts, ['approval', 'question']);
+});
+
 test('ApprovalQueue handles headings, invalid selections, custom input, and aborted active prompts', async () => {
   const answers = ['', '9', '2', 'custom', 'free text'];
   const output = [];

@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { createInterface, type Interface } from 'node:readline/promises';
 import type { Readable, Writable } from 'node:stream';
 import type { AgentRole, BackendId } from '../core/types.js';
@@ -49,6 +50,17 @@ export type UserInputAnswers = Record<string, string[]>;
 export type UserInputHandler = (request: UserInputRequest, signal?: AbortSignal) => Promise<UserInputAnswers>;
 
 type Ask = (prompt: string, signal?: AbortSignal) => Promise<string>;
+type Attention = (kind: 'approval' | 'question') => void;
+type Notify = (title: string, message: string) => void;
+export interface TerminalAlertColors {
+  background: string;
+  foreground: string;
+}
+
+const DEFAULT_ALERT_COLORS: TerminalAlertColors = {
+  background: '#7C3AED',
+  foreground: '#FFFFFF'
+};
 
 /** Serializes concurrent backend requests so only one prompt owns stdin at a time. */
 export class ApprovalQueue {
@@ -56,7 +68,8 @@ export class ApprovalQueue {
 
   constructor(
     private readonly ask: Ask,
-    private readonly write: (text: string) => void
+    private readonly write: (text: string) => void,
+    private readonly attention?: Attention
   ) {}
 
   request: ApprovalHandler = async (request, signal) => {
@@ -77,6 +90,7 @@ export class ApprovalQueue {
   }
 
   private async promptApproval(request: ApprovalRequest, signal?: AbortSignal): Promise<ApprovalDecision> {
+    this.attention?.('approval');
     this.write(formatApproval(request));
     while (true) {
       const choices = request.allowSession ? '[o] once  [s] session  [d] deny: ' : '[o] once  [d] deny: ';
@@ -89,6 +103,7 @@ export class ApprovalQueue {
   }
 
   private async promptUserInput(request: UserInputRequest, signal?: AbortSignal): Promise<UserInputAnswers> {
+    this.attention?.('question');
     this.write(formatUserInputHeading(request));
     const answers: UserInputAnswers = {};
     for (const question of request.questions) {
@@ -162,13 +177,25 @@ export class TerminalApprovalBroker {
   readonly requestUserInput: UserInputHandler;
   private readonly readline: Interface;
 
-  constructor(input: Readable = process.stdin, output: Writable = process.stdout) {
+  constructor(
+    input: Readable = process.stdin,
+    output: Writable = process.stdout,
+    colors: TerminalAlertColors = DEFAULT_ALERT_COLORS,
+    notify: Notify = sendSystemNotification
+  ) {
     this.readline = createInterface({ input, output, terminal: true });
     const queue = new ApprovalQueue(
       async (prompt, signal) => signal
         ? await this.readline.question(prompt, { signal })
         : await this.readline.question(prompt),
-      (text) => output.write(text)
+      (text) => output.write(text),
+      (kind) => {
+        if (!(output as Writable & { isTTY?: boolean }).isTTY) return;
+        const label = kind === 'approval' ? 'Approval required' : 'Answer required';
+        const message = 'Agent Team Runner needs your input.';
+        output.write(`\n${alertStyle(colors)} ${label}: human input needed \x1b[0m\n`);
+        notify('Agent Team Runner', `${label}. ${message}`);
+      }
     );
     this.request = queue.request;
     this.requestUserInput = queue.requestUserInput;
@@ -177,6 +204,36 @@ export class TerminalApprovalBroker {
   close(): void {
     this.readline.close();
   }
+}
+
+function alertStyle(colors: TerminalAlertColors): string {
+  const foreground = hexToRgb(colors.foreground);
+  const background = hexToRgb(colors.background);
+  return `\x1b[1;38;2;${foreground.join(';')};48;2;${background.join(';')}m`;
+}
+
+function hexToRgb(color: string): [number, number, number] {
+  return [
+    Number.parseInt(color.slice(1, 3), 16),
+    Number.parseInt(color.slice(3, 5), 16),
+    Number.parseInt(color.slice(5, 7), 16)
+  ];
+}
+
+function sendSystemNotification(title: string, message: string): void {
+  if (process.platform === 'darwin') {
+    const script = `display notification "${escapeAppleScript(message)}" with title "${escapeAppleScript(title)}" sound name "Glass"`;
+    const child = spawn('osascript', ['-e', script], { detached: true, stdio: 'ignore' });
+    child.once('error', () => {});
+    child.unref();
+    return;
+  }
+  // OSC 9 is a widely supported terminal desktop-notification escape sequence.
+  process.stdout.write(`\x1b]9;${message}\x07`);
+}
+
+function escapeAppleScript(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
 function formatUserInputHeading(request: UserInputRequest): string {

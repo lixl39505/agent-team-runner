@@ -97,8 +97,11 @@ function config() {
   const stateDir = mkdtempSync(join(tmpdir(), 'agent-team-orchestrator-matrix-'));
   mkdirSync(join(stateDir, 'runs', 'run'), { recursive: true });
   return {
-    repoRoot: '/repo', stateDir, worktreesDir: join(stateDir, 'worktrees'), branchPrefix: 'agent-team', concurrency: 1,
-    maxWorkerAttempts: 1, maxReviewCycles: 2, taskTimeoutMs: 1, staleAfterMs: 1,
+    version: 3,
+    workspace: { repoRoot: '/repo', stateDir, worktreesDir: join(stateDir, 'worktrees'), baseRef: 'HEAD', branchPrefix: 'agent-team' },
+    retry: { maxPlanAttempts: 2, maxWorkerAttempts: 1, maxReviewCycles: 2 },
+    status: { pollIntervalMs: 2000 },
+    concurrency: 1, taskTimeoutMs: 1, staleAfterMs: 1,
     integration: { allowedPaths: ['docs/**'], runAgentAfterCherryPick: false }, verification: { globalCommands: [] }
   };
 }

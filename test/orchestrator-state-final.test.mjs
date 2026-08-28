@@ -26,9 +26,7 @@ function configFor(repoRoot) {
   const name = basename(repoRoot);
   return {
     ...DEFAULT_CONFIG,
-    repoRoot,
-    stateDir: join(tmpdir(), `${name}-state`),
-    worktreesDir: join(tmpdir(), `${name}-worktrees`),
+    workspace: { ...DEFAULT_CONFIG.workspace, repoRoot, stateDir: join(tmpdir(), `${name}-state`), worktreesDir: join(tmpdir(), `${name}-worktrees`) },
     concurrency: 1,
     agents: {
       'task-worker': { backend: 'codex', model: 'worker-model' },
@@ -115,7 +113,7 @@ async function approvedCommit(repoRoot, baseSha, branch, file, content) {
 test('orchestrator preserves bound state through verification, review, recursive dependencies, and finalization', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const approval = async () => 'once';
   const userInput = async () => ({});
   const worker = new ScriptBackend('codex', (spec) => {
@@ -156,7 +154,7 @@ test('orchestrator preserves bound state through verification, review, recursive
       requestUserInput: userInput
     });
 
-    const runDir = join(config.stateDir, 'runs', 'run');
+    const runDir = join(config.workspace.stateDir, 'runs', 'run');
     const started = db.db.prepare("SELECT payload_json FROM events WHERE run_id = ? AND event_type = 'WORKER_STARTED'").get('run');
     assert.deepEqual(JSON.parse(started.payload_json), { attempts: 1, agent: 'task-worker', backend: 'codex', model: 'worker-model' });
     assert.equal(db.getRun('run').status, 'done');

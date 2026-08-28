@@ -2,23 +2,32 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import type { AgentEntry, RunnerConfig } from './types.js';
-import { migrateV1Fields } from './agent-config.js';
 
 export const DEFAULT_CONFIG: RunnerConfig = {
-  version: 2,
-  repoRoot: '.',
-  stateDir: '.agent-team',
-  worktreesDir: '../.agent-team-worktrees',
-  baseRef: 'HEAD',
+  version: 3,
   defaultAgent: 'default-claude',
   concurrency: 3,
-  pollIntervalMs: 2000,
   staleAfterMs: 10 * 60 * 1000,
   taskTimeoutMs: 2 * 60 * 60 * 1000,
-  maxPlanAttempts: 2,
-  maxWorkerAttempts: 2,
-  maxReviewCycles: 2,
-  branchPrefix: 'agent-team',
+  workspace: {
+    repoRoot: '.',
+    stateDir: '.agent-team',
+    worktreesDir: '../.agent-team-worktrees',
+    baseRef: 'HEAD',
+    branchPrefix: 'agent-team'
+  },
+  retry: {
+    maxPlanAttempts: 2,
+    maxWorkerAttempts: 2,
+    maxReviewCycles: 2
+  },
+  status: {
+    pollIntervalMs: 2000
+  },
+  interactionAlert: {
+    background: '#7C3AED',
+    foreground: '#FFFFFF'
+  },
   backends: {
     claude: { nativeWindowsSandbox: 'require' },
     codex: { nativeWindowsSandbox: 'require' },
@@ -88,22 +97,34 @@ export function initConfig(repoRoot: string): string {
 }
 
 function defaultConfigYaml(): string {
-  return `# Agent Team Runner 配置 (v2)
+  return `# Agent Team Runner 配置 (v3)
 # agent = 后端 + model 的具名组合；角色引用注册表中的 agent 名。
-version: 2
-repoRoot: .
-stateDir: .agent-team
-worktreesDir: ../.agent-team-worktrees
-baseRef: HEAD
+version: 3
+
+# 常用控制
 defaultAgent: default-claude
 concurrency: 3
-pollIntervalMs: 2000
 staleAfterMs: 600000
 taskTimeoutMs: 7200000
-maxPlanAttempts: 2
-maxWorkerAttempts: 2
-maxReviewCycles: 2
-branchPrefix: agent-team
+interactionAlert:
+  background: '#7C3AED'
+  foreground: '#FFFFFF'
+
+# 仓库与 Worktree
+workspace:
+  repoRoot: .
+  stateDir: .agent-team
+  worktreesDir: ../.agent-team-worktrees
+  baseRef: HEAD
+  branchPrefix: agent-team
+
+# 重试与状态刷新
+retry:
+  maxPlanAttempts: 2
+  maxWorkerAttempts: 2
+  maxReviewCycles: 2
+status:
+  pollIntervalMs: 2000
 
 # 后端接线：CLI 命令缺省用 backend 名本身
 backends:
@@ -169,27 +190,10 @@ export function loadConfig(inputRepoRoot: string): RunnerConfig {
   const repoRoot = resolve(inputRepoRoot);
   const { raw, file } = readRawConfig(repoRoot);
 
-  // v1 配置（adapters/defaultAdapter/models 字段）在内存内迁移成 v2，不重写磁盘
-  const migration = migrateV1Fields(raw);
-  if (migration && file) {
-    console.error([
-      `warning: ${file} uses the v1 config format (adapters/defaultAdapter/models).`,
-      'It was translated in memory; equivalent v2 config:',
-      ...migration.v2Yaml.split('\n').map((line) => `  ${line}`),
-      'Please migrate the file to version: 2.'
-    ].join('\n'));
+  if (file && raw.version !== 3) {
+    throw new Error(`Config file ${file ?? configPath(repoRoot)} must declare version: 3`);
   }
   const effective: Record<string, unknown> = { ...raw };
-  if (migration) {
-    delete effective.adapters;
-    delete effective.defaultAdapter;
-    delete effective.models;
-    effective.backends = migration.backends;
-    effective.agents = migration.agents;
-    effective.roles = migration.roles;
-    effective.defaultAgent = migration.defaultAgent;
-    effective.version = 2;
-  }
 
   const merged: RunnerConfig = {
     ...DEFAULT_CONFIG,
@@ -203,6 +207,22 @@ export function loadConfig(inputRepoRoot: string): RunnerConfig {
       ? { ...(effective.agents as Record<string, AgentEntry>) }
       : { ...DEFAULT_CONFIG.agents },
     roles: { ...(effective.roles as Record<string, string> | undefined) },
+    workspace: {
+      ...DEFAULT_CONFIG.workspace,
+      ...(effective.workspace as object | undefined)
+    },
+    retry: {
+      ...DEFAULT_CONFIG.retry,
+      ...(effective.retry as object | undefined)
+    },
+    status: {
+      ...DEFAULT_CONFIG.status,
+      ...(effective.status as object | undefined)
+    },
+    interactionAlert: {
+      ...DEFAULT_CONFIG.interactionAlert,
+      ...(effective.interactionAlert as object | undefined)
+    },
     verification: {
       ...DEFAULT_CONFIG.verification,
       ...(effective.verification as object | undefined)
@@ -224,10 +244,11 @@ export function loadConfig(inputRepoRoot: string): RunnerConfig {
       throw new Error(`backends.${id}.nativeWindowsSandbox must be "require" or "allow-degraded"`);
     }
   }
+  validateInteractionAlert(merged);
 
-  merged.repoRoot = resolve(repoRoot, merged.repoRoot);
-  merged.stateDir = resolvePath(merged.repoRoot, merged.stateDir);
-  merged.worktreesDir = resolvePath(merged.repoRoot, merged.worktreesDir);
+  merged.workspace.repoRoot = resolve(repoRoot, merged.workspace.repoRoot);
+  merged.workspace.stateDir = resolvePath(merged.workspace.repoRoot, merged.workspace.stateDir);
+  merged.workspace.worktreesDir = resolvePath(merged.workspace.repoRoot, merged.workspace.worktreesDir);
   return merged;
 }
 
@@ -254,7 +275,16 @@ export function applyOverrides(config: RunnerConfig, overrides: ConfigOverride[]
     }
     target[segments[segments.length - 1]!] = parseOverrideValue(value);
   }
+  validateInteractionAlert(config);
   return config;
+}
+
+function validateInteractionAlert(config: RunnerConfig): void {
+  for (const [name, value] of Object.entries(config.interactionAlert)) {
+    if (typeof value !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(value)) {
+      throw new Error(`interactionAlert.${name} must be a #RRGGBB color`);
+    }
+  }
 }
 
 function parseOverrideValue(value: string): unknown {

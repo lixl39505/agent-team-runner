@@ -27,15 +27,16 @@ async function repository(prefix) {
 }
 
 function configFor(repoRoot, overrides = {}) {
+  const { workspace, retry, status, ...rest } = overrides;
   const name = basename(repoRoot);
   return {
     ...DEFAULT_CONFIG,
-    repoRoot,
-    stateDir: join(tmpdir(), `${name}-state`),
-    worktreesDir: join(tmpdir(), `${name}-worktrees`),
+    workspace: { ...DEFAULT_CONFIG.workspace, repoRoot, stateDir: join(tmpdir(), `${name}-state`), worktreesDir: join(tmpdir(), `${name}-worktrees`), ...workspace },
+    retry: { ...DEFAULT_CONFIG.retry, ...retry },
+    status: { ...DEFAULT_CONFIG.status, ...status },
     concurrency: 1,
     verification: { ...DEFAULT_CONFIG.verification, globalCommands: [] },
-    ...overrides
+    ...rest
   };
 }
 
@@ -108,7 +109,7 @@ test('orchestrator injects recursive dependencies, records bound agents, and dis
     defaultAgent: 'default-codex',
     integration: { ...DEFAULT_CONFIG.integration, runAgentAfterCherryPick: true }
   });
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new FixedBackend();
   try {
     const baseSha = await currentHead(repoRoot);
@@ -201,7 +202,10 @@ createInterface({ input: process.stdin }).on('line', (line) => {
 function writeCliConfig(repoRoot, command) {
   mkdirSync(join(repoRoot, '.agent-team'), { recursive: true });
   writeFileSync(join(repoRoot, '.agent-team', 'config.json'), JSON.stringify({
-    stateDir: '.agent-team',
+    version: 3,
+    workspace: { stateDir: '.agent-team' },
+    retry: {},
+    status: {},
     defaultAgent: 'mock-agent',
     agents: { 'mock-agent': { backend: 'codex' } },
     roles: {},

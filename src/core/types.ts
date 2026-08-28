@@ -60,21 +60,31 @@ export interface AgentSnapshot {
 }
 
 export interface RunnerConfig {
-  version: 2;
-  repoRoot: string;
-  stateDir: string;
-  worktreesDir: string;
-  baseRef: string;
+  version: 3;
   /** 缺省 agent（agents 注册表名），未配置的角色回退到它 */
   defaultAgent: string;
   concurrency: number;
-  pollIntervalMs: number;
   staleAfterMs: number;
   taskTimeoutMs: number;
-  maxPlanAttempts: number;
-  maxWorkerAttempts: number;
-  maxReviewCycles: number;
-  branchPrefix: string;
+  workspace: {
+    repoRoot: string;
+    stateDir: string;
+    worktreesDir: string;
+    baseRef: string;
+    branchPrefix: string;
+  };
+  retry: {
+    maxPlanAttempts: number;
+    maxWorkerAttempts: number;
+    maxReviewCycles: number;
+  };
+  status: {
+    pollIntervalMs: number;
+  };
+  interactionAlert: {
+    background: string;
+    foreground: string;
+  };
   backends: Record<BackendId, BackendConfig>;
   /** agent 注册表：名 → {backend, model, ...} */
   agents: Record<string, AgentEntry>;

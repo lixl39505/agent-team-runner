@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULT_CONFIG, applyOverrides, loadConfig } from '../src/core/config.ts';
-import { backendCommand, migrateV1Fields, parseInlineAgentSpec, validateAgents } from '../src/core/agent-config.ts';
+import { backendCommand, parseInlineAgentSpec, validateAgents } from '../src/core/agent-config.ts';
 import { StateDatabase } from '../src/core/db.ts';
 import { planRun } from '../src/core/planner.ts';
 import { runCommand, splitCommand } from '../src/core/shell.ts';
@@ -46,9 +46,7 @@ function manifest() {
 function plannerConfig(repoRoot) {
   return {
     ...DEFAULT_CONFIG,
-    repoRoot,
-    stateDir: join(repoRoot, '.state'),
-    worktreesDir: join(repoRoot, '.worktrees'),
+    workspace: { ...DEFAULT_CONFIG.workspace, repoRoot, stateDir: join(repoRoot, '.state'), worktreesDir: join(repoRoot, '.worktrees') },
     verification: { ...DEFAULT_CONFIG.verification, globalCommands: [] }
   };
 }
@@ -76,7 +74,7 @@ class FakeLeadBackend {
 test('planner generates a fallback slug and records signal interruption without a real backend', async () => {
   const repo = repository();
   const config = plannerConfig(repo);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const success = new FakeLeadBackend(async () => ({ ok: true, output: manifest(), timedOut: false, stalled: false }));
   const pool = { claude: success, codex: success, opencode: success };
   try {
@@ -145,28 +143,15 @@ test('validation preserves optional values, defaults omissions, and rejects path
   assert.equal(validateIntegrationResult({ status: 'failed', blockedReason: 'conflict' }).blockedReason, 'conflict');
 });
 
-test('config and v1 agent migration handle absent files, malformed references, and slug collisions', () => {
+test('config rejects legacy versions and handles malformed references', () => {
   const repo = mkdtempSync(join(tmpdir(), 'agent-team-config-final-'));
   try {
-    assert.equal(loadConfig(repo).repoRoot, repo);
+    assert.equal(loadConfig(repo).version, 3);
     mkdirSync(join(repo, '.agent-team'));
-    writeFileSync(join(repo, '.agent-team', 'config.yaml'), 'defaultAgent: missing\nagents: {}\n');
+    writeFileSync(join(repo, '.agent-team', 'config.yaml'), 'version: 3\nworkspace: {}\nretry: {}\nstatus: {}\ndefaultAgent: missing\nagents: {}\n');
     assert.equal(loadConfig(repo).defaultAgent, 'missing');
     const overridden = applyOverrides({ ...DEFAULT_CONFIG, roles: null }, [{ key: 'roles.lead', value: 'named' }]);
     assert.equal(overridden.roles.lead, 'named');
-
-    const migrated = migrateV1Fields({
-      adapters: {
-        claude: { extraArgs: ['--quiet'] }, codex: { command: 'codex' }, opencode: {}
-      },
-      models: { slash: 'a/b', dash: 'a-b' },
-      roles: { lead: 'codex.slash', worker: 'codex.dash', ignored: '', malformed: 'claude' },
-      defaultAdapter: 'codex'
-    });
-    assert.deepEqual(migrated.agents['codex-a-b'], { backend: 'codex', model: 'a/b' });
-    assert.deepEqual(migrated.agents['codex-a-b-2'], { backend: 'codex', model: 'a-b' });
-    assert.equal(migrated.roles.worker, 'codex-a-b-2');
-    assert.match(migrated.v2Yaml, /defaultAgent: default-codex/);
 
     assert.equal(backendCommand({ ...DEFAULT_CONFIG, backends: { ...DEFAULT_CONFIG.backends, codex: { command: '   ' } } }, 'codex'), 'codex');
     assert.equal(parseInlineAgentSpec('claude.model.with.dots').model, 'model.with.dots');

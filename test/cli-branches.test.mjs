@@ -13,6 +13,8 @@ function repository() {
   const root = mkdtempSync(join(tmpdir(), 'agent-team-cli-branches-'));
   const initialized = spawnSync('git', ['init', '-q', root], { encoding: 'utf8' });
   assert.equal(initialized.status, 0, initialized.stderr);
+  mkdirSync(join(root, '.agent-team'), { recursive: true });
+  writeFileSync(join(root, '.agent-team', 'config.json'), JSON.stringify({ version: 3, workspace: {}, retry: {}, status: {} }));
   return root;
 }
 
@@ -124,21 +126,24 @@ test('CLI applies repeated overrides, rejects malformed overrides, and displays 
 
     const repeated = await cli([
       'list', '--repo', repo,
-      '-c', `stateDir=${join(repo, 'unused-state')}`,
-      '-c', `stateDir=${alternateStateDir}`
+      '-c', `workspace.stateDir=${join(repo, 'unused-state')}`,
+      '-c', `workspace.stateDir=${alternateStateDir}`
     ]);
     assert.equal(repeated.code, 0, repeated.stderr);
     assert.match(repeated.stdout, /^watched-run\trunning\t/m);
 
-    const malformed = await cli(['list', '--repo', repo, '-c', 'stateDir']);
+    const malformed = await cli(['list', '--repo', repo, '-c', 'workspace.stateDir']);
     assert.notEqual(malformed.code, 0);
-    assert.match(malformed.stderr, /Invalid -c override "stateDir": expected <path>=<value>/);
+    assert.match(malformed.stderr, /Invalid -c override "workspace.stateDir": expected <path>=<value>/);
 
     const missingCommand = `agent-team-missing-${process.pid}`;
     const configDir = join(repo, '.agent-team');
     mkdirSync(configDir, { recursive: true });
     writeFileSync(join(configDir, 'config.json'), JSON.stringify({
-      stateDir: alternateStateDir,
+      version: 3,
+      workspace: { stateDir: alternateStateDir },
+      retry: {},
+      status: {},
       backends: {
         claude: { command: missingCommand },
         codex: { command: missingCommand },

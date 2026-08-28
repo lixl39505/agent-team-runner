@@ -23,17 +23,17 @@ async function repository() {
 }
 
 function configFor(repoRoot, overrides = {}) {
+  const { workspace, retry, status, ...rest } = overrides;
   const name = basename(repoRoot);
   return {
     ...DEFAULT_CONFIG,
-    repoRoot,
-    stateDir: join(tmpdir(), `${name}-state`),
-    worktreesDir: join(tmpdir(), `${name}-worktrees`),
+    workspace: { ...DEFAULT_CONFIG.workspace, repoRoot, stateDir: join(tmpdir(), `${name}-state`), worktreesDir: join(tmpdir(), `${name}-worktrees`), ...workspace },
     concurrency: 1,
-    maxWorkerAttempts: 2,
+    retry: { ...DEFAULT_CONFIG.retry, maxWorkerAttempts: 2, ...retry },
+    status: { ...DEFAULT_CONFIG.status, ...status },
     integration: { ...DEFAULT_CONFIG.integration, runAgentAfterCherryPick: false },
     verification: { ...DEFAULT_CONFIG.verification, globalCommands: [] },
-    ...overrides
+    ...rest
   };
 }
 
@@ -99,9 +99,9 @@ function backendPool(backend) {
 }
 
 async function createPlannedRun(db, config, tasks, id = 'run') {
-  const baseSha = await currentHead(config.repoRoot);
+  const baseSha = await currentHead(config.workspace.repoRoot);
   const manifest = { version: 1, title: 'Run', summary: 'test run', tasks };
-  db.createRun({ id, repoRoot: config.repoRoot, goalFile: 'goal.md', baseRef: 'HEAD', baseSha, adapter: 'claude' });
+  db.createRun({ id, repoRoot: config.workspace.repoRoot, goalFile: 'goal.md', baseRef: 'HEAD', baseSha, adapter: 'claude' });
   for (const spec of tasks) db.insertTask(id, spec);
   db.updateRun(id, {
     status: 'planned', manifestJson: JSON.stringify(manifest), rolesJson: JSON.stringify(snapshotAgents(config))
@@ -122,7 +122,7 @@ async function createConflictingCommit(repoRoot, baseSha, id, content) {
 async function createApprovedConflictRun(handler) {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const tasks = [task('T001'), task('T002')];
   const baseSha = await createPlannedRun(db, config, tasks);
   const firstCommit = await createConflictingCommit(repoRoot, baseSha, 'T001', 'first\n');
@@ -135,7 +135,7 @@ async function createApprovedConflictRun(handler) {
 test('orchestrator marks an active task interrupted and discards its attempt', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const exitCode = process.exitCode;
   const backend = new ScriptBackend((spec) => {
     assert.equal(spec.role, 'worker');
@@ -162,7 +162,7 @@ test('orchestrator marks an active task interrupted and discards its attempt', a
 test('orchestrator reports a persisted DAG with no executable task', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new ScriptBackend(() => {
     throw new Error('no agent should be started for an unrunnable graph');
   });

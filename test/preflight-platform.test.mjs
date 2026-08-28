@@ -11,7 +11,7 @@ function input(platform) {
   const claude = new FakeBackend({}, [], 'claude');
   claude.checkPlatform = async () => platform;
   return {
-    config: { ...DEFAULT_CONFIG, stateDir: mkdtempSync(join(tmpdir(), 'agent-team-preflight-platform-')) },
+    config: { ...DEFAULT_CONFIG, workspace: { ...DEFAULT_CONFIG.workspace, stateDir: mkdtempSync(join(tmpdir(), 'agent-team-preflight-platform-')) } },
     backends: { claude, codex: new FakeBackend({}, [], 'codex'), opencode: new FakeBackend({}, [], 'opencode') },
     bindings: [{ agent: 'test', backend: 'claude', source: 'test' }]
   };

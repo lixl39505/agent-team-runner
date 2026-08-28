@@ -44,7 +44,7 @@ export function bindingsForRun(config: RunnerConfig, rolesJson: string | null, m
 export async function checkAgentAvailability(input: PreflightInput): Promise<PreflightResult> {
   const errors: string[] = [];
   const warnings: string[] = [];
-  const cache = new ProbeCache(join(input.config.stateDir, 'preflight-cache.json'));
+  const cache = new ProbeCache(join(input.config.workspace.stateDir, 'preflight-cache.json'));
 
   const backendIds = [...new Set(input.bindings.map((binding) => binding.backend))];
   const versions = new Map<BackendId, string | undefined>();
@@ -149,7 +149,7 @@ async function probeCached(
 
 /** doctor --probe：对全部配置的 agent 强制真实试跑并返回逐项结果 */
 export async function probeAll(input: PreflightInput): Promise<Array<{ agent: string; backend: string; model?: string | undefined; ok: boolean; error?: string | undefined; latencyMs?: number | undefined }>> {
-  const cache = new ProbeCache(join(input.config.stateDir, 'preflight-cache.json'));
+  const cache = new ProbeCache(join(input.config.workspace.stateDir, 'preflight-cache.json'));
   const results: Array<{ agent: string; backend: string; model?: string | undefined; ok: boolean; error?: string | undefined; latencyMs?: number | undefined }> = [];
   const seen = new Set<string>();
   for (const binding of input.bindings) {

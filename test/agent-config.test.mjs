@@ -13,7 +13,7 @@ function tempRepo() {
   return repo;
 }
 
-test('migrates v1 config in memory: roles + models + adapters → agents registry', () => {
+test('rejects legacy v1 config files', () => {
   const repo = tempRepo();
   writeFileSync(join(repo, '.agent-team', 'config.yml'), [
     'version: 1',
@@ -30,25 +30,16 @@ test('migrates v1 config in memory: roles + models + adapters → agents registr
     '    command: codex',
     '    model: gpt-5.6-terra'
   ].join('\n'), { flag: 'w' });
-  const config = loadConfig(repo);
-  assert.equal(config.version, 2);
-  assert.equal(config.defaultAdapter, undefined);
-  // 别名已物化：terra → gpt-5.6-terra
-  assert.equal(config.agents['codex-gpt-5-6-terra'].model, 'gpt-5.6-terra');
-  assert.equal(config.agents['opencode-z-ai-glm-5-2'].model, 'z-ai/glm-5.2');
-  assert.equal(config.agents['opencode-deepseek-v4-flash'].model, 'deepseek/v4-flash');
-  // defaultAdapter=codex + adapters.codex.model → defaultAgent
-  assert.equal(config.defaultAgent, 'codex-gpt-5-6-terra');
-  // roles 指向注册表名
-  assert.equal(config.roles.lead, 'codex-gpt-5-6-terra');
-  assert.equal(config.roles.reviewer, 'opencode-z-ai-glm-5-2');
-  assert.equal(validateAgents(config).ok, true);
+  assert.throws(() => loadConfig(repo), /must declare version: 3/);
 });
 
 test('resolves roles through the registry and falls back to defaultAgent', () => {
   const repo = tempRepo();
   writeFileSync(join(repo, '.agent-team', 'config.yml'), [
-    'version: 2',
+    'version: 3',
+    'workspace: {}',
+    'retry: {}',
+    'status: {}',
     'agents:',
     '  lead-agent: { backend: codex, model: gpt-5.6-terra }',
     '  fast-worker: { backend: opencode, model: deepseek/v4-flash }',
@@ -72,7 +63,10 @@ test('resolves roles through the registry and falls back to defaultAgent', () =>
 test('accepts inline backend.model specs and rejects unknown agents', () => {
   const repo = tempRepo();
   writeFileSync(join(repo, '.agent-team', 'config.yml'), [
-    'version: 2',
+    'version: 3',
+    'workspace: {}',
+    'retry: {}',
+    'status: {}',
     'agents:',
     '  a: { backend: codex }',
     'roles:',
@@ -90,7 +84,10 @@ test('accepts inline backend.model specs and rejects unknown agents', () => {
 test('task.agent resolves with its model (fixes the task.adapter model-drop bug)', () => {
   const repo = tempRepo();
   writeFileSync(join(repo, '.agent-team', 'config.yml'), [
-    'version: 2',
+    'version: 3',
+    'workspace: {}',
+    'retry: {}',
+    'status: {}',
     'agents:',
     '  heavy: { backend: codex, model: gpt-5.6-terra }',
     '  light: { backend: claude }',
@@ -117,7 +114,10 @@ test('task.agent resolves with its model (fixes the task.adapter model-drop bug)
 test('snapshot keeps runs hermetic and parses legacy v1 snapshots', () => {
   const repo = tempRepo();
   writeFileSync(join(repo, '.agent-team', 'config.yml'), [
-    'version: 2',
+    'version: 3',
+    'workspace: {}',
+    'retry: {}',
+    'status: {}',
     'agents:',
     '  lead-agent: { backend: codex, model: gpt-5.6-terra }',
     'roles:',

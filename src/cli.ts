@@ -51,8 +51,8 @@ function repoOption(): string {
 
 function database(repoRoot: string): { config: RunnerConfig; db: StateDatabase } {
   const config = applyOverrides(loadConfig(repoRoot), configOverrides());
-  mkdirSync(config.stateDir, { recursive: true });
-  return { config, db: new StateDatabase(join(config.stateDir, 'state.sqlite')) };
+  mkdirSync(config.workspace.stateDir, { recursive: true });
+  return { config, db: new StateDatabase(join(config.workspace.stateDir, 'state.sqlite')) };
 }
 
 async function preflight(config: RunnerConfig, bindings: AgentBinding[], validateSyntax: boolean): Promise<void> {
@@ -103,10 +103,10 @@ async function main(): Promise<void> {
     const forceProbe = flag('--probe');
     const { config, db } = database(repoRoot);
     try {
-      await ensureGitRepo(config.repoRoot);
+      await ensureGitRepo(config.workspace.repoRoot);
       console.log(`Node: ${process.version}`);
-      console.log(`Repository: ${config.repoRoot}`);
-      console.log(`State DB: ${join(config.stateDir, 'state.sqlite')}`);
+      console.log(`Repository: ${config.workspace.repoRoot}`);
+      console.log(`State DB: ${join(config.workspace.stateDir, 'state.sqlite')}`);
       const backends = buildBackends(config);
       try {
         console.log('Backends:');
@@ -169,7 +169,7 @@ async function main(): Promise<void> {
     if (agent) config.defaultAgent = agent;
     try {
       await preflight(config, Object.values(snapshotAgents(config).roles), true);
-      const approvals = terminalApprovals();
+      const approvals = terminalApprovals(config);
       try {
         const id = await planRun({
           config, db, goalFile, ...(runId ? { runId } : {}),
@@ -217,7 +217,7 @@ async function main(): Promise<void> {
       }
       const run = db.getRun(runId);
       await preflight(config, bindingsForRun(config, run.rolesJson, run.manifestJson), false);
-      const approvals = terminalApprovals();
+      const approvals = terminalApprovals(config);
       try {
         await runOrchestrator({
           config, db, runId,
@@ -249,7 +249,7 @@ async function main(): Promise<void> {
       show();
       if (watch) {
         await new Promise<void>((resolvePromise) => {
-          const timer = setInterval(show, config.pollIntervalMs);
+          const timer = setInterval(show, config.status.pollIntervalMs);
           const stop = (): void => { clearInterval(timer); resolvePromise(); };
           process.once('SIGINT', stop);
           process.once('SIGTERM', stop);
@@ -311,11 +311,11 @@ Options:
 `);
 }
 
-function terminalApprovals(): TerminalApprovalBroker {
+function terminalApprovals(config: RunnerConfig): TerminalApprovalBroker {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error('Planning and running require an interactive terminal for backend permissions and user questions.');
   }
-  return new TerminalApprovalBroker();
+  return new TerminalApprovalBroker(process.stdin, process.stdout, config.interactionAlert);
 }
 
 export function formatCliError(error: unknown): string {

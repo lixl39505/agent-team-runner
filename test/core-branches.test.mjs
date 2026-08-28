@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { applyOverrides, DEFAULT_CONFIG, initConfig, loadConfig } from '../src/core/config.ts';
-import { agentList, backendCommand, isBackendId, isValidAgentName, migrateV1Fields, parseInlineAgentSpec, validateAgents } from '../src/core/agent-config.ts';
+import { agentList, backendCommand, isBackendId, isValidAgentName, parseInlineAgentSpec, validateAgents } from '../src/core/agent-config.ts';
 import { checkPaths, globMatch, patternMatches } from '../src/core/path-policy.ts';
 import { validateIntegrationResult, validateLeadResult, validateReviewResult, validateTaskGraph, validateWorkerResult } from '../src/core/validation.ts';
 import { ProbeCache } from '../src/core/probe-cache.ts';
@@ -36,7 +36,7 @@ function task(id = 'T001', extra = {}) {
 }
 
 function config(stateDir = tempDir('agent-team-preflight-')) {
-  return { ...DEFAULT_CONFIG, stateDir };
+  return { ...DEFAULT_CONFIG, workspace: { ...DEFAULT_CONFIG.workspace, stateDir } };
 }
 
 function backend(id, overrides = {}) {
@@ -56,26 +56,29 @@ test('config rejects non-mapping input and preserves existing config during init
   writeFileSync(path, 'not-a-mapping\n');
   assert.throws(() => loadConfig(root), /empty or not a mapping/);
 
-  writeFileSync(path, 'concurrency: 8\n');
+  writeFileSync(path, 'version: 3\nworkspace: {}\nretry: {}\nstatus: {}\nconcurrency: 8\n');
   assert.equal(initConfig(root), path);
-  assert.equal(readFileSync(path, 'utf8'), 'concurrency: 8\n');
+  assert.equal(readFileSync(path, 'utf8'), 'version: 3\nworkspace: {}\nretry: {}\nstatus: {}\nconcurrency: 8\n');
   assert.equal(loadConfig(root).concurrency, 8);
 });
 
 test('config resolves absolute paths and applies string fallback overrides', () => {
   const root = repo();
   writeFileSync(join(root, '.agent-team', 'config.json'), JSON.stringify({
-    repoRoot: '.', stateDir: '/tmp/agent-team-state', worktreesDir: 'trees'
+    version: 3,
+    workspace: { repoRoot: '.', stateDir: '/tmp/agent-team-state', worktreesDir: 'trees' },
+    retry: {},
+    status: {}
   }));
   const loaded = loadConfig(root);
-  assert.equal(loaded.stateDir, '/tmp/agent-team-state');
-  assert.equal(loaded.worktreesDir, join(root, 'trees'));
+  assert.equal(loaded.workspace.stateDir, '/tmp/agent-team-state');
+  assert.equal(loaded.workspace.worktreesDir, join(root, 'trees'));
   const overridden = applyOverrides(loaded, [{ key: 'new.branch.value', value: 'not-json' }]);
   assert.equal(overridden.new.branch.value, 'not-json');
   assert.throws(() => applyOverrides(loaded, [{ key: '...', value: 'x' }]), /empty key/);
 });
 
-test('agent config validates malformed registry entries and v1 edge cases', () => {
+test('agent config validates malformed registry entries', () => {
   const invalid = {
     ...DEFAULT_CONFIG,
     defaultAgent: 'missing',
@@ -97,10 +100,6 @@ test('agent config validates malformed registry entries and v1 edge cases', () =
   assert.equal(isValidAgentName('_bad'), false);
   assert.equal(parseInlineAgentSpec('codex.'), null);
   assert.equal(parseInlineAgentSpec('other.model'), null);
-  assert.equal(migrateV1Fields({ version: 2, adapters: {} }), null);
-  const migrated = migrateV1Fields({ defaultAdapter: 'invalid', roles: { lead: 'bad.spec', worker: 'codex.' } });
-  assert.equal(migrated.defaultAgent, 'default-claude');
-  assert.deepEqual(migrated.roles, { worker: 'default-codex' });
 });
 
 test('path policy normalizes globs and identifies invalid and blocked files', () => {

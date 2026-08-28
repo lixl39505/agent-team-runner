@@ -3,8 +3,10 @@ import { test, vi } from 'vitest';
 
 vi.mock('../src/core/config.ts', () => ({
   loadConfig: (repoRoot) => ({
-    repoRoot,
-    stateDir: `${repoRoot}/state`,
+    version: 3,
+    workspace: { repoRoot, stateDir: `${repoRoot}/state`, worktreesDir: `${repoRoot}/worktrees`, baseRef: 'HEAD', branchPrefix: 'agent-team' },
+    retry: { maxPlanAttempts: 2, maxWorkerAttempts: 2, maxReviewCycles: 2 },
+    status: { pollIntervalMs: 2000 },
     defaultAgent: 'default',
     agents: { default: { backend: 'claude' } },
     roles: {}

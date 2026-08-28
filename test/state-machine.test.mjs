@@ -27,13 +27,9 @@ function configFor(repoRoot) {
   const name = basename(repoRoot);
   return {
     ...DEFAULT_CONFIG,
-    repoRoot,
-    stateDir: join(tmpdir(), `${name}-state`),
-    worktreesDir: join(tmpdir(), `${name}-worktrees`),
+    workspace: { ...DEFAULT_CONFIG.workspace, repoRoot, stateDir: join(tmpdir(), `${name}-state`), worktreesDir: join(tmpdir(), `${name}-worktrees`) },
     concurrency: 1,
-    maxPlanAttempts: 2,
-    maxWorkerAttempts: 2,
-    maxReviewCycles: 2,
+    retry: { ...DEFAULT_CONFIG.retry, maxPlanAttempts: 2, maxWorkerAttempts: 2, maxReviewCycles: 2 },
     integration: { ...DEFAULT_CONFIG.integration, runAgentAfterCherryPick: false },
     verification: { ...DEFAULT_CONFIG.verification, globalCommands: [] }
   };
@@ -90,8 +86,8 @@ function backendPool(backend) {
 }
 
 async function createPlannedRun(db, config, manifest, id = 'run') {
-  const baseSha = await currentHead(config.repoRoot);
-  db.createRun({ id, repoRoot: config.repoRoot, goalFile: 'goal.md', baseRef: 'HEAD', baseSha, adapter: 'claude' });
+  const baseSha = await currentHead(config.workspace.repoRoot);
+  db.createRun({ id, repoRoot: config.workspace.repoRoot, goalFile: 'goal.md', baseRef: 'HEAD', baseSha, adapter: 'claude' });
   for (const spec of manifest.tasks) db.insertTask(id, spec);
   db.updateRun(id, {
     status: 'planned',
@@ -107,7 +103,7 @@ function eventTypes(db, runId) {
 test('planner retries an invalid manifest and persists the validated plan atomically', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   let attempts = 0;
   const backend = new ScriptBackend(() => {
     attempts += 1;
@@ -128,8 +124,8 @@ test('planner retries an invalid manifest and persists the validated plan atomic
     assert.equal(db.getRun(runId).status, 'planned');
     assert.equal(db.listTasks(runId).length, 1);
     assert.ok(db.getRun(runId).rolesJson);
-    assert.ok(existsSync(join(config.stateDir, 'runs', runId, 'manifest.json')));
-    assert.ok(existsSync(join(config.stateDir, 'runs', runId, 'tasks', 'T001.md')));
+    assert.ok(existsSync(join(config.workspace.stateDir, 'runs', runId, 'manifest.json')));
+    assert.ok(existsSync(join(config.workspace.stateDir, 'runs', runId, 'tasks', 'T001.md')));
     assert.deepEqual(eventTypes(db, runId).filter((type) => type === 'PLAN_VALIDATION_FAILED').length, 1);
   } finally {
     db.close();
@@ -139,7 +135,7 @@ test('planner retries an invalid manifest and persists the validated plan atomic
 test('orchestrator retries reviewer feedback and integrates the approved task', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const manifest = { version: 1, title: 'Run', summary: 'test run', tasks: [task()] };
   let workerAttempts = 0;
   let reviewAttempts = 0;
@@ -183,7 +179,7 @@ test('orchestrator retries reviewer feedback and integrates the approved task', 
 test('orchestrator waits for dependencies and injects their commits into worktrees', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const manifest = {
     version: 1,
     title: 'Dependencies',
@@ -231,7 +227,7 @@ test('orchestrator records a failed run when global integration verification fai
       globalCommands: ['node -e "process.exit(1)"']
     }
   };
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const manifest = { version: 1, title: 'Run', summary: 'test run', tasks: [task()] };
   const backend = new ScriptBackend((spec) => {
     if (spec.role === 'worker') {
@@ -256,8 +252,8 @@ test('orchestrator records a failed run when global integration verification fai
 
 test('orchestrator blocks out-of-scope worker changes before review', async () => {
   const repoRoot = await repository();
-  const config = { ...configFor(repoRoot), maxWorkerAttempts: 1 };
-  const db = new StateDatabase(join(config.stateDir, 'state.sqlite'));
+  const config = { ...configFor(repoRoot), retry: { ...DEFAULT_CONFIG.retry, maxWorkerAttempts: 1 } };
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const manifest = { version: 1, title: 'Run', summary: 'test run', tasks: [task()] };
   const backend = new ScriptBackend((spec) => {
     if (spec.role !== 'worker') throw new Error(`unexpected role: ${spec.role}`);

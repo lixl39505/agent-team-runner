@@ -53,3 +53,35 @@ test('TerminalApprovalBroker supports default streams and signal-aware readline 
     broker.close();
   }
 });
+
+test('TerminalApprovalBroker uses a system notification and an informational terminal alert', async () => {
+  const input = new PassThrough();
+  let terminalOutput = '';
+  const output = new Writable({
+    write(chunk, _encoding, callback) {
+      terminalOutput += chunk.toString();
+      callback();
+    }
+  });
+  output.isTTY = true;
+  const notifications = [];
+  const broker = new TerminalApprovalBroker(
+    input,
+    output,
+    { background: '#123456', foreground: '#ABCDEF' },
+    (title, message) => notifications.push({ title, message })
+  );
+  try {
+    const approval = broker.request(request());
+    await new Promise((resolve) => setImmediate(resolve));
+    input.write('o\n');
+    assert.equal(await approval, 'once');
+    assert.match(terminalOutput, /\x1b\[1;38;2;171;205;239;48;2;18;52;86m Approval required: human input needed /);
+    assert.deepEqual(notifications, [{
+      title: 'Agent Team Runner',
+      message: 'Approval required. Agent Team Runner needs your input.'
+    }]);
+  } finally {
+    broker.close();
+  }
+});
