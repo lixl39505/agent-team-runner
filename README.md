@@ -171,6 +171,9 @@ agents:
     backend: codex
     model: gpt-5.6-terra
     description: strong planner
+    authProfile: work # macOS Keychain profile name, not a secret
+    authIsolation: isolated # shared or isolated
+    baseUrl: https://api.example.com/v1
   fast-worker:
     backend: opencode
     model: zhipuai-coding-plan/glm-5.2
@@ -222,6 +225,27 @@ WSL2 运行时属于 Linux 路径，不触发该开关。
 - `roles.<role>` 支持注册表名，也支持内联 `backend.model` 规格（如 `-c roles.lead=codex.gpt-5.6-terra` 快速覆写）。
 - Lead 的 prompt 会注入 agents 注册表（人工筛选的能力清单）；任务可用 `agent` 字段点名更合适的 agent，plan 后立即校验。
 - 各后端真实可用的 model 由预检闭环保证（见下），注册表里的 model 必须真实存在。
+- agent 可选 `authProfile`（安全 agent 名语法）、`authIsolation`（`shared` 或 `isolated`）和 `baseUrl`（HTTP(S) URL）。这些是非秘密配置；API key 只保存在 macOS Keychain。
+
+### API key 凭据
+
+在 macOS 上，API key 按后端和 profile 保存到 Keychain，不写入配置文件或命令行：
+
+```bash
+agent-team auth set --backend opencode --profile work
+agent-team auth status --backend opencode --profile work
+agent-team auth logout --backend opencode --profile work
+```
+
+`auth set` 在交互式终端中隐藏输入。OAuth 登录暂未由 Runner 管理，请使用相应后端的原生 CLI 登录。
+
+`authProfile` 的运行时语义按后端区分：
+
+- Claude `isolated` 使用 `~/.agent-team-runner/runtimes/claude/<profile>` 作为 `CLAUDE_CONFIG_DIR`，并在有 Keychain API key 时注入 `ANTHROPIC_API_KEY`；`baseUrl` 映射为 `ANTHROPIC_BASE_URL`。
+- Codex profile 始终使用独立的 `CODEX_HOME=~/.agent-team-runner/runtimes/codex/<profile>`，隔离原生 CLI 登录状态。暂不通过 Keychain 向 Codex 注入 API key。
+- OpenCode 默认 `shared`，复用一个原生多 provider `serve`。`isolated` 会启动独立服务并从 Keychain 注入一个 provider API key，因此 `model` 必须是 `<provider>/<model>`，例如 `openai/gpt-5`。
+
+隔离运行时使用最小环境，不继承父进程中其他后端的认证变量。未配置 `authProfile` 时保持原生 CLI 的共享登录行为。
 
 ### plan 时快照
 
@@ -245,7 +269,7 @@ agent-team launch specs/goals/order-export.md \
 - 后端 `discover()`：安装 / 版本 / 认证状态（未安装或未登录 → 阻止启动）
 - 后端 `listModels()`：枚举本地登录真实可用的 model（claude `supportedModels()`、codex `model/list`、opencode `/config/providers`）
 - 注册表里的 model 不在清单 → 默认阻止启动；此时触发 `probe()`（1-token 真实试跑）仲裁：试跑成功则放行并提示（网关 / 自定义 provider 模型），失败报具体错误
-- probe 结果按 (backend, model, backendVersion) 持久缓存于 `.agent-team/preflight-cache.json`，CLI 升级自动失效
+- probe 结果按 (backend, authProfile, model, backendVersion) 持久缓存于 `.agent-team/preflight-cache.json`，CLI 升级自动失效
 
 不再解析 `~/.codex/config.toml` 或 `~/.claude/settings.json` 之类 dotfile 来"猜测"可用性。
 

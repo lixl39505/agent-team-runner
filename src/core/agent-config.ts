@@ -38,6 +38,19 @@ export function validateAgents(config: RunnerConfig): AgentConfigValidation {
     if (!entry || typeof entry !== 'object' || !isBackendId(String(entry.backend))) {
       result.ok = false;
       result.errors.push(`agents.${name}: unknown backend "${String(entry?.backend)}", expected one of ${BACKEND_IDS.join(', ')}`);
+      continue;
+    }
+    if (entry.authProfile !== undefined && (typeof entry.authProfile !== 'string' || !isValidAgentName(entry.authProfile))) {
+      result.ok = false;
+      result.errors.push(`agents.${name}.authProfile: invalid profile name (letters/digits/dash/underscore, no dots)`);
+    }
+    if (entry.authIsolation !== undefined && entry.authIsolation !== 'shared' && entry.authIsolation !== 'isolated') {
+      result.ok = false;
+      result.errors.push(`agents.${name}.authIsolation: must be "shared" or "isolated"`);
+    }
+    if (entry.baseUrl !== undefined && (typeof entry.baseUrl !== 'string' || !isValidHttpUrl(entry.baseUrl))) {
+      result.ok = false;
+      result.errors.push(`agents.${name}.baseUrl: must be a valid http(s) URL`);
     }
   }
   for (const [role, value] of Object.entries(config.roles)) {
@@ -56,6 +69,15 @@ export function validateAgents(config: RunnerConfig): AgentConfigValidation {
     result.errors.push(`defaultAgent: unknown agent "${config.defaultAgent}" (must exist in the agents registry)`);
   }
   return result;
+}
+
+function isValidHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (url.protocol === 'http:' || url.protocol === 'https:') && !url.username && !url.password;
+  } catch {
+    return false;
+  }
 }
 
 /** 解析内联 "backend.model" 规格；不合法返回 null */

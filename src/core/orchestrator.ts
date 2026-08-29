@@ -13,7 +13,7 @@ import type {
 import type { AgentBackend, AgentEvent } from '../agent/types.js';
 import type { ApprovalHandler, UserInputHandler } from '../agent/approval.js';
 import { StateDatabase } from './db.js';
-import { buildBackends, disposeBackends, resolveAgentWithSnapshot, resolveTaskAgent } from '../agent/registry.js';
+import { buildBackends, disposeBackends, type BackendPool, resolveAgentWithSnapshot, resolveTaskAgent } from '../agent/registry.js';
 import { runAgent } from '../agent/supervise.js';
 import {
   INTEGRATION_SCHEMA,
@@ -62,7 +62,7 @@ export async function runOrchestrator(input: {
   requestApproval?: ApprovalHandler;
   requestUserInput?: UserInputHandler;
   /** Test seam: production creates its own managed backend pool. */
-  backends?: Record<BackendId, AgentBackend>;
+  backends?: Record<BackendId, AgentBackend> | BackendPool;
 }): Promise<void> {
   const { config, db, runId } = input;
   let run = db.getRun(runId);
@@ -176,7 +176,7 @@ async function executeTask(input: {
   config: RunnerConfig;
   db: StateDatabase;
   runId: string;
-  backends: Record<string, AgentBackend>;
+  backends: Record<BackendId, AgentBackend> | BackendPool;
   record: TaskRecord;
   requestApproval?: ApprovalHandler;
   requestUserInput?: UserInputHandler;
@@ -218,7 +218,7 @@ async function executeTask(input: {
     }
   };
   const worker = await runAgent<WorkerResult>({
-    backend: backends[workerBinding.backend]!,
+    backend: await getBackend(backends, workerBinding),
     spec: {
       role: 'worker', cwd: worktreeInfo.path,
       label: `${runId} ${task.id} worker`,
@@ -270,7 +270,7 @@ async function executeTask(input: {
   // Reviewer 独立解析角色绑定（plan 快照优先），不复用 Worker 的会话
   const reviewerBinding = resolveAgentWithSnapshot('reviewer', config, run.rolesJson);
   const reviewRun = await runAgent<ReviewResult>({
-    backend: backends[reviewerBinding.backend]!,
+    backend: await getBackend(backends, reviewerBinding),
     spec: {
       role: 'reviewer', cwd: worktreeInfo.path,
       label: `${runId} ${task.id} reviewer`,
@@ -438,7 +438,7 @@ async function integrateRun(input: {
   config: RunnerConfig;
   db: StateDatabase;
   runId: string;
-  backends: Record<string, AgentBackend>;
+  backends: Record<BackendId, AgentBackend> | BackendPool;
   requestApproval?: ApprovalHandler;
   requestUserInput?: UserInputHandler;
   isInterrupted: () => boolean;
@@ -455,7 +455,7 @@ async function integrateRun(input: {
   db.updateRun(runId, { integrationBranch: branch, integrationWorktree: worktree });
   const runDir = join(config.workspace.stateDir, 'runs', runId);
   const integratorBinding = resolveAgentWithSnapshot('integrator', config, run.rolesJson);
-  const integratorBackend = input.backends[integratorBinding.backend]!;
+  const integratorBackend = await getBackend(input.backends, integratorBinding);
 
   for (const task of topologicalTasks(manifest.tasks)) {
     if (input.isInterrupted()) return;
@@ -546,4 +546,12 @@ async function integrateRun(input: {
   db.updateRun(runId, { status: 'done', integrationCommit, error: null, finishedAt: new Date().toISOString() });
   db.addEvent(runId, null, 'INTEGRATION_COMPLETED', { branch, worktree, integrationCommit });
   writeFileSync(join(runDir, 'summary.txt'), `Run ${runId} completed\nBranch: ${branch}\nCommit: ${integrationCommit}\n`, 'utf8');
+}
+
+async function getBackend(
+  backends: Record<BackendId, AgentBackend> | BackendPool,
+  binding: import('./types.js').AgentBinding
+): Promise<AgentBackend> {
+  if (typeof (backends as Partial<BackendPool>).get === 'function') return await (backends as BackendPool).get(binding);
+  return (backends as Record<BackendId, AgentBackend>)[binding.backend]!;
 }

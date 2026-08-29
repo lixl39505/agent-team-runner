@@ -141,6 +141,9 @@ backends:
 #     backend: codex
 #     model: gpt-5.6-terra
 #     description: strong planner
+#     authProfile: work # Keychain profile name; never put API keys here
+#     authIsolation: isolated # shared (default behavior) or isolated
+#     baseUrl: https://api.example.com/v1
 #   fast-worker:
 #     backend: opencode
 #     model: deepseek/v4-flash

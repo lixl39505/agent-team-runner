@@ -28,6 +28,10 @@ export interface ClaudeBackendOptions {
   platform?: NodeJS.Platform | undefined;
   /** Test seam; production uses cross-spawn. */
   spawn?: typeof spawn | undefined;
+  /** Explicit runtime environment, used by profile-isolated sessions. */
+  env?: Record<string, string | undefined> | undefined;
+  /** Do not inherit ambient backend authentication variables. */
+  minimalEnv?: boolean | undefined;
 }
 
 export class ClaudeBackend implements AgentBackend {
@@ -242,7 +246,7 @@ export class ClaudeBackend implements AgentBackend {
 
   private baseOptions(overrides: Partial<Options>): Options {
     return {
-      env: sanitizedEnv(),
+      env: sanitizedEnv(this.options.env, !this.options.minimalEnv),
       // Match Claude Code: native settings may pre-authorize operations; remaining asks reach canUseTool.
       settingSources: ['user', 'project', 'local'],
       ...(this.options.command ? { pathToClaudeCodeExecutable: this.options.command } : {}),

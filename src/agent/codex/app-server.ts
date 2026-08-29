@@ -57,6 +57,10 @@ export interface CodexBackendOptions {
   platform?: NodeJS.Platform | undefined;
   /** Test seam; production uses cross-spawn. */
   spawn?: typeof spawn | undefined;
+  /** Explicit runtime environment, used by profile-isolated app servers. */
+  env?: Record<string, string | undefined> | undefined;
+  /** Do not inherit ambient backend authentication variables. */
+  minimalEnv?: boolean | undefined;
 }
 
 interface TurnRecord {
@@ -320,7 +324,7 @@ export class CodexBackend implements AgentBackend {
           this.platformCheckPromise = null;
         }
       },
-      sanitizedEnv()
+      sanitizedEnv(this.options.env, !this.options.minimalEnv)
     );
     this.connection = connection;
     try {

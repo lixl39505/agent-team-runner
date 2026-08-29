@@ -154,7 +154,7 @@ process.exit(process.argv.includes('--version') ? 0 : 1);
     }), 'utf8');
     writeFileSync(join(stateDir, 'preflight-cache.json'), JSON.stringify({
       entries: {
-        'claude|<backend-default>|fake-1': { ok: true, latencyMs: 0, checkedAt: Date.now() }
+        'claude:shared|<backend-default>|fake-1': { ok: true, latencyMs: 0, checkedAt: Date.now() }
       }
     }), 'utf8');
 

@@ -69,7 +69,7 @@ function writeConfig(repo, command) {
   // The cached successful probe lets these CLI paths test terminal behavior only.
   writeFileSync(join(stateDir, 'preflight-cache.json'), JSON.stringify({
     entries: {
-      'codex|<backend-default>|tty-local-codex-1': { ok: true, latencyMs: 0, checkedAt: Date.now() }
+      'codex:shared|<backend-default>|tty-local-codex-1': { ok: true, latencyMs: 0, checkedAt: Date.now() }
     }
   }), 'utf8');
 }

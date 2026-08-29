@@ -81,6 +81,27 @@ test('accepts inline backend.model specs and rejects unknown agents', () => {
   assert.equal(validateAgents(config).ok, false);
 });
 
+test('validates agent auth metadata without accepting secret configuration', () => {
+  const repo = tempRepo();
+  writeFileSync(join(repo, '.agent-team', 'config.yml'), [
+    'version: 3',
+    'workspace: {}',
+    'retry: {}',
+    'status: {}',
+    'agents:',
+    '  valid: { backend: codex, authProfile: work_profile, authIsolation: isolated, baseUrl: https://api.example.com/v1 }',
+    '  invalid: { backend: claude, authProfile: bad.profile, authIsolation: per-run, baseUrl: ftp://api.example.com }',
+    'defaultAgent: valid'
+  ].join('\n'), { flag: 'w' });
+  const validation = validateAgents(loadConfig(repo));
+  assert.equal(validation.ok, false);
+  assert.deepEqual(validation.errors, [
+    'agents.invalid.authProfile: invalid profile name (letters/digits/dash/underscore, no dots)',
+    'agents.invalid.authIsolation: must be "shared" or "isolated"',
+    'agents.invalid.baseUrl: must be a valid http(s) URL'
+  ]);
+});
+
 test('task.agent resolves with its model (fixes the task.adapter model-drop bug)', () => {
   const repo = tempRepo();
   writeFileSync(join(repo, '.agent-team', 'config.yml'), [

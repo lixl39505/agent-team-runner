@@ -83,7 +83,7 @@ function writeConfig(repo, codexCommand, model) {
 function cacheLocalCodex(repo) {
   writeFileSync(join(repo, '.agent-team', 'preflight-cache.json'), JSON.stringify({
     entries: {
-      'codex|<backend-default>|local-codex-1': { ok: true, latencyMs: 0, checkedAt: Date.now() }
+      'codex:shared|<backend-default>|local-codex-1': { ok: true, latencyMs: 0, checkedAt: Date.now() }
     }
   }), 'utf8');
 }

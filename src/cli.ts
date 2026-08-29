@@ -12,10 +12,14 @@ import { formatRunStatus } from './core/status.js';
 import { execFile, ensureGitRepo } from './core/git.js';
 import { buildBackends, disposeBackends, parseSnapshot, snapshotAgents } from './agent/registry.js';
 import { generatedProtocolVersion } from './agent/codex/generated.js';
-import { backendCommand, validateAgents } from './core/agent-config.js';
+import { backendCommand, isBackendId, isValidAgentName, validateAgents } from './core/agent-config.js';
 import { bindingsForRun, checkAgentAvailability, probeAll } from './core/preflight.js';
-import type { AgentBinding, RunnerConfig } from './core/types.js';
+import type { AgentBinding, BackendId, RunnerConfig } from './core/types.js';
+import type { AgentBackend } from './agent/types.js';
+import type { BackendPool } from './agent/registry.js';
 import { TerminalApprovalBroker } from './agent/approval.js';
+import { createCredentialStore } from './core/credentials.js';
+import { promptMaskedSecret } from './core/terminal-input.js';
 
 let argv: string[] = [];
 let command: string | undefined;
@@ -98,6 +102,11 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === 'auth') {
+    await runAuthCommand();
+    return;
+  }
+
   if (command === 'doctor') {
     const repoRoot = repoOption();
     const forceProbe = flag('--probe');
@@ -109,28 +118,33 @@ async function main(): Promise<void> {
       console.log(`State DB: ${join(config.workspace.stateDir, 'state.sqlite')}`);
       const backends = buildBackends(config);
       try {
+        const doctorBindings = (['claude', 'codex', 'opencode'] as BackendId[]).map((backend) => ({
+          agent: `doctor-${backend}`, backend, source: 'doctor'
+        }));
         console.log('Backends:');
         const generatedCodex = generatedProtocolVersion();
-        for (const [name, backend] of Object.entries(backends)) {
+        for (const binding of doctorBindings) {
+          const backend = await getBackend(backends, binding);
           const discovery = await backend.discover();
           const label = discovery.installed
             ? `${discovery.version ?? 'available'}${discovery.authed === false ? ' (not authenticated)' : ''}`
             : `unavailable${discovery.detail ? ` (${discovery.detail})` : ''}`;
-          console.log(`  ${name}: ${label}`);
+          console.log(`  ${binding.backend}: ${label}`);
           // 协议类型新鲜度：app-server 协议是 experimental，类型快照必须与实际 CLI 版本一致
-          if (name === 'codex' && generatedCodex && discovery.version && discovery.version.trim() !== generatedCodex) {
+          if (binding.backend === 'codex' && generatedCodex && discovery.version && discovery.version.trim() !== generatedCodex) {
             console.log(`  warn: codex protocol types were generated for "${generatedCodex}" but installed CLI is "${discovery.version.trim()}"; run: npm run gen:codex && npm run check`);
           }
         }
         const snapshot = snapshotAgents(config);
         const syntax = validateAgents(config);
         console.log('Models:');
-        for (const [name, backend] of Object.entries(backends)) {
+        for (const binding of doctorBindings) {
           try {
+            const backend = await getBackend(backends, binding);
             const models = await backend.listModels();
-            console.log(`  ${name}: ${models.length} models — ${models.slice(0, 6).map((model) => model.id).join(', ')}${models.length > 6 ? ', …' : ''}`);
+            console.log(`  ${binding.backend}: ${models.length} models — ${models.slice(0, 6).map((model) => model.id).join(', ')}${models.length > 6 ? ', …' : ''}`);
           } catch (error) {
-            console.log(`  ${name}: enumeration failed (${error instanceof Error ? error.message : String(error)})`);
+            console.log(`  ${binding.backend}: enumeration failed (${error instanceof Error ? error.message : String(error)})`);
           }
         }
         console.log('Agents:');
@@ -273,6 +287,51 @@ async function main(): Promise<void> {
   throw new Error(`Unknown command: ${command}`);
 }
 
+async function runAuthCommand(): Promise<void> {
+  const subcommand = argv.shift();
+  if (subcommand === 'login') {
+    const { backend } = authOptions(false);
+    throw new Error(`OAuth login is not supported; use the ${backend} native CLI to log in.`);
+  }
+  if (subcommand !== 'set' && subcommand !== 'status' && subcommand !== 'logout') {
+    throw new Error('Usage: agent-team auth <set|status|logout> --backend BACKEND --profile NAME');
+  }
+  if (subcommand === 'set' && argv.some((argument) => argument === '--key' || argument.startsWith('--key='))) {
+    throw new Error('agent-team auth set does not accept --key; enter the API key at the masked terminal prompt.');
+  }
+  const { backend, profile } = authOptions(true);
+  const credentials = createCredentialStore();
+  if (subcommand === 'set') {
+    const apiKey = await promptMaskedSecret('API key: ');
+    if (!apiKey) throw new Error('API key must not be empty.');
+    await credentials.setApiKey(backend, profile, apiKey);
+    console.log('Credential saved.');
+    return;
+  }
+  if (subcommand === 'status') {
+    console.log((await credentials.hasApiKey(backend, profile)) ? 'present' : 'missing');
+    return;
+  }
+  await credentials.deleteApiKey(backend, profile);
+  console.log('Credential removed.');
+}
+
+function authOptions(requireProfile: boolean): { backend: string; profile: string } {
+  const backend = option('--backend');
+  const profile = option('--profile');
+  if (!backend || !isBackendId(backend)) {
+    throw new Error('auth --backend must be one of claude, codex, opencode');
+  }
+  if (requireProfile && (!profile || !isValidAgentName(profile))) {
+    throw new Error('auth --profile must use letters, digits, dashes, or underscores (no dots)');
+  }
+  if (!requireProfile && profile !== undefined) {
+    throw new Error('auth login does not accept --profile');
+  }
+  if (argv.length > 0) throw new Error(`Unknown auth option: ${argv[0]}`);
+  return { backend, profile: profile ?? '' };
+}
+
 export async function runCli(args: string[] = process.argv.slice(2)): Promise<void> {
   argv = [...args];
   command = argv.shift();
@@ -295,6 +354,12 @@ Commands:
   init [repo]                         Initialize config and sync role skills
   doctor [--repo PATH]               Check repository and agent backends
   skills sync [--repo PATH]          Mirror portable skills for Codex/OpenCode/Claude
+  auth set --backend ID --profile N  Save an API key in the macOS Keychain
+  auth status --backend ID --profile N
+                                     Report whether a Keychain credential is present
+  auth logout --backend ID --profile N
+                                     Delete a Keychain credential
+  auth login --backend ID            Use the backend native CLI instead (OAuth unsupported)
   plan <goal.md> [options]           Ask Lead to create and validate a task DAG
   launch <goal.md> [options]         Plan and run end-to-end
   run <run-id>                       Execute Workers, Reviews, and Integration
@@ -316,6 +381,14 @@ function terminalApprovals(config: RunnerConfig): TerminalApprovalBroker {
     throw new Error('Planning and running require an interactive terminal for backend permissions and user questions.');
   }
   return new TerminalApprovalBroker(process.stdin, process.stdout, config.interactionAlert);
+}
+
+async function getBackend(
+  backends: Record<BackendId, AgentBackend> | BackendPool,
+  binding: AgentBinding
+): Promise<AgentBackend> {
+  if (typeof (backends as Partial<BackendPool>).get === 'function') return await (backends as BackendPool).get(binding);
+  return (backends as Record<BackendId, AgentBackend>)[binding.backend]!;
 }
 
 export function formatCliError(error: unknown): string {

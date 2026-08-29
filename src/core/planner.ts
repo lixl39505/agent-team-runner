@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 import type { BackendId, LeadResult, RunnerConfig } from './types.js';
 import { StateDatabase } from './db.js';
-import { buildBackends, disposeBackends, resolveAgent, snapshotAgents } from '../agent/registry.js';
+import { buildBackends, disposeBackends, type BackendPool, resolveAgent, snapshotAgents } from '../agent/registry.js';
 import { runAgent } from '../agent/supervise.js';
 import type { ApprovalHandler, UserInputHandler } from '../agent/approval.js';
 import type { AgentBackend } from '../agent/types.js';
@@ -25,7 +25,7 @@ export async function planRun(input: {
   requestApproval?: ApprovalHandler;
   requestUserInput?: UserInputHandler;
   /** Test seam: production creates its own managed backend pool. */
-  backends?: Record<BackendId, AgentBackend>;
+  backends?: Record<BackendId, AgentBackend> | BackendPool;
 }): Promise<string> {
   const repoRoot = input.config.workspace.repoRoot;
   await ensureGitRepo(repoRoot);
@@ -75,7 +75,7 @@ export async function planRun(input: {
 ${priorError}
 Return a corrected full manifest.` : '');
         const result = await runAgent<LeadResult>({
-          backend: backends[leadBinding.backend],
+          backend: await getBackend(backends, leadBinding),
           spec: {
             role: 'lead', cwd: repoRoot,
             label: `${runId} lead`,
@@ -133,4 +133,12 @@ Return a corrected full manifest.` : '');
     input.db.addEvent(runId, null, 'PLAN_FAILED', { error: String(error) });
     throw error;
   }
+}
+
+async function getBackend(
+  backends: Record<BackendId, AgentBackend> | BackendPool,
+  binding: import('./types.js').AgentBinding
+): Promise<AgentBackend> {
+  if (typeof (backends as Partial<BackendPool>).get === 'function') return await (backends as BackendPool).get(binding);
+  return (backends as Record<BackendId, AgentBackend>)[binding.backend]!;
 }

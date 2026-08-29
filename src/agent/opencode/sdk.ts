@@ -38,6 +38,10 @@ export interface OpenCodeBackendOptions {
   platform?: NodeJS.Platform | undefined;
   /** Test seam; production uses cross-spawn. */
   spawn?: typeof spawn | undefined;
+  /** Explicit runtime environment, used by profile-isolated servers. */
+  env?: Record<string, string | undefined> | undefined;
+  /** Do not inherit ambient backend authentication variables. */
+  minimalEnv?: boolean | undefined;
 }
 
 interface OpenCodeMessagePart {
@@ -275,7 +279,7 @@ export class OpenCodeBackend implements AgentBackend {
     const port = this.options.port ?? 4100 + Math.floor(Math.random() * 800);
     const child = this.spawn(command, ['serve', `--hostname=${hostname}`, `--port=${port}`], {
       env: {
-        ...sanitizedEnv(),
+        ...sanitizedEnv(this.options.env, !this.options.minimalEnv),
         OPENCODE_CONFIG_CONTENT: JSON.stringify({
           permission: compileOpenCodeBasePermission()
         })

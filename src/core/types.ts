@@ -3,6 +3,7 @@ export type BackendId = 'claude' | 'codex' | 'opencode';
 export type AdapterName = BackendId;
 export type AgentRole = 'lead' | 'worker' | 'reviewer' | 'integrator';
 export type NativeWindowsSandboxPolicy = 'require' | 'allow-degraded';
+export type AuthIsolation = 'shared' | 'isolated';
 
 export type RunStatus =
   | 'planning'
@@ -38,6 +39,10 @@ export interface AgentEntry {
   model?: string;
   description?: string;
   maxTurns?: number;
+  /** Keychain profile name; secrets are never stored in project configuration. */
+  authProfile?: string;
+  authIsolation?: AuthIsolation;
+  baseUrl?: string;
 }
 
 /** 角色或任务解析出的 agent 绑定（取代旧 ResolvedProfile） */
@@ -48,6 +53,9 @@ export interface AgentBinding {
   model?: string;
   /** turn 上限（来自 agents 注册表条目） */
   maxTurns?: number;
+  authProfile?: string;
+  authIsolation?: AuthIsolation;
+  baseUrl?: string;
   /** 来源描述：roles.<role> / defaultAgent / task:<name> / snapshot */
   source: string;
 }

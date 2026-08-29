@@ -214,7 +214,8 @@ test('preflight handles missing implementations, crashes, cache, forced probes, 
   });
   assert.deepEqual(all.map(({ agent, ok, error }) => ({ agent, ok, error })), [
     { agent: 'custom', ok: true, error: undefined },
-    { agent: 'crash', ok: false, error: 'probe boom' }
+    { agent: 'crash', ok: false, error: 'probe boom' },
+    { agent: 'absent', ok: false, error: 'backend "opencode" has no implementation registered' }
   ]);
 });
 

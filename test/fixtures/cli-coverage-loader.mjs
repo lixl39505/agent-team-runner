@@ -53,7 +53,7 @@ const mockSources = {
     } });
   `,
   './agent/codex/generated.js': `export const generatedProtocolVersion = () => 'old-codex';`,
-  './core/agent-config.js': `export const backendCommand = () => ''; export const validateAgents = () => ({ ok: true, errors: ['syntax error'], warnings: ['syntax warning'] });`,
+  './core/agent-config.js': `export const backendCommand = () => ''; export const isBackendId = (value) => ['claude', 'codex', 'opencode'].includes(value); export const isValidAgentName = () => true; export const validateAgents = () => ({ ok: true, errors: ['syntax error'], warnings: ['syntax warning'] });`,
   './core/preflight.js': `
     export const bindingsForRun = () => [];
     export const checkAgentAvailability = async () => ({ ok: true, errors: ['availability error'], warnings: ['availability warning'] });

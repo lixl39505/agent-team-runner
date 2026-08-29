@@ -16,9 +16,12 @@ const BACKEND_AUTH_KEYS = [
   'OPENCODE_CONFIG', 'OPENCODE_MODELS_URL'
 ];
 
-export function sanitizedEnv(extraEnv: Record<string, string | undefined> = {}): Record<string, string> {
+export function sanitizedEnv(
+  extraEnv: Record<string, string | undefined> = {},
+  inheritBackendAuth: boolean = true
+): Record<string, string> {
   const result: Record<string, string> = {};
-  for (const key of [...BASE_ENV_KEYS, ...BACKEND_AUTH_KEYS]) {
+  for (const key of [...BASE_ENV_KEYS, ...(inheritBackendAuth ? BACKEND_AUTH_KEYS : [])]) {
     const value = extraEnv[key] ?? process.env[key];
     if (value !== undefined) result[key] = value;
   }

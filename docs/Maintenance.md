@@ -11,7 +11,7 @@ src/
     types.ts              AgentBackend / AgentSession / AgentEvent / SessionSpec / AgentRunOutcome
     approval.ts           FIFO 终端交互队列；权限审批与用户补充问题使用独立协议
     process-tree.ts       POSIX 进程组 / Windows taskkill 进程树终止
-    registry.ts           buildBackends 工厂；resolveAgent/snapshotAgents/resolveTaskAgent（取代 profiles.ts）
+    registry.ts           profile-aware backend pool；resolveAgent/snapshotAgents/resolveTaskAgent（取代 profiles.ts）
     supervise.ts          runAgent 监督器：事件泵、日志、心跳、超时/静默、中断与宽限强杀
     fake.ts               脚本化 AgentBackend（单测核心）
     env.ts                子进程环境净化（基础变量 + 后端认证变量 allowlist）
@@ -29,9 +29,11 @@ src/
       policy.ts           compileOpenCode：服务端原生 ask 门禁 + read-only 角色边界
   core/
     config.ts             配置初始化、加载（YAML/JSON）、v3 默认值合并、-c 覆写
-    agent-config.ts       agents 注册表校验、backendCommand
-    preflight.ts          闭环预检：discover + listModels + probe（probe-cache 持久缓存）
-    probe-cache.ts        probe 结果持久缓存（backend|model|version 键，TTL）
+    agent-config.ts       agents 注册表（含 auth profile）校验、backendCommand
+    credentials.ts        macOS Keychain API key 存储（service: agent-team-runner）
+    terminal-input.ts     交互式 masked secret 输入
+    preflight.ts          闭环预检：discover + listModels + probe（按 profile 缓存）
+    probe-cache.ts        probe 结果持久缓存（backend:profile|model|version 键，TTL）
     db.ts                 SQLite 状态数据库（runs / tasks / events 三表）
     types.ts              所有类型定义
     prompts.ts            角色 Prompt 模板（lead 注入 agents 注册表、worker 厚重试上下文）
