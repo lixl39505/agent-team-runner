@@ -1,6 +1,12 @@
+# AI 
 .claude/skills
+.agent-team/
 
+# 编译产物
 dist
 .local
 node_modules
-.agent-team/
+
+# 测试产物
+
+coverage/
