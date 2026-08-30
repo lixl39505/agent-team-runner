@@ -56,7 +56,7 @@ export class LiveRunUi {
 
   stop(): void {
     if (!this.active) return;
-    if (this.timer) clearInterval(this.timer);
+    clearInterval(this.timer!);
     this.timer = undefined;
     this.active = false;
     if (!this.paused) this.output.write('\x1b[?1049l\x1b[?25h');

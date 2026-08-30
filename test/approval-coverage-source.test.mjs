@@ -76,11 +76,18 @@ test('TerminalApprovalBroker uses a system notification and an informational ter
     await new Promise((resolve) => setImmediate(resolve));
     input.write('o\n');
     assert.equal(await approval, 'once');
+    const question = broker.requestUserInput({
+      backend: 'claude', role: 'worker', cwd: '/repo',
+      questions: [{ id: 'answer', question: 'Continue?' }]
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    input.write('yes\n');
+    assert.deepEqual(await question, { answer: ['yes'] });
     assert.match(terminalOutput, /\x1b\[1;38;2;171;205;239;48;2;18;52;86m Approval required: human input needed /);
-    assert.deepEqual(notifications, [{
-      title: 'Agent Team Runner',
-      message: 'Approval required. Agent Team Runner needs your input.'
-    }]);
+    assert.deepEqual(notifications, [
+      { title: 'Agent Team Runner', message: 'Approval required. Agent Team Runner needs your input.' },
+      { title: 'Agent Team Runner', message: 'Answer required. Agent Team Runner needs your input.' }
+    ]);
   } finally {
     broker.close();
   }

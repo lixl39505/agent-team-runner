@@ -186,11 +186,19 @@ test('orchestrator lets the integrator resolve a real cherry-pick conflict withi
     return integrationResult();
   });
   try {
-    await runOrchestrator({ config: setup.config, db: setup.db, runId: 'run', backends: backendPool(setup.backend) });
+    const events = [];
+    await runOrchestrator({
+      config: setup.config,
+      db: setup.db,
+      runId: 'run',
+      backends: backendPool(setup.backend),
+      onAgentEvent: (execution, event) => events.push([execution.role, event.type])
+    });
 
     const run = setup.db.getRun('run');
     assert.equal(run.status, 'done');
     assert.equal(setup.backend.specs.length, 1);
+    assert.deepEqual(events, [['integrator', 'activity']]);
     assert.equal(readFileSync(join(run.integrationWorktree, 'src', 'feature.txt'), 'utf8'), 'resolved\n');
     assert.equal((await git(run.integrationWorktree, ['status', '--porcelain'])).stdout, '');
   } finally {

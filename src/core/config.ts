@@ -194,7 +194,7 @@ export function loadConfig(inputRepoRoot: string): RunnerConfig {
   const { raw, file } = readRawConfig(repoRoot);
 
   if (file && raw.version !== 3) {
-    throw new Error(`Config file ${file ?? configPath(repoRoot)} must declare version: 3`);
+    throw new Error(`Config file ${file} must declare version: 3`);
   }
   const effective: Record<string, unknown> = { ...raw };
 

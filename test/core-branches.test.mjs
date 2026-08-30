@@ -232,3 +232,27 @@ test('bindingsForRun falls back from invalid snapshots and deduplicates task age
   assert.equal(bindings.filter((binding) => binding.agent === 'specialist').length, 1);
   assert.equal(bindings.filter((binding) => binding.agent === 'main').length, 4);
 });
+
+test('preflight resolves profiled backend-pool bindings with OpenCode isolation rules', async () => {
+  const requested = [];
+  const pool = {
+    get: async (binding) => {
+      requested.push(binding);
+      return backend(binding.backend, { listModels: async () => [{ id: binding.model }] });
+    },
+    dispose: () => {}
+  };
+  const bindings = [
+    { agent: 'codex-profile', backend: 'codex', model: 'm', authProfile: 'work', source: 'test' },
+    { agent: 'opencode-shared', backend: 'opencode', model: 'm', authProfile: 'work', source: 'test' },
+    { agent: 'opencode-isolated', backend: 'opencode', model: 'm', authProfile: 'work', authIsolation: 'isolated', source: 'test' }
+  ];
+  const input = { config: config(), backends: pool, bindings };
+
+  const availability = await checkAgentAvailability(input);
+  const probes = await probeAll(input);
+
+  assert.equal(availability.ok, true);
+  assert.equal(requested.length, 6);
+  assert.deepEqual(probes.map((result) => result.agent), bindings.map((binding) => binding.agent));
+});

@@ -30,7 +30,30 @@ test('macOS Keychain store reports absent credentials without reading their valu
   assert.equal(await store.deleteApiKey('claude', 'default'), false);
 });
 
+test('macOS Keychain store reports API key values and security command failures', async () => {
+  const key = createCredentialStore({ platform: 'darwin', runSecurity: async () => ({ exitCode: 0, stdout: ' secret\n' }) });
+  assert.equal(await key.getApiKey('claude', 'work'), 'secret');
+  const missing = createCredentialStore({ platform: 'darwin', runSecurity: async () => ({ exitCode: 44 }) });
+  assert.equal(await missing.getApiKey('claude', 'work'), null);
+  for (const method of [
+    (store) => store.setApiKey('claude', 'work', 'key'),
+    (store) => store.hasApiKey('claude', 'work'),
+    (store) => store.getApiKey('claude', 'work'),
+    (store) => store.deleteApiKey('claude', 'work')
+  ]) {
+    const failed = createCredentialStore({ platform: 'darwin', runSecurity: async () => ({ exitCode: 1 }) });
+    await assert.rejects(method(failed), /macOS Keychain/);
+  }
+  const empty = createCredentialStore({ platform: 'darwin', runSecurity: async () => ({ exitCode: 0 }) });
+  await assert.rejects(empty.setApiKey('claude', 'work', ''), /must not be empty/);
+});
+
 test('credential storage clearly rejects unsupported platforms', async () => {
   const store = createCredentialStore({ platform: 'linux' });
-  await assert.rejects(store.hasApiKey('codex', 'work'), /only supported on macOS/);
+  for (const method of [
+    () => store.setApiKey('codex', 'work', 'key'),
+    () => store.getApiKey('codex', 'work'),
+    () => store.hasApiKey('codex', 'work'),
+    () => store.deleteApiKey('codex', 'work')
+  ]) await assert.rejects(method(), /only supported on macOS/);
 });

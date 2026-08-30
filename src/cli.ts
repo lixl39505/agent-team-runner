@@ -334,7 +334,7 @@ async function runAuthCommand(): Promise<void> {
 
 async function runLogsCommand(): Promise<void> {
   const runId = argv.shift();
-  if (!runId) throw new Error('Usage: agent-team logs <run-id> [agent-id] [--list] [--follow] [--repo PATH]');
+  if (!runId || runId.startsWith('--')) throw new Error('Usage: agent-team logs <run-id> [agent-id] [--list] [--follow] [--repo PATH]');
   const agentId = argv[0] && !argv[0]!.startsWith('--') ? argv.shift() : undefined;
   const list = flag('--list');
   const follow = flag('--follow');
@@ -440,14 +440,14 @@ Options:
 `);
 }
 
-function terminalApprovals(config: RunnerConfig, ui?: LiveRunUi): TerminalApprovalBroker {
+function terminalApprovals(config: RunnerConfig, ui: LiveRunUi): TerminalApprovalBroker {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error('Planning and running require an interactive terminal for backend permissions and user questions.');
   }
-  return new TerminalApprovalBroker(process.stdin, process.stdout, config.interactionAlert, undefined, ui ? {
+  return new TerminalApprovalBroker(process.stdin, process.stdout, config.interactionAlert, undefined, {
     beforePrompt: ui.pause,
     afterPrompt: ui.resume
-  } : undefined);
+  });
 }
 
 async function getBackend(

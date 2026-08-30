@@ -36,3 +36,14 @@ test('loadConfig rejects invalid native Windows sandbox policies', () => {
     rmSync(nullPolicy, { recursive: true, force: true });
   }
 });
+
+test('loadConfig falls back to defaults when no config file exists', () => {
+  const root = mkdtempSync(join(tmpdir(), 'agent-team-config-missing-'));
+  try {
+    const config = loadConfig(root);
+    assert.equal(config.defaultAgent, 'default-claude');
+    assert.equal(config.workspace.repoRoot, root);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

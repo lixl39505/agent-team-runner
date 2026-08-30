@@ -13,7 +13,8 @@ export default defineConfig({
       include: ['src/**/*.ts'],
       exclude: ['src/agent/codex/protocol/**'],
       thresholds: {
-        branches: 100
+        branches: 100,
+        functions: 100
       }
     }
   }

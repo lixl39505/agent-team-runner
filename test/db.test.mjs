@@ -24,6 +24,8 @@ test('persists run and task state', () => {
     { id: 'T001-worker-1', status: 'completed', session: 'thread-1' }
   ]);
   assert.equal(db.getAgentExecution('demo', 'T001-worker-1').logPath, '/tmp/worker.log');
+  db.updateAgentExecution('demo', 'T001-worker-1', {});
+  assert.throws(() => db.getAgentExecution('demo', 'missing'), /not found/);
   db.close();
 });
 

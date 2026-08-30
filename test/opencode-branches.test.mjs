@@ -17,13 +17,13 @@ function spec(overrides = {}) {
   };
 }
 
-async function open(overrides = {}) {
+async function open({ promptResponse, ...overrides } = {}) {
   const backend = new OpenCodeBackend();
   const calls = { permissions: [], aborts: [], events: [] };
   const client = {
     session: {
       async create() { return { data: { id: 'known-session' } }; },
-      async prompt() { return { data: { info: { structured: {} } } }; },
+       async prompt() { return promptResponse ?? { data: { info: { structured: {} } } }; },
       async abort(request) { calls.aborts.push(request); }
     },
     async postSessionIdPermissionsPermissionId(request) { calls.permissions.push(request); }
@@ -74,16 +74,24 @@ test('OpenCode routes known, unknown, and incomplete permission events fail-clos
 test('OpenCode emits activity only for active session updates', () => {
   const backend = new OpenCodeBackend();
   let activities = 0;
-  backend.sessions.set('active', { onActivity() { activities += 1; } });
+  const messages = [];
+  const tools = [];
+  backend.sessions.set('active', {
+    onActivity() { activities += 1; },
+    onMessage(text) { messages.push(text); },
+    onTool(tool, state) { tools.push([tool, state]); }
+  });
 
-  backend.handleEvent({ type: 'message.updated', properties: { sessionID: 'active' } });
-  backend.handleEvent({ type: 'message.part.updated', properties: { sessionID: 'active' } });
+  backend.handleEvent({ type: 'message.updated', properties: { sessionID: 'active', part: { text: 'hello', tool: 'Bash', state: 'completed' } } });
+  backend.handleEvent({ type: 'message.part.updated', properties: { sessionID: 'active', text: 'world' } });
   backend.handleEvent({ type: 'session.diff', properties: { sessionID: 'active' } });
   backend.handleEvent({ type: 'message.updated', properties: { sessionID: 'missing' } });
   backend.handleEvent({ type: 'unrelated', properties: { sessionID: 'active' } });
   backend.handleEvent({ type: 'message.updated', properties: {} });
 
   assert.equal(activities, 3);
+  assert.deepEqual(messages, ['hello', 'world']);
+  assert.deepEqual(tools, [['Bash', 'completed']]);
 });
 
 test('OpenCode permission interactions reject denied, failed, and interrupted approvals', async () => {
@@ -112,6 +120,32 @@ test('OpenCode permission interactions reject denied, failed, and interrupted ap
     assert.equal(result.calls.events.at(-1).reason, 'denied by user');
   }
   assert.deepEqual(interrupted.calls.aborts, [{ path: { id: 'known-session' } }]);
+});
+
+test('OpenCode session forwards streamed message and tool state to Agent events', async () => {
+  const opened = await open();
+  opened.session.onMessage('streamed response');
+  opened.session.onTool('Bash', 'running');
+  opened.session.onTool('Bash', 'completed');
+  opened.session.onTool('Bash', 'error');
+  assert.deepEqual(opened.calls.events.slice(-4), [
+    { type: 'message', text: 'streamed response' },
+    { type: 'tool-call', tool: 'Bash', input: {} },
+    { type: 'tool-result', tool: 'Bash', ok: true },
+    { type: 'tool-result', tool: 'Bash', ok: false }
+  ]);
+});
+
+test('OpenCode forwards partial usage token fields from final responses', async () => {
+  for (const tokens of [{ input: 1 }, { output: 2 }]) {
+    const opened = await open({ promptResponse: { data: { info: { tokens }, parts: [{ type: 'text', text: '{}' }] } } });
+    assert.equal((await opened.session.completion()).ok, true);
+    assert.deepEqual(opened.calls.events.find((event) => event.type === 'usage'), {
+      type: 'usage',
+      ...(tokens.input !== undefined ? { inputTokens: tokens.input } : {}),
+      ...(tokens.output !== undefined ? { outputTokens: tokens.output } : {})
+    });
+  }
 });
 
 test('OpenCode subscription and dispose safely release failed and active streams', async () => {

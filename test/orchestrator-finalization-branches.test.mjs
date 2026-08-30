@@ -124,12 +124,20 @@ test('orchestrator finalizes without documentation changes and writes the termin
   });
   try {
     const { runDir } = await createApprovedRun(db, config);
-    await runOrchestrator({ config, db, runId: 'run', backends: backendPool(backend) });
+    const events = [];
+    await runOrchestrator({
+      config,
+      db,
+      runId: 'run',
+      backends: backendPool(backend),
+      onAgentEvent: (execution, event) => events.push([execution.role, event.type])
+    });
 
     const run = db.getRun('run');
     assert.equal(run.status, 'done');
     assert.equal(run.integrationCommit, await currentHead(run.integrationWorktree));
     assert.equal(backend.specs.length, 1);
+    assert.deepEqual(events, [['integrator', 'activity']]);
     assert.equal(readFileSync(join(runDir, 'summary.txt'), 'utf8'), `Run run completed\nBranch: ${run.integrationBranch}\nCommit: ${run.integrationCommit}\n`);
     assert.match(readFileSync(join(runDir, 'logs', 'integration-verification.log'), 'utf8'), /\$ npm run verify/);
     assert.deepEqual(eventTypes(db, 'run').slice(-2), ['INTEGRATION_COMPLETED', 'RUN_COMPLETED']);

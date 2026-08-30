@@ -162,3 +162,23 @@ test('snapshot keeps runs hermetic and parses legacy v1 snapshots', () => {
   assert.equal(legacy.roles.lead.backend, 'codex');
   assert.equal(legacy.roles.lead.model, 'gpt-5.6-terra');
 });
+
+test('allows an intentionally unset role binding', () => {
+  const result = validateAgents({
+    defaultAgent: 'default',
+    agents: { default: { backend: 'claude' } },
+    roles: { lead: '', worker: 'default' }
+  });
+
+  assert.deepEqual(result, { ok: true, errors: [], warnings: [] });
+});
+
+test('rejects malformed agent base URLs', () => {
+  const result = validateAgents({
+    defaultAgent: 'default',
+    agents: { default: { backend: 'claude', baseUrl: 'https://[' } },
+    roles: {}
+  });
+
+  assert.deepEqual(result.errors, ['agents.default.baseUrl: must be a valid http(s) URL']);
+});

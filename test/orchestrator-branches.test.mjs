@@ -207,3 +207,73 @@ test('orchestrator resumes a failed run by resetting its interrupted worktree be
     db.close();
   }
 });
+
+test('orchestrator uses a supplied backend pool and forwards worker and reviewer activity', async () => {
+  const repoRoot = await repository();
+  const config = configFor(repoRoot);
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
+  const backend = new ScriptBackend((spec) => {
+    if (spec.role === 'worker') {
+      writeFileSync(join(spec.cwd, 'src', 'feature.txt'), 'pooled\n', 'utf8');
+      return workerResult('completed', 'completed through pool');
+    }
+    assert.equal(spec.role, 'reviewer');
+    return approvedReview();
+  });
+  const requested = [];
+  const events = [];
+  const pool = {
+    get: async (binding) => {
+      requested.push(binding);
+      return backend;
+    },
+    dispose: () => {}
+  };
+  try {
+    await createPlannedRun(db, config);
+    await runOrchestrator({
+      config,
+      db,
+      runId: 'run',
+      backends: pool,
+      onAgentEvent: (execution, event) => events.push([execution.role, event.type])
+    });
+
+    assert.equal(db.getRun('run').status, 'done');
+    assert.deepEqual(requested.map((binding) => binding.agent), ['default-claude', 'default-claude', 'default-claude']);
+    assert.deepEqual(events, [['worker', 'activity'], ['reviewer', 'activity']]);
+  } finally {
+    db.close();
+  }
+});
+
+test('orchestrator omits unavailable retry context after Git and result-file failures', async () => {
+  const repoRoot = await repository();
+  const config = configFor(repoRoot);
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
+  const backend = new ScriptBackend((spec) => {
+    assert.equal(spec.role, 'worker');
+    assert.doesNotMatch(spec.prompt, /Previous worker summary/);
+    return workerResult('blocked', 'retry context was safely omitted');
+  });
+  try {
+    const baseSha = await createPlannedRun(db, config);
+    const nonGitWorktree = mkdtempSync(join(tmpdir(), 'agent-team-non-git-worktree-'));
+    mkdirSync(join(config.workspace.stateDir, 'runs', 'run', 'results'), { recursive: true });
+    writeFileSync(join(config.workspace.stateDir, 'runs', 'run', 'results', 'T001-worker-1.json'), '{not json', 'utf8');
+    db.updateTask('run', 'T001', {
+      status: 'changes_requested',
+      phase: 'retry',
+      attempts: 1,
+      worktree: nonGitWorktree,
+      branch: 'retry-context',
+      startSha: baseSha
+    });
+
+    await runOrchestrator({ config, db, runId: 'run', backends: backendPool(backend) });
+
+    assert.equal(db.getTask('run', 'T001').status, 'blocked');
+  } finally {
+    db.close();
+  }
+});

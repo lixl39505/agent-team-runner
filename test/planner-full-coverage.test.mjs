@@ -100,3 +100,50 @@ test('planner creates and disposes its managed backend pool when none is supplie
     rmSync(repoRoot, { recursive: true, force: true });
   }
 });
+
+test('planner uses a supplied backend pool and forwards lead activity events', async () => {
+  const repoRoot = repository();
+  const config = configFor(repoRoot);
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
+  const backend = new LeadBackend(async () => ({
+    ok: true,
+    output: {
+      version: 1,
+      title: 'Pool plan',
+      summary: 'A valid plan from a pooled backend.',
+      tasks: [{
+        id: 'T001', title: 'Task', description: 'Do the task.', dependsOn: [],
+        allowedPaths: ['src/**'], blockedPaths: [], acceptance: ['done'], verificationCommands: []
+      }]
+    },
+    timedOut: false,
+    stalled: false
+  }));
+  const requested = [];
+  const events = [];
+  const pool = {
+    get: async (binding) => {
+      requested.push(binding);
+      return backend;
+    },
+    dispose: () => {}
+  };
+  try {
+    const runId = await planRun({
+      config,
+      db,
+      goalFile: 'goal.md',
+      runId: 'pooled-plan',
+      backends: pool,
+      onAgentEvent: (execution, event) => events.push([execution.agentId, event.type])
+    });
+
+    assert.equal(runId, 'pooled-plan');
+    assert.equal(requested.length, 1);
+    assert.deepEqual(events, [['lead-1', 'activity']]);
+    assert.equal(db.getRun(runId).status, 'planned');
+  } finally {
+    db.close();
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});

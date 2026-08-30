@@ -9,6 +9,8 @@ test('agent environments keep auth but force non-interactive Git isolation', () 
   assert.equal(env.GIT_PAGER, 'cat');
   assert.equal(env.GIT_OPTIONAL_LOCKS, '0');
   assert.equal(env.GIT_TERMINAL_PROMPT, '0');
+  const isolated = sanitizedEnv({ ANTHROPIC_API_KEY: 'explicit', UNUSED: undefined }, false);
+  assert.equal(isolated.ANTHROPIC_API_KEY, 'explicit');
 });
 
 test('verification environments exclude provider credentials', () => {
