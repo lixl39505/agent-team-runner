@@ -2,6 +2,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type {
+  AgentExecutionRecord,
   RunRecord,
   RunStatus,
   TaskRecord,
@@ -53,6 +54,16 @@ function mapTask(row: Record<string, unknown>): TaskRecord {
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
     finishedAt: row.finished_at === null ? null : String(row.finished_at)
+  };
+}
+
+function mapAgentExecution(row: Record<string, unknown>): AgentExecutionRecord {
+  return {
+    runId: String(row.run_id), agentId: String(row.agent_id), taskId: row.task_id === null ? null : String(row.task_id),
+    role: String(row.role) as AgentExecutionRecord['role'], backend: String(row.backend) as AgentExecutionRecord['backend'],
+    model: row.model === null ? null : String(row.model), status: String(row.status) as AgentExecutionRecord['status'],
+    sessionId: row.session_id === null ? null : String(row.session_id), logPath: String(row.log_path),
+    startedAt: String(row.started_at), updatedAt: String(row.updated_at), finishedAt: row.finished_at === null ? null : String(row.finished_at)
   };
 }
 
@@ -125,8 +136,26 @@ export class StateDatabase {
         FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
       ) STRICT;
 
+      CREATE TABLE IF NOT EXISTS agent_executions (
+        run_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        task_id TEXT,
+        role TEXT NOT NULL,
+        backend TEXT NOT NULL,
+        model TEXT,
+        status TEXT NOT NULL,
+        session_id TEXT,
+        log_path TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        finished_at TEXT,
+        PRIMARY KEY (run_id, agent_id),
+        FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+      ) STRICT;
+
       CREATE INDEX IF NOT EXISTS idx_tasks_run_status ON tasks(run_id, status);
       CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, id);
+      CREATE INDEX IF NOT EXISTS idx_agent_executions_run ON agent_executions(run_id, started_at);
     `);
     this.addColumnIfMissing('runs', 'roles_json', 'TEXT');
   }
@@ -268,6 +297,40 @@ export class StateDatabase {
       INSERT INTO events (run_id, task_id, event_type, payload_json, created_at)
       VALUES (?, ?, ?, ?, ?)
     `).run(runId, taskId, eventType, payload === undefined ? null : JSON.stringify(payload), now());
+  }
+
+  startAgentExecution(input: {
+    runId: string; agentId: string; taskId?: string | undefined; role: string; backend: string; model?: string | undefined; logPath: string;
+  }): void {
+    const timestamp = now();
+    this.db.prepare(`
+      INSERT OR REPLACE INTO agent_executions (
+        run_id, agent_id, task_id, role, backend, model, status, session_id, log_path, started_at, updated_at, finished_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'running', NULL, ?, ?, ?, NULL)
+    `).run(input.runId, input.agentId, input.taskId ?? null, input.role, input.backend, input.model ?? null, input.logPath, timestamp, timestamp);
+  }
+
+  updateAgentExecution(runId: string, agentId: string, patch: Partial<{
+    status: AgentExecutionRecord['status']; sessionId: string; finishedAt: string | null;
+  }>): void {
+    const entries = Object.entries(patch);
+    if (entries.length === 0) return;
+    const columns: Record<string, string> = { status: 'status', sessionId: 'session_id', finishedAt: 'finished_at' };
+    const sets = entries.map(([key]) => `${columns[key]} = ?`);
+    const values = entries.map(([, value]) => value);
+    sets.push('updated_at = ?');
+    values.push(now(), runId, agentId);
+    this.db.prepare(`UPDATE agent_executions SET ${sets.join(', ')} WHERE run_id = ? AND agent_id = ?`).run(...values);
+  }
+
+  listAgentExecutions(runId: string): AgentExecutionRecord[] {
+    return (this.db.prepare('SELECT * FROM agent_executions WHERE run_id = ? ORDER BY started_at, agent_id').all(runId) as Record<string, unknown>[]).map(mapAgentExecution);
+  }
+
+  getAgentExecution(runId: string, agentId: string): AgentExecutionRecord {
+    const row = this.db.prepare('SELECT * FROM agent_executions WHERE run_id = ? AND agent_id = ?').get(runId, agentId) as Record<string, unknown> | undefined;
+    if (!row) throw new Error(`Agent execution not found: ${runId}/${agentId}`);
+    return mapAgentExecution(row);
   }
 
   resetInterrupted(runId: string): void {

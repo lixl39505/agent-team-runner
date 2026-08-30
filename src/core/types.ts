@@ -123,6 +123,22 @@ export interface TaskSpec {
   allowNoChanges?: boolean;
 }
 
+/** A concrete Lead/Worker/Reviewer/Integrator invocation within a run. */
+export interface AgentExecutionRecord {
+  runId: string;
+  agentId: string;
+  taskId: string | null;
+  role: AgentRole;
+  backend: BackendId;
+  model: string | null;
+  status: 'running' | 'completed' | 'failed';
+  sessionId: string | null;
+  logPath: string;
+  startedAt: string;
+  updatedAt: string;
+  finishedAt: string | null;
+}
+
 export interface RunManifest {
   version: 1;
   title: string;

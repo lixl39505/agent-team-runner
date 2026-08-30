@@ -224,8 +224,16 @@ export class OpenCodeBackend implements AgentBackend {
       return;
     }
     if (!sessionId) return;
-    if (event.type === 'message.updated' || event.type === 'message.part.updated' || event.type === 'session.diff') {
-      this.sessions.get(sessionId)?.onActivity();
+    const session = this.sessions.get(sessionId);
+    if (event.type === 'message.updated' || event.type === 'message.part.updated') {
+      const part = eventPart(properties);
+      if (part.text) session?.onMessage(part.text);
+      if (part.tool) session?.onTool(part.tool, part.state);
+      session?.onActivity();
+      return;
+    }
+    if (event.type === 'session.diff') {
+      session?.onActivity();
     }
   }
 
@@ -472,6 +480,12 @@ ${JSON.stringify(this.spec.schema)}`;
         .map((part) => part.text)
         .join('\n')
         .trim();
+      if (usage) this.spec.onEvent?.({
+        type: 'usage',
+        ...(usage.inputTokens !== undefined ? { inputTokens: usage.inputTokens } : {}),
+        ...(usage.outputTokens !== undefined ? { outputTokens: usage.outputTokens } : {})
+      });
+      if (text) this.spec.onEvent?.({ type: 'message', text });
       if (!text) {
         return {
           ok: false,
@@ -509,6 +523,18 @@ ${JSON.stringify(this.spec.schema)}`;
 
   onActivity(): void {
     this.spec.onEvent?.({ type: 'activity' });
+  }
+
+  onMessage(text: string): void {
+    this.spec.onEvent?.({ type: 'message', text });
+  }
+
+  onTool(tool: string, state: string | undefined): void {
+    if (state === 'completed' || state === 'error') {
+      this.spec.onEvent?.({ type: 'tool-result', tool, ok: state === 'completed' });
+      return;
+    }
+    this.spec.onEvent?.({ type: 'tool-call', tool, input: {} });
   }
 
   async answerPermission(permissionId: string, request: { type: string; pattern?: string | Array<string> | undefined }): Promise<void> {
@@ -606,6 +632,13 @@ ${JSON.stringify(this.spec.schema)}`;
     })();
     return this.abortPromise!;
   }
+}
+
+function eventPart(properties: Record<string, unknown>): OpenCodeMessagePart {
+  const candidate = properties.part;
+  return candidate && typeof candidate === 'object'
+    ? candidate as OpenCodeMessagePart
+    : properties as OpenCodeMessagePart;
 }
 
 function openCodeApprovalKind(type: string): 'command' | 'file-change' | 'network' | 'external-directory' | 'tool' {

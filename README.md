@@ -68,6 +68,7 @@ Runner 在调用 Agent 时会直接读取打包的 Skill 内容并编译进运�
 - 全局验证命令
 - Integrator 统一更新架构和进度文档
 - 前台运行、FIFO 审批队列、状态查看和 Ctrl-C 停止
+- 前台双栏 TUI：实时 Agent 事件流与运行中 Agent 状态列表
 
 ## 环境要求
 
@@ -333,7 +334,7 @@ agent-team plan specs/goals/order-export.md \
 .agent-team/runs/order-export/manifest.json
 .agent-team/runs/order-export/tasks/T001.md
 .agent-team/runs/order-export/tasks/T002.md
-.agent-team/runs/order-export/logs/lead.log
+.agent-team/runs/order-export/logs/lead-1.log
 ```
 
 ### 执行已有计划
@@ -350,18 +351,19 @@ agent-team launch specs/goals/order-export.md \
   --agent lead-agent
 ```
 
-### Ghostty 状态窗格
+### 实时状态与日志
 
 ```bash
 agent-team status order-export --watch
 ```
 
-其他窗格可以直接观察日志：
+`plan`、`launch` 和 `run` 在交互式终端默认显示双栏界面：左侧为所有 Agent 的实时消息和工具事件，右侧为 Agent ID、后端、模型和状态。权限或问题输入时界面会暂时退出，完成输入后自动恢复。
+
+另开终端可列出和追踪某个 Agent 的日志：
 
 ```bash
-tail -f .agent-team/runs/order-export/logs/T001-worker-1.log
-tail -f .agent-team/runs/order-export/logs/T001-review-1.log
-tail -f .agent-team/runs/order-export/logs/integration-verification.log
+agent-team logs order-export --list
+agent-team logs order-export T001-worker-1 --follow
 ```
 
 `plan`、`launch` 和 `run` 都是前台终端命令。运行中使用 Ctrl-C 停止，现场 Worktree 会暂时保留供检查；再次执行 `agent-team run <runId>` 时，Runner 会从任务 `startSha` 重建被中断的 Worktree，并用新会话重跑完整 attempt。

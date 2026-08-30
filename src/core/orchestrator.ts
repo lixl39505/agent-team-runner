@@ -14,7 +14,7 @@ import type { AgentBackend, AgentEvent } from '../agent/types.js';
 import type { ApprovalHandler, UserInputHandler } from '../agent/approval.js';
 import { StateDatabase } from './db.js';
 import { buildBackends, disposeBackends, type BackendPool, resolveAgentWithSnapshot, resolveTaskAgent } from '../agent/registry.js';
-import { runAgent } from '../agent/supervise.js';
+import { executionInfo, runTrackedAgent, type AgentEventSink } from './agent-execution.js';
 import {
   INTEGRATION_SCHEMA,
   REVIEW_SCHEMA,
@@ -61,6 +61,7 @@ export async function runOrchestrator(input: {
   runId: string;
   requestApproval?: ApprovalHandler;
   requestUserInput?: UserInputHandler;
+  onAgentEvent?: AgentEventSink;
   /** Test seam: production creates its own managed backend pool. */
   backends?: Record<BackendId, AgentBackend> | BackendPool;
 }): Promise<void> {
@@ -114,8 +115,9 @@ export async function runOrchestrator(input: {
       for (const candidate of candidates) {
         const promise = executeTask({
           config, db, runId, backends, record: candidate,
-          ...(input.requestApproval ? { requestApproval: input.requestApproval } : {}),
-          ...(input.requestUserInput ? { requestUserInput: input.requestUserInput } : {})
+            ...(input.requestApproval ? { requestApproval: input.requestApproval } : {}),
+            ...(input.requestUserInput ? { requestUserInput: input.requestUserInput } : {}),
+            ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {})
         })
           .catch((error) => {
             db.updateTask(runId, candidate.taskId, {
@@ -143,7 +145,8 @@ export async function runOrchestrator(input: {
       config, db, runId, backends,
       isInterrupted: () => interrupted,
       ...(input.requestApproval ? { requestApproval: input.requestApproval } : {}),
-      ...(input.requestUserInput ? { requestUserInput: input.requestUserInput } : {})
+      ...(input.requestUserInput ? { requestUserInput: input.requestUserInput } : {}),
+      ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {})
     });
   } catch (error) {
     if (interrupted) return;
@@ -180,6 +183,7 @@ async function executeTask(input: {
   record: TaskRecord;
   requestApproval?: ApprovalHandler;
   requestUserInput?: UserInputHandler;
+  onAgentEvent?: AgentEventSink;
 }): Promise<void> {
   const { config, db, runId, backends } = input;
   let record = db.getTask(runId, input.record.taskId);
@@ -217,7 +221,10 @@ async function executeTask(input: {
       db.updateTask(runId, task.id, { phase: 'worker-active' });
     }
   };
-  const worker = await runAgent<WorkerResult>({
+  const worker = await runTrackedAgent<WorkerResult>({
+    db,
+    execution: executionInfo(runId, `${task.id}-worker-${attempts}`, 'worker', workerBinding.backend, logPath, workerBinding.model, task.id),
+    ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {}),
     backend: await getBackend(backends, workerBinding),
     spec: {
       role: 'worker', cwd: worktreeInfo.path,
@@ -269,7 +276,11 @@ async function executeTask(input: {
   const candidateDiff = (await git(worktreeInfo.path, ['diff', '--cached', '--binary'])).stdout;
   // Reviewer 独立解析角色绑定（plan 快照优先），不复用 Worker 的会话
   const reviewerBinding = resolveAgentWithSnapshot('reviewer', config, run.rolesJson);
-  const reviewRun = await runAgent<ReviewResult>({
+  const reviewLogPath = join(runDir, 'logs', `${task.id}-review-${reviewCycle}.log`);
+  const reviewRun = await runTrackedAgent<ReviewResult>({
+    db,
+    execution: executionInfo(runId, `${task.id}-reviewer-${reviewCycle}`, 'reviewer', reviewerBinding.backend, reviewLogPath, reviewerBinding.model, task.id),
+    ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {}),
     backend: await getBackend(backends, reviewerBinding),
     spec: {
       role: 'reviewer', cwd: worktreeInfo.path,
@@ -290,7 +301,7 @@ async function executeTask(input: {
       requestUserInput: input.requestUserInput,
       timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs
     },
-    logPath: join(runDir, 'logs', `${task.id}-review-${reviewCycle}.log`),
+    logPath: reviewLogPath,
     outputPath: reviewOutput
   });
   const reviewHeadAfter = await currentHead(worktreeInfo.path);
@@ -441,6 +452,7 @@ async function integrateRun(input: {
   backends: Record<BackendId, AgentBackend> | BackendPool;
   requestApproval?: ApprovalHandler;
   requestUserInput?: UserInputHandler;
+  onAgentEvent?: AgentEventSink;
   isInterrupted: () => boolean;
 }): Promise<void> {
   const { config, db, runId } = input;
@@ -465,7 +477,11 @@ async function integrateRun(input: {
     if (picked.code === 0) continue;
     const conflicts = await conflictedFiles(worktree);
     if (conflicts.length === 0) throw new Error(`Cherry-pick failed for ${task.id}: ${picked.stderr}`);
-    const conflictResult = await runAgent<IntegrationResult>({
+    const conflictLogPath = join(runDir, 'logs', `integration-conflict-${task.id}.log`);
+    const conflictResult = await runTrackedAgent<IntegrationResult>({
+      db,
+      execution: executionInfo(runId, `integrator-conflict-${task.id}`, 'integrator', integratorBinding.backend, conflictLogPath, integratorBinding.model, task.id),
+      ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {}),
       backend: integratorBackend,
       spec: {
         role: 'integrator', cwd: worktree,
@@ -479,7 +495,7 @@ async function integrateRun(input: {
         requestUserInput: input.requestUserInput,
         timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs
       },
-      logPath: join(runDir, 'logs', `integration-conflict-${task.id}.log`),
+      logPath: conflictLogPath,
       outputPath: join(runDir, 'results', `integration-conflict-${task.id}.json`)
     });
     if (input.isInterrupted()) return;
@@ -510,7 +526,11 @@ async function integrateRun(input: {
   await runGlobalVerification({ worktree, config, logPath: join(runDir, 'logs', 'integration-verification.log') });
   if (input.isInterrupted()) return;
   if (config.integration.runAgentAfterCherryPick) {
-    const integrationRun = await runAgent<IntegrationResult>({
+    const integrationLogPath = join(runDir, 'logs', 'integrator.log');
+    const integrationRun = await runTrackedAgent<IntegrationResult>({
+      db,
+      execution: executionInfo(runId, 'integrator-finalize', 'integrator', integratorBinding.backend, integrationLogPath, integratorBinding.model),
+      ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {}),
       backend: integratorBackend,
       spec: {
         role: 'integrator', cwd: worktree,
@@ -524,7 +544,7 @@ async function integrateRun(input: {
         requestUserInput: input.requestUserInput,
         timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs
       },
-      logPath: join(runDir, 'logs', 'integrator.log'),
+      logPath: integrationLogPath,
       outputPath: join(runDir, 'results', 'integrator.json')
     });
     if (input.isInterrupted()) return;

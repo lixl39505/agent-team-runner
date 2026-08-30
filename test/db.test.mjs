@@ -18,6 +18,12 @@ test('persists run and task state', () => {
   assert.equal(db.listTasks('demo').length, 1);
   const taskColumns = db.db.prepare('PRAGMA table_info(tasks)').all().map((column) => column.name);
   assert.equal(taskColumns.includes('pid'), false);
+  db.startAgentExecution({ runId: 'demo', agentId: 'T001-worker-1', taskId: 'T001', role: 'worker', backend: 'codex', model: 'gpt-5', logPath: '/tmp/worker.log' });
+  db.updateAgentExecution('demo', 'T001-worker-1', { sessionId: 'thread-1', status: 'completed', finishedAt: '2026-01-01T00:00:00.000Z' });
+  assert.deepEqual(db.listAgentExecutions('demo').map((entry) => ({ id: entry.agentId, status: entry.status, session: entry.sessionId })), [
+    { id: 'T001-worker-1', status: 'completed', session: 'thread-1' }
+  ]);
+  assert.equal(db.getAgentExecution('demo', 'T001-worker-1').logPath, '/tmp/worker.log');
   db.close();
 });
 

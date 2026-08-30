@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, watch } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { applyOverrides, initConfig, loadConfig } from './core/config.js';
@@ -20,6 +20,7 @@ import type { BackendPool } from './agent/registry.js';
 import { TerminalApprovalBroker } from './agent/approval.js';
 import { createCredentialStore } from './core/credentials.js';
 import { promptMaskedSecret } from './core/terminal-input.js';
+import { LiveRunUi } from './core/live-ui.js';
 
 let argv: string[] = [];
 let command: string | undefined;
@@ -107,6 +108,11 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === 'logs') {
+    await runLogsCommand();
+    return;
+  }
+
   if (command === 'doctor') {
     const repoRoot = repoOption();
     const forceProbe = flag('--probe');
@@ -183,13 +189,17 @@ async function main(): Promise<void> {
     if (agent) config.defaultAgent = agent;
     try {
       await preflight(config, Object.values(snapshotAgents(config).roles), true);
-      const approvals = terminalApprovals(config);
+      const ui = new LiveRunUi(db);
+      const approvals = terminalApprovals(config, ui);
+      ui.start(runId);
       try {
         const id = await planRun({
           config, db, goalFile, ...(runId ? { runId } : {}),
           requestApproval: approvals.request,
-          requestUserInput: approvals.requestUserInput
+          requestUserInput: approvals.requestUserInput,
+          onAgentEvent: ui.onEvent
         });
+        ui.setRun(id);
         console.log(`Planned run: ${id}`);
         console.log(formatRunStatus(db.getRun(id), db.listTasks(id)));
         if (command === 'launch') {
@@ -198,11 +208,13 @@ async function main(): Promise<void> {
           await runOrchestrator({
             config, db, runId: id,
             requestApproval: approvals.request,
-            requestUserInput: approvals.requestUserInput
+            requestUserInput: approvals.requestUserInput,
+            onAgentEvent: ui.onEvent
           });
         }
       } finally {
         approvals.close();
+        ui.stop();
       }
     } finally {
       db.close();
@@ -231,16 +243,20 @@ async function main(): Promise<void> {
       }
       const run = db.getRun(runId);
       await preflight(config, bindingsForRun(config, run.rolesJson, run.manifestJson), false);
-      const approvals = terminalApprovals(config);
+      const ui = new LiveRunUi(db);
+      const approvals = terminalApprovals(config, ui);
+      ui.start(runId);
       try {
         await runOrchestrator({
           config, db, runId,
           requestApproval: approvals.request,
-          requestUserInput: approvals.requestUserInput
+          requestUserInput: approvals.requestUserInput,
+          onAgentEvent: ui.onEvent
         });
         console.log(formatRunStatus(db.getRun(runId), db.listTasks(runId)));
       } finally {
         approvals.close();
+        ui.stop();
       }
     } finally {
       db.close();
@@ -316,6 +332,52 @@ async function runAuthCommand(): Promise<void> {
   console.log('Credential removed.');
 }
 
+async function runLogsCommand(): Promise<void> {
+  const runId = argv.shift();
+  if (!runId) throw new Error('Usage: agent-team logs <run-id> [agent-id] [--list] [--follow] [--repo PATH]');
+  const agentId = argv[0] && !argv[0]!.startsWith('--') ? argv.shift() : undefined;
+  const list = flag('--list');
+  const follow = flag('--follow');
+  const repoRoot = repoOption();
+  if (list && agentId) throw new Error('agent-team logs --list does not accept an agent ID');
+  if (!list && !agentId) throw new Error('agent-team logs requires an agent ID, or use --list');
+  if (argv.length > 0) throw new Error(`Unknown logs option: ${argv[0]}`);
+  const { db } = database(repoRoot);
+  try {
+    if (list) {
+      for (const entry of db.listAgentExecutions(runId)) {
+        console.log(`${entry.agentId}\t${entry.role}\t${entry.backend}${entry.model ? `/${entry.model}` : ''}\t${entry.status}\t${entry.logPath}`);
+      }
+      return;
+    }
+    const entry = db.getAgentExecution(runId, agentId!);
+    printLog(entry.logPath);
+    if (follow) await followLog(entry.logPath);
+  } finally {
+    db.close();
+  }
+}
+
+function printLog(path: string): void {
+  if (existsSync(path)) process.stdout.write(readFileSync(path, 'utf8'));
+}
+
+async function followLog(path: string): Promise<void> {
+  let offset = existsSync(path) ? readFileSync(path).length : 0;
+  await new Promise<void>((resolvePromise) => {
+    const watcher = watch(path, { persistent: true }, () => {
+      if (!existsSync(path)) return;
+      const content = readFileSync(path, 'utf8');
+      if (content.length < offset) offset = 0;
+      process.stdout.write(content.slice(offset));
+      offset = content.length;
+    });
+    const stop = (): void => { watcher.close(); resolvePromise(); };
+    process.once('SIGINT', stop);
+    process.once('SIGTERM', stop);
+  });
+}
+
 function authOptions(requireProfile: boolean): { backend: string; profile: string } {
   const backend = option('--backend');
   const profile = option('--profile');
@@ -360,6 +422,8 @@ Commands:
   auth logout --backend ID --profile N
                                      Delete a Keychain credential
   auth login --backend ID            Use the backend native CLI instead (OAuth unsupported)
+  logs <run-id> --list               List Agent execution IDs and log paths
+  logs <run-id> <agent-id> [--follow] Show one Agent log, optionally following it
   plan <goal.md> [options]           Ask Lead to create and validate a task DAG
   launch <goal.md> [options]         Plan and run end-to-end
   run <run-id>                       Execute Workers, Reviews, and Integration
@@ -376,11 +440,14 @@ Options:
 `);
 }
 
-function terminalApprovals(config: RunnerConfig): TerminalApprovalBroker {
+function terminalApprovals(config: RunnerConfig, ui?: LiveRunUi): TerminalApprovalBroker {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error('Planning and running require an interactive terminal for backend permissions and user questions.');
   }
-  return new TerminalApprovalBroker(process.stdin, process.stdout, config.interactionAlert);
+  return new TerminalApprovalBroker(process.stdin, process.stdout, config.interactionAlert, undefined, ui ? {
+    beforePrompt: ui.pause,
+    afterPrompt: ui.resume
+  } : undefined);
 }
 
 async function getBackend(

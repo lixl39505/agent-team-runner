@@ -3,7 +3,7 @@ import { basename, join, resolve } from 'node:path';
 import type { BackendId, LeadResult, RunnerConfig } from './types.js';
 import { StateDatabase } from './db.js';
 import { buildBackends, disposeBackends, type BackendPool, resolveAgent, snapshotAgents } from '../agent/registry.js';
-import { runAgent } from '../agent/supervise.js';
+import { executionInfo, runTrackedAgent, type AgentEventSink } from './agent-execution.js';
 import type { ApprovalHandler, UserInputHandler } from '../agent/approval.js';
 import type { AgentBackend } from '../agent/types.js';
 import { agentList } from './agent-config.js';
@@ -24,6 +24,7 @@ export async function planRun(input: {
   runId?: string;
   requestApproval?: ApprovalHandler;
   requestUserInput?: UserInputHandler;
+  onAgentEvent?: AgentEventSink;
   /** Test seam: production creates its own managed backend pool. */
   backends?: Record<BackendId, AgentBackend> | BackendPool;
 }): Promise<string> {
@@ -74,7 +75,11 @@ export async function planRun(input: {
 
 ${priorError}
 Return a corrected full manifest.` : '');
-        const result = await runAgent<LeadResult>({
+        const logPath = join(runDir, 'logs', `lead-${attempt}.log`);
+        const result = await runTrackedAgent<LeadResult>({
+          db: input.db,
+          execution: executionInfo(runId, `lead-${attempt}`, 'lead', leadBinding.backend, logPath, leadBinding.model),
+          ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {}),
           backend: await getBackend(backends, leadBinding),
           spec: {
             role: 'lead', cwd: repoRoot,
@@ -88,7 +93,7 @@ Return a corrected full manifest.` : '');
             requestUserInput: input.requestUserInput,
             timeoutMs: input.config.taskTimeoutMs, staleAfterMs: input.config.staleAfterMs
           },
-          logPath: join(runDir, 'logs', `lead-${attempt}.log`),
+          logPath,
           outputPath: join(runDir, `lead-result-${attempt}.json`)
         });
         if (!result.ok || !result.output) {

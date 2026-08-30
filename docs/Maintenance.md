@@ -33,8 +33,10 @@ src/
     credentials.ts        macOS Keychain API key 存储（service: agent-team-runner）
     terminal-input.ts     交互式 masked secret 输入
     preflight.ts          闭环预检：discover + listModels + probe（按 profile 缓存）
+    agent-execution.ts    runAgent 追踪包装器：持久化 Agent 实例并转发实时事件
+    live-ui.ts            ANSI 双栏运行界面（事件流 + Agent 实例状态）
     probe-cache.ts        probe 结果持久缓存（backend:profile|model|version 键，TTL）
-    db.ts                 SQLite 状态数据库（runs / tasks / events 三表）
+    db.ts                 SQLite 状态数据库（runs / tasks / events / agent_executions）
     types.ts              所有类型定义
     prompts.ts            角色 Prompt 模板（lead 注入 agents 注册表、worker 厚重试上下文）
     planner.ts            规划阶段：运行 Lead Agent 生成 DAG

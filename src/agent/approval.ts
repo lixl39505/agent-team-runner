@@ -52,6 +52,10 @@ export type UserInputHandler = (request: UserInputRequest, signal?: AbortSignal)
 type Ask = (prompt: string, signal?: AbortSignal) => Promise<string>;
 type Attention = (kind: 'approval' | 'question') => void;
 type Notify = (title: string, message: string) => void;
+export interface TerminalInteractionHooks {
+  beforePrompt(): void;
+  afterPrompt(): void;
+}
 export interface TerminalAlertColors {
   background: string;
   foreground: string;
@@ -69,7 +73,8 @@ export class ApprovalQueue {
   constructor(
     private readonly ask: Ask,
     private readonly write: (text: string) => void,
-    private readonly attention?: Attention
+    private readonly attention?: Attention,
+    private readonly hooks?: TerminalInteractionHooks
   ) {}
 
   request: ApprovalHandler = async (request, signal) => {
@@ -83,7 +88,12 @@ export class ApprovalQueue {
   private async enqueue<T>(prompt: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     const turn = this.tail.then(async () => {
       if (signal?.aborted) throw signal.reason ?? new Error('interaction cancelled');
-      return await prompt();
+      this.hooks?.beforePrompt();
+      try {
+        return await prompt();
+      } finally {
+        this.hooks?.afterPrompt();
+      }
     });
     this.tail = turn.then(() => {}, () => {});
     return await abortable(turn, signal);
@@ -181,7 +191,8 @@ export class TerminalApprovalBroker {
     input: Readable = process.stdin,
     output: Writable = process.stdout,
     colors: TerminalAlertColors = DEFAULT_ALERT_COLORS,
-    notify: Notify = sendSystemNotification
+    notify: Notify = sendSystemNotification,
+    hooks?: TerminalInteractionHooks
   ) {
     this.readline = createInterface({ input, output, terminal: true });
     const queue = new ApprovalQueue(
@@ -195,7 +206,8 @@ export class TerminalApprovalBroker {
         const message = 'Agent Team Runner needs your input.';
         output.write(`\n${alertStyle(colors)} ${label}: human input needed \x1b[0m\n`);
         notify('Agent Team Runner', `${label}. ${message}`);
-      }
+      },
+      hooks
     );
     this.request = queue.request;
     this.requestUserInput = queue.requestUserInput;
