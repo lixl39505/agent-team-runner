@@ -1,4 +1,4 @@
-import type { ExecutionContract, IntegrationResult, LeadResult, ReviewResult, SkillRequirement, TaskSpec, WorkerResult } from './types.js';
+import type { ContractBlockReason, ExecutionContract, IntegrationResult, ReviewResult, SkillRequirement, TaskSpec, WorkerResult } from './types.js';
 
 function assertObject(value: unknown, label: string): asserts value is Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -13,23 +13,6 @@ function stringArray(value: unknown, label: string): string[] {
   return value;
 }
 
-export function validateLeadResult(value: unknown, validAgentNames?: string[]): LeadResult {
-  assertObject(value, 'Lead result');
-  // 模型常把 version 写成字符串 "1"——schema 侧放宽为 number，这里收敛校验
-  const version = Number(value.version);
-  if (version !== 1) throw new Error('Lead result version must be 1');
-  if (typeof value.title !== 'string' || typeof value.summary !== 'string') {
-    throw new Error('Lead result title and summary are required');
-  }
-  if (!Array.isArray(value.tasks) || value.tasks.length === 0) {
-    throw new Error('Lead result must contain at least one task');
-  }
-  const tasks = value.tasks.map((task, index) => validateTaskSpec(task, index, validAgentNames));
-  validateTaskGraph(tasks);
-  validateParallelPathOwnership(tasks);
-  return { version: 1, title: value.title, summary: value.summary, tasks };
-}
-
 export function validateTaskSpec(value: unknown, index: number, validAgentNames?: string[]): TaskSpec {
   assertObject(value, `Task ${index}`);
   const id = String(value.id ?? '');
@@ -40,7 +23,7 @@ export function validateTaskSpec(value: unknown, index: number, validAgentNames?
   const description = String(value.description ?? '');
   if (!title || !description) throw new Error(`Task ${id} requires title and description`);
   if (value.adapter !== undefined) {
-    throw new Error(`Task ${id} uses the deprecated "adapter" field; v2 manifests select agents by name via "agent" (re-plan with a v2 config)`);
+    throw new Error(`Task ${id} uses the removed "adapter" field; use an agents registry name via "agent" instead`);
   }
   const agent = value.agent;
   if (agent !== undefined) {
@@ -110,7 +93,7 @@ function validateSkillRequirement(value: unknown, taskId: string, index: number)
   return { name, role: role as SkillRequirement['role'], required: value.required, source: source as SkillRequirement['source'] };
 }
 
-/** 验证外层 SDD 提交的执行契约，不调用 Lead，也不解释来源系统。 */
+/** 验证外层 SDD 提交的执行契约，不解释来源系统。 */
 export function validateExecutionContract(value: unknown, validAgentNames?: string[]): ExecutionContract {
   assertObject(value, 'Execution contract');
   if (Number(value.version) !== 1) throw new Error('Execution contract version must be 1');
@@ -248,9 +231,10 @@ function patternsMayOverlap(left: string, right: string): boolean {
 export function validateWorkerResult(value: unknown): WorkerResult {
   assertObject(value, 'Worker result');
   const status = String(value.status);
-  if (!['completed', 'blocked', 'failed'].includes(status)) throw new Error('Invalid worker status');
-  return {
-    status: status as WorkerResult['status'],
+  if (!['completed', 'blocked', 'blocked_on_contract', 'failed'].includes(status)) throw new Error('Invalid worker status');
+  const allowedKeys = new Set(['status', 'summary', 'testsRun', 'knownRisks', 'architectureImpact', 'progressImpact', 'blockedReason', 'contractBlock']);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) throw new Error('Worker result contains unknown fields');
+  const fields = {
     summary: String(value.summary ?? ''),
     testsRun: stringArray(value.testsRun ?? [], 'testsRun'),
     knownRisks: stringArray(value.knownRisks ?? [], 'knownRisks'),
@@ -258,6 +242,29 @@ export function validateWorkerResult(value: unknown): WorkerResult {
     progressImpact: String(value.progressImpact ?? ''),
     ...(typeof value.blockedReason === 'string' ? { blockedReason: value.blockedReason } : {})
   };
+  if (status === 'blocked_on_contract') {
+    if (value.contractBlock === undefined) throw new Error('blocked_on_contract worker result requires contractBlock');
+    return { ...fields, status: 'blocked_on_contract', contractBlock: validateContractBlockReason(value.contractBlock) };
+  }
+  if (value.contractBlock !== undefined) {
+    throw new Error('contractBlock is only valid when worker status is blocked_on_contract');
+  }
+  return { ...fields, status: status as 'completed' | 'blocked' | 'failed' };
+}
+
+function validateContractBlockReason(value: unknown): ContractBlockReason {
+  assertObject(value, 'contractBlock');
+  const allowedKeys = new Set(['code', 'message', 'requestedContractChanges', 'affectedPaths']);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) throw new Error('contractBlock contains unknown fields');
+  const code = value.code;
+  if (typeof code !== 'string' || !['out_of_scope', 'missing_requirement', 'conflicting_requirement', 'dependency_change', 'missing_access', 'other'].includes(code)) {
+    throw new Error('Invalid contractBlock code');
+  }
+  if (typeof value.message !== 'string') throw new Error('contractBlock.message must be a string');
+  if (!Object.hasOwn(value, 'requestedContractChanges')) throw new Error('contractBlock.requestedContractChanges is required');
+  const requestedContractChanges = stringArray(value.requestedContractChanges, 'contractBlock.requestedContractChanges');
+  const affectedPaths = value.affectedPaths === undefined ? undefined : stringArray(value.affectedPaths, 'contractBlock.affectedPaths');
+  return { code: code as ContractBlockReason['code'], message: value.message, requestedContractChanges, ...(affectedPaths === undefined ? {} : { affectedPaths }) };
 }
 
 export function validateReviewResult(value: unknown): ReviewResult {
@@ -298,33 +305,28 @@ export function validateIntegrationResult(value: unknown): IntegrationResult {
   };
 }
 
-export const LEAD_SCHEMA = {
-  type: 'object', additionalProperties: false,
-  required: ['version', 'title', 'summary', 'tasks'],
-  properties: {
-    version: { type: 'number' }, title: { type: 'string' }, summary: { type: 'string' },
-    tasks: { type: 'array', minItems: 1, items: {
-      type: 'object', additionalProperties: false,
-      required: ['id', 'title', 'description', 'dependsOn', 'allowedPaths', 'blockedPaths', 'acceptance', 'verificationCommands'],
-      properties: {
-        id: { type: 'string', pattern: '^[A-Z][A-Z0-9_-]{1,31}$' }, title: { type: 'string' }, description: { type: 'string' }, role: { type: 'string' },
-        agent: { type: 'string' }, dependsOn: { type: 'array', items: { type: 'string' } },
-        allowedPaths: { type: 'array', minItems: 1, items: { type: 'string' } }, blockedPaths: { type: 'array', items: { type: 'string' } },
-        acceptance: { type: 'array', minItems: 1, items: { type: 'string' } }, verificationCommands: { type: 'array', items: { type: 'string' } },
-        allowNoChanges: { type: 'boolean' }
-      }
-    }}
-  }
-} as const;
-
 export const WORKER_SCHEMA = {
   type: 'object', additionalProperties: false,
   required: ['status', 'summary', 'testsRun', 'knownRisks', 'architectureImpact', 'progressImpact'],
   properties: {
-    status: { enum: ['completed', 'blocked', 'failed'] }, summary: { type: 'string' },
+    status: { enum: ['completed', 'blocked', 'blocked_on_contract', 'failed'] }, summary: { type: 'string' },
     testsRun: { type: 'array', items: { type: 'string' } }, knownRisks: { type: 'array', items: { type: 'string' } },
-    architectureImpact: { type: 'string' }, progressImpact: { type: 'string' }, blockedReason: { type: 'string' }
-  }
+    architectureImpact: { type: 'string' }, progressImpact: { type: 'string' }, blockedReason: { type: 'string' },
+    contractBlock: {
+      type: 'object', additionalProperties: false,
+      required: ['code', 'message', 'requestedContractChanges'],
+      properties: {
+        code: { enum: ['out_of_scope', 'missing_requirement', 'conflicting_requirement', 'dependency_change', 'missing_access', 'other'] },
+        message: { type: 'string' },
+        requestedContractChanges: { type: 'array', items: { type: 'string' } },
+        affectedPaths: { type: 'array', items: { type: 'string' } }
+      }
+    }
+  },
+  allOf: [{
+    if: { properties: { status: { const: 'blocked_on_contract' } }, required: ['status'] },
+    then: { required: ['contractBlock'] }
+  }]
 } as const;
 
 export const REVIEW_SCHEMA = {

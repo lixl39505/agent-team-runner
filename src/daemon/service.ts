@@ -2,6 +2,8 @@ import { ensureAgentTeamHome, type AgentTeamHome } from '../core/home.js';
 import { StateDatabase } from '../core/db.js';
 import { createExecutionRun } from '../core/execution-run.js';
 import { runOrchestrator } from '../core/orchestrator.js';
+import type { AgentEventSink } from '../core/agent-execution.js';
+import type { ContractBlockReport } from '../core/types.js';
 import { ProjectRegistry, type JsonValue as ProjectJsonValue, type ProjectPolicyInput } from '../core/project-registry.js';
 import { runnerConfigFromProjectPolicy } from '../core/project-runtime.js';
 import type { ApprovalDecision, ApprovalHandler, UserInputAnswers, UserInputHandler } from '../agent/approval.js';
@@ -10,7 +12,7 @@ import { DaemonInstanceLock, type DaemonMetadata } from './instance-lock.js';
 import { LocalIpcClient, LocalIpcServer } from './ipc.js';
 
 type RunExecutor = (input: Pick<Parameters<typeof runOrchestrator>[0],
-  'config' | 'db' | 'runId' | 'requestApproval' | 'requestUserInput' | 'signal'
+  'config' | 'db' | 'runId' | 'requestApproval' | 'requestUserInput' | 'reportContractBlock' | 'onAgentEvent' | 'signal'
 >) => Promise<void>;
 
 type ActiveRun = {
@@ -127,6 +129,23 @@ function requiredStringArray(params: Record<string, unknown>, field: string, met
 function safeJsonValue(value: unknown): JsonValue {
   try {
     return JSON.parse(JSON.stringify(value, (_key, entry: unknown) => entry === undefined ? null : entry)) as JsonValue;
+  } catch {
+    return null;
+  }
+}
+
+function safeJsonPayload(value: unknown): JsonValue {
+  const seen = new WeakSet<object>();
+  try {
+    return JSON.parse(JSON.stringify(value, (_key, entry: unknown) => {
+      if (entry === undefined || typeof entry === 'function' || typeof entry === 'symbol') return null;
+      if (typeof entry === 'bigint') return String(entry);
+      if (entry && typeof entry === 'object') {
+        if (seen.has(entry)) return null;
+        seen.add(entry);
+      }
+      return entry;
+    })) as JsonValue;
   } catch {
     return null;
   }
@@ -443,6 +462,8 @@ export class AgentTeamDaemon {
           runId,
           requestApproval: this.requestApproval(runId),
           requestUserInput: this.requestUserInput(runId),
+          reportContractBlock: this.reportContractBlock(runId),
+          onAgentEvent: this.onAgentEvent(runId),
           signal: controller.signal
         });
       })
@@ -501,6 +522,41 @@ export class AgentTeamDaemon {
       );
       if (!isUserInputAnswers(answer)) throw new Error(`Invalid user input response for interaction ${interaction.id}`);
       return answer;
+    };
+  }
+
+  private reportContractBlock(runId: string): (report: ContractBlockReport) => void {
+    return (report) => {
+      try {
+        const task = JSON.parse(report.task.specJson) as { externalId?: unknown };
+        this.controlPlaneStore.queueInteraction({
+          runId,
+          taskId: report.task.taskId,
+          agentId: report.agentExecution.agentId,
+          sessionId: report.agentExecution.sessionId,
+          kind: 'contract_block',
+          request: safeJsonPayload({
+            type: 'blocked_on_contract',
+            taskId: report.task.taskId,
+            task: { title: report.task.title, externalId: task.externalId ?? null },
+            attempt: report.task.attempts,
+            reason: report.reason
+          })
+        });
+      } catch {
+        // Contract escalation must not turn a blocked task into an orchestrator exception.
+      }
+    };
+  }
+
+  private onAgentEvent(runId: string): AgentEventSink {
+    return (execution, event) => {
+      if (event.type === 'activity') return;
+      try {
+        this.stateDatabase.addEvent(runId, execution.taskId ?? null, 'AGENT_EVENT', safeJsonPayload({ execution, event }));
+      } catch {
+        // Observability failures must not interrupt the agent execution.
+      }
     };
   }
 

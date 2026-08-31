@@ -21,7 +21,7 @@ function assertSafeRunId(runId: string): void {
 }
 
 /**
- * Materialize a validated external execution contract without invoking a Lead.
+ * Materialize a validated external execution contract.
  * The resulting run is directly consumable by the existing orchestrator.
  */
 export async function createExecutionRun(input: {

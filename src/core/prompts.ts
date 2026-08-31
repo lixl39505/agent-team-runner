@@ -1,58 +1,6 @@
 import type { ResolvedSkill, ReviewResult, RunManifest, TaskSpec } from './types.js';
 import { loadSkill } from './files.js';
 
-export interface LeadAgentOption {
-  name: string;
-  backend: string;
-  model?: string | undefined;
-  description?: string | undefined;
-}
-
-export function leadPrompt(input: {
-  goal: string;
-  goalFile: string;
-  repoRoot: string;
-  baseRef: string;
-  baseSha: string;
-  allowedCommandPrefixes: string[];
-  /** agents 注册表（人工筛选的能力清单）：Lead 只能从中为任务点名 agent */
-  agents: LeadAgentOption[];
-}): string {
-  const agents = input.agents.length > 0
-    ? `
-# Agent registry (optional per-task "agent" field)
-
-Tasks may name an agent from this registry via the "agent" field when a task clearly benefits from a specific agent; omit it to inherit the worker role default. Do not invent agent names.
-${input.agents.map((agent) => `- ${agent.name}: ${agent.backend}${agent.model ? ` / ${agent.model}` : ''}${agent.description ? ` — ${agent.description}` : ''}`).join('\n')}
-`
-    : '';
-  return `${loadSkill('lead')}
-
-# Runtime context
-
-Repository: ${input.repoRoot}
-Base ref: ${input.baseRef}
-Base SHA: ${input.baseSha}
-Goal file: ${input.goalFile}
-
-# Initial goal
-
-${input.goal}
-${agents}
-# Verification command policy
-
-Every verification command must begin with one of these allowlisted prefixes:
-${input.allowedCommandPrefixes.map((value) => `- ${value}`).join('\n')}
-
-# Path policy for task allowedPaths
-
-Every task's allowedPaths entries must be glob patterns relative to the repository root:
-use "src/**" (or "src/**/*") to own a directory tree and "src/file.ts" for a single file.
-Never use a bare directory name like "src" — write "src/**" instead.
-
-Inspect the repository before decomposing the work. Return only the structured task manifest. Do not modify repository files.`;
-}
-
 const DIFF_LIMIT = 24_000;
 
 export interface WorkerRetryContext {
@@ -104,7 +52,11 @@ Task specification:
 ${JSON.stringify(input.task, null, 2)}
 
 ${skillHandoff}${input.priorFeedback ? `# Previous failure or review feedback\n\n${input.priorFeedback}\n` : ''}${retry}
-The Runner owns staging and commits. You may run the task verification commands while implementing; the Runner repeats them after your turn. Do not run git add, git commit, git merge, git rebase, git push, deployment, or production mutations. Work only inside the current worktree. At the end, return the structured Worker result.`;
+The Runner owns staging and commits. You may run the task verification commands while implementing; the Runner repeats them after your turn. Do not run git add, git commit, git merge, git rebase, git push, deployment, or production mutations. Work only inside the current worktree.
+
+# Contract escalation
+
+Use status \`blocked_on_contract\` only when continuing requires a change to the task contract: scope or path ownership, acceptance criteria, dependencies, required access or permission, or a missing/conflicting requirement. Do not use it for ordinary implementation failures or uncertainty, and never expand scope yourself. When using it, provide \`contractBlock\` with a code, a clear message, requestedContractChanges, and affectedPaths when known. Use ordinary \`blocked\` for non-contract blockers. At the end, return the structured Worker result.`;
 }
 
 function truncate(text: string, limit: number): string {

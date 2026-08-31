@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import type {
   BackendId,
+  ContractBlockReport,
   IntegrationResult,
   ReviewResult,
   RunManifest,
@@ -62,6 +63,8 @@ export async function runOrchestrator(input: {
   requestApproval?: ApprovalHandler;
   requestUserInput?: UserInputHandler;
   onAgentEvent?: AgentEventSink;
+  /** Optional outer-service hook for worker requests to change the execution contract. */
+  reportContractBlock?: (report: ContractBlockReport) => void | Promise<void>;
   signal?: AbortSignal | undefined;
   /** Test seam: production creates its own managed backend pool. */
   backends?: Record<BackendId, AgentBackend> | BackendPool;
@@ -105,7 +108,7 @@ export async function runOrchestrator(input: {
       if (interrupted) return;
       const tasks = db.listTasks(runId);
       const approved = new Set(tasks.filter((task) => task.status === 'approved').map((task) => task.taskId));
-      const terminalProblem = tasks.find((task) => task.status === 'blocked' || task.status === 'failed');
+      const terminalProblem = tasks.find((task) => ['blocked', 'blocked_on_contract', 'failed'].includes(task.status));
       if (terminalProblem) {
         db.updateRun(runId, { status: 'needs_attention', error: `${terminalProblem.taskId}: ${terminalProblem.lastError ?? terminalProblem.status}` });
         return;
@@ -125,7 +128,8 @@ export async function runOrchestrator(input: {
             signal: input.signal,
             ...(input.requestApproval ? { requestApproval: input.requestApproval } : {}),
             ...(input.requestUserInput ? { requestUserInput: input.requestUserInput } : {}),
-            ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {})
+            ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {}),
+            ...(input.reportContractBlock ? { reportContractBlock: input.reportContractBlock } : {})
         })
           .catch((error) => {
             db.updateTask(runId, candidate.taskId, {
@@ -138,7 +142,7 @@ export async function runOrchestrator(input: {
       }
 
       if (active.size === 0) {
-        const blockedByGraph = db.listTasks(runId).filter((task) => !['approved', 'failed', 'blocked'].includes(task.status));
+        const blockedByGraph = db.listTasks(runId).filter((task) => !['approved', 'failed', 'blocked', 'blocked_on_contract'].includes(task.status));
         if (blockedByGraph.length > 0) {
           db.updateRun(runId, { status: 'needs_attention', error: 'No runnable tasks remain; inspect dependency and task states.' });
           return;
@@ -194,6 +198,7 @@ async function executeTask(input: {
   requestApproval?: ApprovalHandler;
   requestUserInput?: UserInputHandler;
   onAgentEvent?: AgentEventSink;
+  reportContractBlock?: (report: ContractBlockReport) => void | Promise<void>;
   signal?: AbortSignal | undefined;
 }): Promise<void> {
   const { config, db, runId, backends } = input;
@@ -201,7 +206,7 @@ async function executeTask(input: {
   const task = taskSpec(record);
   const run = db.getRun(runId);
   const runDir = join(config.workspace.stateDir, 'runs', runId);
-  // Worker：Lead manifest 的 task.agent 优先（连带 model），否则用 plan 时固化的角色快照（回退当前 config）
+  // Worker：任务的 task.agent 优先（连带 model），否则用创建运行时固化的角色快照（回退当前 config）。
   const workerBinding = resolveTaskAgent(task, config, run.rolesJson);
   const worktreeInfo = await ensureTaskWorktree({ config, db, runId, record, task, manifest: parseManifest(run.manifestJson) });
   record = db.getTask(runId, task.id);
@@ -232,9 +237,10 @@ async function executeTask(input: {
       db.updateTask(runId, task.id, { phase: 'worker-active' });
     }
   };
+  const workerExecution = executionInfo(runId, `${task.id}-worker-${attempts}`, 'worker', workerBinding.backend, logPath, workerBinding.model, task.id);
   const worker = await runTrackedAgent<WorkerResult>({
     db,
-    execution: executionInfo(runId, `${task.id}-worker-${attempts}`, 'worker', workerBinding.backend, logPath, workerBinding.model, task.id),
+    execution: workerExecution,
     signal: input.signal,
     ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {}),
     backend: await getBackend(backends, workerBinding),
@@ -263,6 +269,24 @@ async function executeTask(input: {
     db.addEvent(runId, task.id, 'WORKER_BLOCKED', workerResult);
     return;
   }
+  if (workerResult.status === 'blocked_on_contract') {
+    const finishedAt = new Date().toISOString();
+    db.updateTask(runId, task.id, { status: 'blocked_on_contract', phase: 'worker', lastError: workerResult.contractBlock!.message, finishedAt });
+    db.addEvent(runId, task.id, 'WORKER_BLOCKED_ON_CONTRACT', workerResult);
+    if (input.reportContractBlock) {
+      try {
+        await input.reportContractBlock({
+          run,
+          task: db.getTask(runId, task.id),
+          agentExecution: db.getAgentExecution(runId, workerExecution.agentId),
+          reason: workerResult.contractBlock!
+        });
+      } catch (error) {
+        db.addEvent(runId, task.id, 'WORKER_CONTRACT_BLOCK_REPORT_FAILED', { error: String(error) });
+      }
+    }
+    return;
+  }
   if (workerResult.status === 'failed') {
     await retryOrFail({ config, db, runId, taskId: task.id, attempts, error: workerResult.summary });
     return;
@@ -286,7 +310,7 @@ async function executeTask(input: {
   const reviewHeadBefore = await currentHead(worktreeInfo.path);
   const reviewStatusBefore = (await git(worktreeInfo.path, ['status', '--porcelain=v1', '-z'])).stdout;
   const candidateDiff = (await git(worktreeInfo.path, ['diff', '--cached', '--binary'])).stdout;
-  // Reviewer 独立解析角色绑定（plan 快照优先），不复用 Worker 的会话
+  // Reviewer 独立解析角色绑定（运行快照优先），不复用 Worker 的会话。
   const reviewerBinding = resolveAgentWithSnapshot('reviewer', config, run.rolesJson);
   const reviewLogPath = join(runDir, 'logs', `${task.id}-review-${reviewCycle}.log`);
   const reviewRun = await runTrackedAgent<ReviewResult>({

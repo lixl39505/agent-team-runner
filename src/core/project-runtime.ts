@@ -128,7 +128,7 @@ export function runnerConfigFromProjectPolicy(
   const roles: RunnerConfig['roles'] = {};
   if (agentMapping.roles !== undefined) {
     const rolesInput = object(agentMapping.roles, 'agentProfileMapping.roles');
-    allowedKeys(rolesInput, ['lead', 'worker', 'reviewer', 'integrator'], 'agentProfileMapping.roles');
+    allowedKeys(rolesInput, ['worker', 'reviewer', 'integrator'], 'agentProfileMapping.roles');
     for (const [role, value] of Object.entries(rolesInput)) {
       roles[role as keyof RunnerConfig['roles']] = string(value, `agentProfileMapping.roles.${role}`);
     }
@@ -164,8 +164,7 @@ export function runnerConfigFromProjectPolicy(
   if (backendPolicy.taskTimeoutMs !== undefined) config.taskTimeoutMs = positiveInteger(backendPolicy.taskTimeoutMs, 'backendPolicy.taskTimeoutMs');
   if (backendPolicy.retry !== undefined) {
     const retry = object(backendPolicy.retry, 'backendPolicy.retry');
-    allowedKeys(retry, ['maxPlanAttempts', 'maxWorkerAttempts', 'maxReviewCycles'], 'backendPolicy.retry');
-    if (retry.maxPlanAttempts !== undefined) config.retry.maxPlanAttempts = positiveInteger(retry.maxPlanAttempts, 'backendPolicy.retry.maxPlanAttempts');
+    allowedKeys(retry, ['maxWorkerAttempts', 'maxReviewCycles'], 'backendPolicy.retry');
     if (retry.maxWorkerAttempts !== undefined) config.retry.maxWorkerAttempts = positiveInteger(retry.maxWorkerAttempts, 'backendPolicy.retry.maxWorkerAttempts');
     if (retry.maxReviewCycles !== undefined) config.retry.maxReviewCycles = positiveInteger(retry.maxReviewCycles, 'backendPolicy.retry.maxReviewCycles');
   }

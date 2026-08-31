@@ -1,13 +1,12 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DEFAULT_CONFIG } from '../src/core/config.ts';
 import { StateDatabase } from '../src/core/db.ts';
 import { currentHead, git } from '../src/core/git.ts';
 import { snapshotAgents } from '../src/agent/registry.ts';
-import { planRun } from '../src/core/planner.ts';
 import { runOrchestrator } from '../src/core/orchestrator.ts';
 
 async function repository() {
@@ -29,7 +28,7 @@ function configFor(repoRoot) {
     ...DEFAULT_CONFIG,
     workspace: { ...DEFAULT_CONFIG.workspace, repoRoot, stateDir: join(tmpdir(), `${name}-state`), worktreesDir: join(tmpdir(), `${name}-worktrees`) },
     concurrency: 1,
-    retry: { ...DEFAULT_CONFIG.retry, maxPlanAttempts: 2, maxWorkerAttempts: 2, maxReviewCycles: 2 },
+    retry: { ...DEFAULT_CONFIG.retry, maxWorkerAttempts: 2, maxReviewCycles: 2 },
     integration: { ...DEFAULT_CONFIG.integration, runAgentAfterCherryPick: false },
     verification: { ...DEFAULT_CONFIG.verification, globalCommands: [] }
   };
@@ -99,38 +98,6 @@ async function createPlannedRun(db, config, manifest, id = 'run') {
 function eventTypes(db, runId) {
   return db.db.prepare('SELECT event_type FROM events WHERE run_id = ? ORDER BY id').all(runId).map((row) => row.event_type);
 }
-
-test('planner retries an invalid manifest and persists the validated plan atomically', async () => {
-  const repoRoot = await repository();
-  const config = configFor(repoRoot);
-  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
-  let attempts = 0;
-  const backend = new ScriptBackend(() => {
-    attempts += 1;
-    return {
-      version: 1,
-      title: 'Plan',
-      summary: 'test plan',
-      tasks: [task({ verificationCommands: attempts === 1 ? ['rm -rf .'] : [] })]
-    };
-  });
-  try {
-    const runId = await planRun({
-      config, db, goalFile: 'goal.md', runId: 'plan-test', backends: backendPool(backend)
-    });
-
-    assert.equal(runId, 'plan-test');
-    assert.equal(attempts, 2);
-    assert.equal(db.getRun(runId).status, 'planned');
-    assert.equal(db.listTasks(runId).length, 1);
-    assert.ok(db.getRun(runId).rolesJson);
-    assert.ok(existsSync(join(config.workspace.stateDir, 'runs', runId, 'manifest.json')));
-    assert.ok(existsSync(join(config.workspace.stateDir, 'runs', runId, 'tasks', 'T001.md')));
-    assert.deepEqual(eventTypes(db, runId).filter((type) => type === 'PLAN_VALIDATION_FAILED').length, 1);
-  } finally {
-    db.close();
-  }
-});
 
 test('orchestrator retries reviewer feedback and integrates the approved task', async () => {
   const repoRoot = await repository();

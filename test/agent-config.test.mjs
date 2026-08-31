@@ -41,21 +41,20 @@ test('resolves roles through the registry and falls back to defaultAgent', () =>
     'retry: {}',
     'status: {}',
     'agents:',
-    '  lead-agent: { backend: codex, model: gpt-5.6-terra }',
+    '  default-agent: { backend: codex, model: gpt-5.6-terra }',
     '  fast-worker: { backend: opencode, model: deepseek/v4-flash }',
     'roles:',
-    '  lead: lead-agent',
     '  worker: fast-worker'
   ].join('\n'), { flag: 'w' });
   const config = loadConfig(repo);
-  const lead = resolveAgent('lead', config);
+  const worker = resolveAgent('worker', config);
   assert.deepEqual(
-    { agent: lead.agent, backend: lead.backend, model: lead.model },
-    { agent: 'lead-agent', backend: 'codex', model: 'gpt-5.6-terra' }
+    { agent: worker.agent, backend: worker.backend, model: worker.model },
+    { agent: 'fast-worker', backend: 'opencode', model: 'deepseek/v4-flash' }
   );
   // 未配置的角色回退 defaultAgent（自定义注册表时自动取第一个条目）
   const reviewer = resolveAgent('reviewer', config);
-  assert.equal(reviewer.agent, 'lead-agent');
+  assert.equal(reviewer.agent, 'default-agent');
   assert.equal(reviewer.backend, 'codex');
   assert.equal(reviewer.source, 'defaultAgent');
 });
@@ -70,13 +69,13 @@ test('accepts inline backend.model specs and rejects unknown agents', () => {
     'agents:',
     '  a: { backend: codex }',
     'roles:',
-    '  lead: codex.gpt-5.6-terra',
+    '  reviewer: codex.gpt-5.6-terra',
     '  worker: no-such-agent'
   ].join('\n'), { flag: 'w' });
   const config = loadConfig(repo);
-  const lead = resolveAgent('lead', config);
+  const reviewer = resolveAgent('reviewer', config);
   assert.deepEqual(parseInlineAgentSpec('codex.gpt-5.6-terra'), { backend: 'codex', model: 'gpt-5.6-terra' });
-  assert.equal(lead.model, 'gpt-5.6-terra');
+  assert.equal(reviewer.model, 'gpt-5.6-terra');
   assert.throws(() => resolveAgent('worker', config), /unknown agent "no-such-agent"/);
   assert.equal(validateAgents(config).ok, false);
 });
@@ -140,34 +139,32 @@ test('snapshot keeps runs hermetic and parses legacy v1 snapshots', () => {
     'retry: {}',
     'status: {}',
     'agents:',
-    '  lead-agent: { backend: codex, model: gpt-5.6-terra }',
-    'roles:',
-    '  lead: lead-agent'
+    '  default-agent: { backend: codex, model: gpt-5.6-terra }'
   ].join('\n'), { flag: 'w' });
   const config = loadConfig(repo);
   const snapshot = snapshotAgents(config);
   assert.equal(snapshot.version, 2);
-  assert.ok(snapshot.agents['lead-agent']);
+  assert.ok(snapshot.agents['default-agent']);
   // v2 快照：即使 config 后续删掉 agent，快照仍可解析
   const mutated = { ...config, agents: {}, roles: {} };
   const fromSnapshot = resolveTaskAgent(
-    { id: 'T001', title: 't', description: 'd', agent: 'lead-agent', dependsOn: [], allowedPaths: ['src/**'], blockedPaths: [], acceptance: [], verificationCommands: [] },
+    { id: 'T001', title: 't', description: 'd', agent: 'default-agent', dependsOn: [], allowedPaths: ['src/**'], blockedPaths: [], acceptance: [], verificationCommands: [] },
     mutated,
     JSON.stringify(snapshot)
   );
   assert.equal(fromSnapshot.model, 'gpt-5.6-terra');
   // v1 旧快照形状 {cli, model}
-  const legacy = parseSnapshot(JSON.stringify({ lead: { cli: 'codex', model: 'gpt-5.6-terra', source: 'codex.terra' } }));
+  const legacy = parseSnapshot(JSON.stringify({ worker: { cli: 'codex', model: 'gpt-5.6-terra', source: 'codex.terra' } }));
   assert.equal(legacy.version, 2);
-  assert.equal(legacy.roles.lead.backend, 'codex');
-  assert.equal(legacy.roles.lead.model, 'gpt-5.6-terra');
+  assert.equal(legacy.roles.worker.backend, 'codex');
+  assert.equal(legacy.roles.worker.model, 'gpt-5.6-terra');
 });
 
 test('allows an intentionally unset role binding', () => {
   const result = validateAgents({
     defaultAgent: 'default',
     agents: { default: { backend: 'claude' } },
-    roles: { lead: '', worker: 'default' }
+    roles: { worker: 'default' }
   });
 
   assert.deepEqual(result, { ok: true, errors: [], warnings: [] });

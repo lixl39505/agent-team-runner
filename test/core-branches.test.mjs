@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { applyOverrides, DEFAULT_CONFIG, initConfig, loadConfig } from '../src/core/config.ts';
 import { agentList, backendCommand, isBackendId, isValidAgentName, parseInlineAgentSpec, validateAgents } from '../src/core/agent-config.ts';
 import { checkPaths, globMatch, patternMatches } from '../src/core/path-policy.ts';
-import { validateIntegrationResult, validateLeadResult, validateReviewResult, validateTaskGraph, validateWorkerResult } from '../src/core/validation.ts';
+import { validateIntegrationResult, validateReviewResult, validateTaskGraph, validateWorkerResult } from '../src/core/validation.ts';
 import { ProbeCache } from '../src/core/probe-cache.ts';
 import { assertAllowedCommand, splitCommand } from '../src/core/shell.ts';
 import { bindingsForRun, checkAgentAvailability, probeAll } from '../src/core/preflight.ts';
@@ -83,7 +83,7 @@ test('agent config validates malformed registry entries', () => {
     ...DEFAULT_CONFIG,
     defaultAgent: 'missing',
     agents: { 'bad.name': { backend: 'unknown' } },
-    roles: { lead: 'codex.model', worker: 'nope' }
+    roles: { reviewer: 'codex.model', worker: 'nope' }
   };
   const result = validateAgents(invalid);
   assert.equal(result.ok, false);
@@ -115,12 +115,6 @@ test('path policy normalizes globs and identifies invalid and blocked files', ()
 });
 
 test('validation rejects malformed manifests and result payloads', () => {
-  assert.throws(() => validateLeadResult(null), /must be an object/);
-  assert.throws(() => validateLeadResult({ version: 1, title: 'x', summary: 'x', tasks: [task('T001', { dependsOn: ['NOPE'] })] }), /unknown task/);
-  assert.throws(() => validateLeadResult({ version: 1, title: 'x', summary: 'x', tasks: [task('T001'), task('T001')] }), /Duplicate/);
-  assert.throws(() => validateLeadResult({ version: 1, title: 'x', summary: 'x', tasks: [task('T001', { dependsOn: ['T001'] })] }), /cannot depend on itself/);
-  assert.throws(() => validateLeadResult({ version: 1, title: 'x', summary: 'x', tasks: [task('T001', { allowedPaths: [] })] }), /no allowed paths/);
-  assert.throws(() => validateLeadResult({ version: 1, title: 'x', summary: 'x', tasks: [task('T001', { verificationCommands: [1] })] }), /string array/);
   assert.throws(() => validateTaskGraph([task('T001', { dependsOn: ['T002'] }), task('T002', { dependsOn: ['T001'] })]), /cycle/);
   assert.throws(() => validateWorkerResult({ status: 'unknown' }), /Invalid worker status/);
   assert.throws(() => validateWorkerResult({ status: 'completed', testsRun: 'no' }), /testsRun must be a string array/);
@@ -230,7 +224,7 @@ test('bindingsForRun falls back from invalid snapshots and deduplicates task age
   };
   const bindings = bindingsForRun(value, '{bad json', JSON.stringify({ tasks: [{ agent: 'specialist' }, { agent: 'specialist' }] }));
   assert.equal(bindings.filter((binding) => binding.agent === 'specialist').length, 1);
-  assert.equal(bindings.filter((binding) => binding.agent === 'main').length, 4);
+  assert.equal(bindings.filter((binding) => binding.agent === 'main').length, 3);
 });
 
 test('preflight resolves profiled backend-pool bindings with OpenCode isolation rules', async () => {

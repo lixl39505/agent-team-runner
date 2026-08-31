@@ -36,7 +36,7 @@ test('queues persistent JSON interactions, filters them, and lists oldest first'
       runId: 'run-2',
       taskId: null,
       sessionId: null,
-      kind: 'agent_question',
+      kind: 'contract_block',
       request: { sequence: 1 }
     }));
     store.db.prepare('UPDATE interactions SET created_at = ? WHERE id = ?').run('2026-01-01T00:00:00.000Z', earlier.id);

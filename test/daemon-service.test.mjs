@@ -53,9 +53,9 @@ function projectPolicy() {
     verificationAllowedCommandPrefixes: ['npm test'],
     baselinePathPolicy: { allowed: ['src/**'] },
     agentProfileMapping: {
-      defaultAgent: 'lead',
-      agents: { lead: { backend: 'codex' } },
-      roles: { lead: 'lead' }
+      defaultAgent: 'worker',
+      agents: { worker: { backend: 'codex' } },
+      roles: { worker: 'worker' }
     },
     backendPolicy: {}
   };
@@ -73,7 +73,7 @@ function executionContract(project, repoRoot) {
       title: 'Create feature',
       description: 'Implement the feature.',
       role: 'worker',
-      agent: 'lead',
+      agent: 'worker',
       dependsOn: [],
       allowedPaths: ['src/**'],
       blockedPaths: ['docs/**'],
@@ -637,6 +637,139 @@ test('AgentTeamDaemon persists daemon approval and user-input interactions', asy
       assert.match(results[7], /Invalid user input response/);
       assert.equal(store.listInteractions()[4].sessionId, 'input-session');
       assert.equal(store.listInteractions()[5].sessionId, null);
+    } finally {
+      client.close();
+      await daemon.stop();
+      store.close();
+    }
+  });
+});
+
+test('AgentTeamDaemon persists contract blocks and non-activity agent events safely', async () => {
+  await withHome(async (home) => {
+    const { repoRoot, gitCommonDir } = await repository(dirname(home.root));
+    const store = new ControlPlaneStore(home.stateDb);
+    const daemon = new AgentTeamDaemon(home, {
+      controlPlaneStore: store,
+      runExecutor: async (input) => {
+        const task = input.db.getTask(input.runId, 'T001');
+        const execution = {
+          runId: input.runId, agentId: 'T001-worker-1', taskId: 'T001', role: 'worker', backend: 'codex',
+          logPath: '/tmp/worker.log'
+        };
+        input.onAgentEvent(execution, { type: 'activity' });
+        const circular = { command: 'npm test' };
+        circular.self = circular;
+        input.onAgentEvent(execution, { type: 'tool-call', tool: 'shell', input: circular });
+        input.onAgentEvent(execution, {
+          type: 'tool-call', tool: 'unserializable', input: { toJSON() { throw new Error('cannot serialize'); } }
+        });
+        input.onAgentEvent(execution, { type: 'tool-call', tool: 'values', input: [undefined, () => {}, Symbol('value'), 1n] });
+        input.reportContractBlock({
+          task,
+          agentExecution: { ...execution, sessionId: 'worker-session' },
+          reason: {
+            code: 'out_of_scope', message: 'Task must own src/other.ts.',
+            requestedContractChanges: ['Add src/other.ts to allowedPaths'], affectedPaths: ['src/other.ts']
+          }
+        });
+      }
+    });
+    await daemon.start();
+    const client = new LocalIpcClient(home.socket);
+    try {
+      await client.connect();
+      const project = await client.request('project.register', {
+        gitCommonDir, repoRoot, displayName: 'Contract block execution', gitIdentity: {}, policy: projectPolicy()
+      });
+      await client.request('execution.submit', { contract: executionContract(project, repoRoot), runId: 'contract-block-execution' });
+      await waitFor(() => store.listInteractions('contract-block-execution').length === 1);
+
+      assert.deepEqual(store.listInteractions('contract-block-execution')[0], {
+        ...store.listInteractions('contract-block-execution')[0],
+        runId: 'contract-block-execution',
+        taskId: 'T001',
+        agentId: 'T001-worker-1',
+        sessionId: 'worker-session',
+        kind: 'contract_block',
+        request: {
+          type: 'blocked_on_contract',
+          taskId: 'T001',
+          task: { title: 'Create feature', externalId: 'SPEC-1' },
+          attempt: 0,
+          reason: {
+            code: 'out_of_scope', message: 'Task must own src/other.ts.',
+            requestedContractChanges: ['Add src/other.ts to allowedPaths'], affectedPaths: ['src/other.ts']
+          }
+        },
+        status: 'queued',
+        claimedByClientId: null,
+        response: null,
+        claimedAt: null,
+        resolvedAt: null
+      });
+      const events = daemon.stateDatabase.listEvents('contract-block-execution');
+      assert.equal(events.filter((event) => event.eventType === 'AGENT_EVENT').length, 3);
+      assert.deepEqual(events.find((event) => event.eventType === 'AGENT_EVENT')?.payload, {
+        execution: {
+          runId: 'contract-block-execution', agentId: 'T001-worker-1', taskId: 'T001', role: 'worker', backend: 'codex',
+          logPath: '/tmp/worker.log'
+        },
+        event: { type: 'tool-call', tool: 'shell', input: { command: 'npm test', self: null } }
+      });
+      const agentEvents = events.filter((event) => event.eventType === 'AGENT_EVENT');
+      assert.equal(agentEvents.at(-2)?.payload, null);
+      assert.deepEqual(agentEvents.at(-1)?.payload, {
+        execution: {
+          runId: 'contract-block-execution', agentId: 'T001-worker-1', taskId: 'T001', role: 'worker', backend: 'codex',
+          logPath: '/tmp/worker.log'
+        },
+        event: { type: 'tool-call', tool: 'values', input: [null, null, null, '1'] }
+      });
+    } finally {
+      client.close();
+      await daemon.stop();
+      store.close();
+    }
+  });
+});
+
+test('AgentTeamDaemon ignores contract-block persistence failures', async () => {
+  await withHome(async (home) => {
+    const { repoRoot, gitCommonDir } = await repository(dirname(home.root));
+    const store = new ControlPlaneStore(home.stateDb);
+    store.queueInteraction = () => { throw new Error('store unavailable'); };
+    let executorCompleted = false;
+    const daemon = new AgentTeamDaemon(home, {
+      controlPlaneStore: store,
+      runExecutor: async (input) => {
+        const addEvent = input.db.addEvent.bind(input.db);
+        input.db.addEvent = () => { throw new Error('events unavailable'); };
+        input.onAgentEvent({ runId: input.runId, agentId: 'T001-worker-1', role: 'worker', backend: 'codex', logPath: '/tmp/worker.log' }, {
+          type: 'message', text: 'continue'
+        });
+        input.db.addEvent = addEvent;
+        const task = input.db.getTask(input.runId, 'T001');
+        task.specJson = '{}';
+        input.reportContractBlock({
+          task,
+          agentExecution: { agentId: 'T001-worker-1', sessionId: null },
+          reason: { code: 'other', message: 'Contract decision needed.', requestedContractChanges: [] }
+        });
+        executorCompleted = true;
+      }
+    });
+    await daemon.start();
+    const client = new LocalIpcClient(home.socket);
+    try {
+      await client.connect();
+      const project = await client.request('project.register', {
+        gitCommonDir, repoRoot, displayName: 'Unavailable contract store', gitIdentity: {}, policy: projectPolicy()
+      });
+      await client.request('execution.submit', { contract: executionContract(project, repoRoot), runId: 'contract-block-store-failure' });
+      await waitFor(() => executorCompleted);
+      assert.equal(daemon.stateDatabase.getRun('contract-block-store-failure').status, 'planned');
+      assert.equal(eventTypes(daemon.stateDatabase, 'contract-block-store-failure').includes('RUN_DAEMON_FAILED'), false);
     } finally {
       client.close();
       await daemon.stop();

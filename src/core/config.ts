@@ -17,7 +17,6 @@ export const DEFAULT_CONFIG: RunnerConfig = {
     branchPrefix: 'agent-team'
   },
   retry: {
-    maxPlanAttempts: 2,
     maxWorkerAttempts: 2,
     maxReviewCycles: 2
   },
@@ -120,7 +119,6 @@ workspace:
 
 # 重试与状态刷新
 retry:
-  maxPlanAttempts: 2
   maxWorkerAttempts: 2
   maxReviewCycles: 2
 status:
@@ -135,15 +133,8 @@ backends:
   opencode:
     nativeWindowsSandbox: require
 
-# agent 注册表：为不同 role 配置不同 agent（背后不同 model）
+# agent 注册表：为不同角色配置不同 agent（背后不同 model）
 # agents:
-#   lead-agent:
-#     backend: codex
-#     model: gpt-5.6-terra
-#     description: strong planner
-#     authProfile: work # Keychain profile name; never put API keys here
-#     authIsolation: isolated # shared (default behavior) or isolated
-#     baseUrl: https://api.example.com/v1
 #   fast-worker:
 #     backend: opencode
 #     model: deepseek/v4-flash
@@ -152,12 +143,10 @@ backends:
 #     model: claude-sonnet-5
 
 # 角色 → agent 名（未配置的角色回退 defaultAgent）
-# Lead 可在 manifest 的任务里用 "agent" 字段引用注册表中的任何 agent
 # roles:
-#   lead: lead-agent
 #   worker: fast-worker
 #   reviewer: careful-review
-#   integrator: lead-agent
+#   integrator: careful-review
 
 agents:
   default-claude:
@@ -197,6 +186,7 @@ export function loadConfig(inputRepoRoot: string): RunnerConfig {
     throw new Error(`Config file ${file} must declare version: 3`);
   }
   const effective: Record<string, unknown> = { ...raw };
+  rejectRemovedConfigKeys(effective);
 
   const merged: RunnerConfig = {
     ...DEFAULT_CONFIG,
@@ -268,6 +258,9 @@ export function applyOverrides(config: RunnerConfig, overrides: ConfigOverride[]
   for (const { key, value } of overrides) {
     const segments = key.split('.').filter((segment) => segment.length > 0);
     if (segments.length === 0) throw new Error(`Invalid -c override: empty key`);
+    if ((segments[0] === 'roles' && segments[1] === 'lead') || (segments[0] === 'retry' && segments[1] === 'maxPlanAttempts')) {
+      throw new Error(`-c ${key} references a removed configuration key`);
+    }
     let target: Record<string, unknown> = config as unknown as Record<string, unknown>;
     for (const segment of segments.slice(0, -1)) {
       const next = target[segment];
@@ -280,6 +273,17 @@ export function applyOverrides(config: RunnerConfig, overrides: ConfigOverride[]
   }
   validateInteractionAlert(config);
   return config;
+}
+
+function rejectRemovedConfigKeys(config: Record<string, unknown>): void {
+  const roles = config.roles;
+  if (roles && typeof roles === 'object' && !Array.isArray(roles) && Object.hasOwn(roles, 'lead')) {
+    throw new Error('roles.lead has been removed');
+  }
+  const retry = config.retry;
+  if (retry && typeof retry === 'object' && !Array.isArray(retry) && Object.hasOwn(retry, 'maxPlanAttempts')) {
+    throw new Error('retry.maxPlanAttempts has been removed');
+  }
 }
 
 function validateInteractionAlert(config: RunnerConfig): void {

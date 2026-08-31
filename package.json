@@ -1,7 +1,7 @@
 {
   "name": "agent-team-runner",
   "version": "0.1.0",
-  "description": "Reusable local orchestrator for Lead/Worker/Reviewer/Integrator coding agents with Git worktrees and SQLite.",
+  "description": "Reusable local orchestrator for Worker/Reviewer/Integrator coding agents with Git worktrees and SQLite.",
   "type": "module",
   "bin": {
     "agent-team": "dist/cli.js",
@@ -11,7 +11,6 @@
   "files": [
     "dist",
     "skills",
-    "templates",
     "README.md",
     "LICENSE"
   ],

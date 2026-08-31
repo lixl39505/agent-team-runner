@@ -16,7 +16,7 @@ export function isValidAgentName(name: string): boolean {
   return /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name);
 }
 
-/** 注册表清单（注入 Lead prompt 的能力清单） */
+/** 注册表清单。 */
 export function agentList(config: RunnerConfig): Array<AgentEntry & { name: string }> {
   return Object.entries(config.agents).map(([name, entry]) => ({ name, ...entry }));
 }

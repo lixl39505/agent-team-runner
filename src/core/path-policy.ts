@@ -31,7 +31,7 @@ export function globMatch(path: string, glob: string): boolean {
 }
 
 /**
- * 模式匹配：glob 语义之外，无通配符且末段不含 "." 的裸目录名（Lead 常见输出，如 `src`）
+ * 模式匹配：glob 语义之外，无通配符且末段不含 "." 的裸目录名（例如 `src`）
  * 视为目录前缀，匹配其整个子树。allowed 与 blocked 对称适用。
  */
 export function patternMatches(file: string, pattern: string): boolean {

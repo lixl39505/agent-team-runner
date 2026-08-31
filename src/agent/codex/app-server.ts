@@ -161,7 +161,7 @@ export class CodexBackend implements AgentBackend {
     const started = Date.now();
     const scratch = mkdtempSync(join(tmpdir(), 'agent-team-codex-probe-'));
     const session = await this.openSession({
-      role: 'lead',
+      role: 'reviewer',
       cwd: scratch,
       prompt: 'Reply with exactly: ok',
       schema: { type: 'string' },

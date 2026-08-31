@@ -22,11 +22,11 @@ export function readText(path: string): string {
   return readFileSync(path, 'utf8');
 }
 
-export function skillPath(role: 'lead' | 'worker' | 'reviewer' | 'integrator'): string {
+export function skillPath(role: 'worker' | 'reviewer' | 'integrator'): string {
   return join(packageRoot, 'skills', `team-${role}`, 'SKILL.md');
 }
 
-export function loadSkill(role: 'lead' | 'worker' | 'reviewer' | 'integrator'): string {
+export function loadSkill(role: 'worker' | 'reviewer' | 'integrator'): string {
   const raw = readFileSync(skillPath(role), 'utf8');
   return raw.replace(/^---\n[\s\S]*?\n---\n/, '').trim();
 }
@@ -34,7 +34,7 @@ export function loadSkill(role: 'lead' | 'worker' | 'reviewer' | 'integrator'): 
 export function syncSkills(repoRoot: string): string[] {
   const written: string[] = [];
   for (const hostRoot of ['.agents/skills', '.claude/skills']) {
-    for (const role of ['lead', 'worker', 'reviewer', 'integrator'] as const) {
+    for (const role of ['worker', 'reviewer', 'integrator'] as const) {
       const target = join(repoRoot, hostRoot, `team-${role}`, 'SKILL.md');
       mkdirSync(dirname(target), { recursive: true });
       writeFileSync(target, readFileSync(skillPath(role), 'utf8'), 'utf8');

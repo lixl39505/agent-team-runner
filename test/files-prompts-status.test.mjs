@@ -14,7 +14,7 @@ import {
   writeJson,
   writeTaskMarkdown
 } from '../src/core/files.ts';
-import { integrationPrompt, leadPrompt, reviewFeedback, reviewerPrompt, workerPrompt } from '../src/core/prompts.ts';
+import { integrationPrompt, reviewFeedback, reviewerPrompt, workerPrompt } from '../src/core/prompts.ts';
 import { formatRunStatus } from '../src/core/status.ts';
 
 function tempDir() {
@@ -58,7 +58,7 @@ test('file helpers create nested paths, serialize JSON, and read text', () => {
 
 test('skill helpers resolve, load, and synchronize every role', () => {
   withTempDir((directory) => {
-    for (const role of ['lead', 'worker', 'reviewer', 'integrator']) {
+    for (const role of ['worker', 'reviewer', 'integrator']) {
       const source = skillPath(role);
       assert.equal(existsSync(source), true);
       const loaded = loadSkill(role);
@@ -67,7 +67,7 @@ test('skill helpers resolve, load, and synchronize every role', () => {
     }
 
     const written = syncSkills(directory);
-    assert.equal(written.length, 8);
+    assert.equal(written.length, 6);
     for (const path of written) {
       assert.equal(existsSync(path), true);
       assert.equal(readText(path).startsWith('---\n'), true);
@@ -113,31 +113,6 @@ test('ensureGitignore creates, appends without a newline, and remains idempotent
   });
 });
 
-test('leadPrompt includes the registry only when agents are supplied', () => {
-  const base = {
-    goal: 'Improve coverage',
-    goalFile: '/tmp/goal.md',
-    repoRoot: '/tmp/repo',
-    baseRef: 'main',
-    baseSha: 'abcdef',
-    allowedCommandPrefixes: ['npm test']
-  };
-  const withoutAgents = leadPrompt({ ...base, agents: [] });
-  assert.equal(withoutAgents.includes('Agent registry'), false);
-  assert.match(withoutAgents, /Repository: \/tmp\/repo/);
-  assert.match(withoutAgents, /- npm test/);
-
-  const withAgents = leadPrompt({
-    ...base,
-    agents: [
-      { name: 'plain', backend: 'codex' },
-      { name: 'described', backend: 'opencode', model: 'model-x', description: 'Fast' }
-    ]
-  });
-  assert.match(withAgents, /- plain: codex/);
-  assert.match(withAgents, /- described: opencode \/ model-x — Fast/);
-});
-
 test('workerPrompt renders optional worktree, feedback, and complete retry context', () => {
   const prompt = workerPrompt({
     task,
@@ -179,6 +154,8 @@ test('workerPrompt renders optional worktree, feedback, and complete retry conte
   assert.match(withSkill, /tdd \(project, sha256:abc\)/);
   assert.match(withSkill, /Write a failing test first/);
   assert.equal(withSkill.includes('Do not show this to the worker.'), false);
+  assert.match(withSkill, /# Contract escalation/);
+  assert.match(withSkill, /never expand scope yourself/);
 });
 
 test('reviewerPrompt and integrationPrompt render their conditional contexts', () => {
@@ -227,7 +204,7 @@ test('formatRunStatus handles empty runs, task details, integration fields, and 
     id: 'run-1', repoRoot: '/repo', goalFile: '/repo/goal.md', baseRef: 'main', baseSha: '1234567890abcdef', adapter: 'codex', status: 'running', manifestJson: null, rolesJson: null,
     integrationBranch: null, integrationWorktree: null, integrationCommit: null, error: null, createdAt: '', updatedAt: '', finishedAt: null
   };
-  assert.equal(formatRunStatus(baseRun, []), 'RUN run-1\nStatus: running\nBase: main (1234567890ab)\nLead backend: codex\n');
+  assert.equal(formatRunStatus(baseRun, []), 'RUN run-1\nStatus: running\nBase: main (1234567890ab)\nExecution source: codex\n');
 
   const status = formatRunStatus({ ...baseRun, integrationBranch: 'team/run-1', integrationWorktree: '/tmp/integration', integrationCommit: 'commit', error: 'integration failed' }, [
     { runId: 'run-1', taskId: 'LONG-1', title: 'First', specJson: '{}', status: 'failed', phase: null, branch: null, worktree: null, startSha: null, commitSha: 'abcdef123456', attempts: 2, reviewCycles: 0, lastError: 'first line\nsecond line', reviewJson: null, createdAt: '', updatedAt: '', finishedAt: null },

@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { validateIntegrationResult, validateLeadResult, validateReviewResult, validateWorkerResult } from '../src/core/validation.ts';
+import { validateIntegrationResult, validateReviewResult, validateWorkerResult } from '../src/core/validation.ts';
 import { DEFAULT_CONFIG } from '../src/core/config.ts';
 import { verifyTaskWorktree, runGlobalVerification } from '../src/core/verifier.ts';
 
@@ -31,23 +31,6 @@ function repository() {
 }
 
 test('result validators preserve optional fields and reject every malformed result shape', () => {
-  assert.deepEqual(validateLeadResult({ version: '1', title: 'Plan', summary: 'Summary', tasks: [
-    task({ role: 'worker', agent: 'named', allowNoChanges: true })
-  ] }, ['named']), {
-    version: 1, title: 'Plan', summary: 'Summary', tasks: [task({ role: 'worker', agent: 'named', allowNoChanges: true })]
-  });
-  for (const value of [
-    { version: 2, title: 'x', summary: 'x', tasks: [task()] },
-    { version: 1, title: 1, summary: 'x', tasks: [task()] },
-    { version: 1, title: 'x', summary: 'x', tasks: [] },
-    { version: 1, title: 'x', summary: 'x', tasks: [task({ id: 'x' })] },
-    { version: 1, title: 'x', summary: 'x', tasks: [task({ agent: '' })] },
-    { version: 1, title: 'x', summary: 'x', tasks: [task({ agent: 'unknown' })] },
-    { version: 1, title: 'x', summary: 'x', tasks: [task({ allowedPaths: ['/absolute'] })] },
-    { version: 1, title: 'x', summary: 'x', tasks: [task({ allowedPaths: ['../escape'] })] },
-    { version: 1, title: 'x', summary: 'x', tasks: [task({ allowedPaths: ['.git/config'] })] }
-  ]) assert.throws(() => validateLeadResult(value, ['named']));
-
   assert.deepEqual(validateWorkerResult({ status: 'blocked', blockedReason: 'waiting' }).blockedReason, 'waiting');
   assert.deepEqual(validateReviewResult({ decision: 'changes_requested', findings: [{ severity: 'low', file: 'a.ts', line: 1, message: 'note' }] }).findings[0], { severity: 'low', file: 'a.ts', line: 1, message: 'note' });
   assert.deepEqual(validateIntegrationResult({ status: 'failed', blockedReason: 'conflict' }).blockedReason, 'conflict');

@@ -1,7 +1,7 @@
 export type BackendId = 'claude' | 'codex' | 'opencode';
 /** @deprecated 旧名，随旧 adapter 层在 Phase 4 一起删除 */
 export type AdapterName = BackendId;
-export type AgentRole = 'lead' | 'worker' | 'reviewer' | 'integrator';
+export type AgentRole = 'worker' | 'reviewer' | 'integrator';
 export type NativeWindowsSandboxPolicy = 'require' | 'allow-degraded';
 export type AuthIsolation = 'shared' | 'isolated';
 
@@ -61,7 +61,7 @@ export interface AgentBinding {
   source: string;
 }
 
-/** plan 时固化的全量快照（roles + agents 注册表），保证 run 不受配置文件后续变化影响 */
+/** 创建运行时固化的全量快照（roles + agents 注册表），保证执行不受配置后续变化影响。 */
 export interface AgentSnapshot {
   version: 2;
   roles: Record<AgentRole, AgentBinding>;
@@ -83,7 +83,6 @@ export interface RunnerConfig {
     branchPrefix: string;
   };
   retry: {
-    maxPlanAttempts: number;
     maxWorkerAttempts: number;
     maxReviewCycles: number;
   };
@@ -116,7 +115,7 @@ export interface TaskSpec {
   title: string;
   description: string;
   role?: string;
-  /** agents 注册表名：Lead 为任务点名更合适的 agent；缺省继承 worker 角色 */
+  /** agents 注册表名；缺省继承 worker 角色。 */
   agent?: string;
   dependsOn: string[];
   allowedPaths: string[];
@@ -169,7 +168,7 @@ export interface ExecutionContract {
   tasks: TaskSpec[];
 }
 
-/** A concrete Lead/Worker/Reviewer/Integrator invocation within a run. */
+/** A concrete Worker/Reviewer/Integrator invocation within a run. */
 export interface AgentExecutionRecord {
   runId: string;
   agentId: string;
@@ -192,10 +191,23 @@ export interface RunManifest {
   tasks: TaskSpec[];
 }
 
-export interface LeadResult extends RunManifest {}
+export type ContractBlockCode =
+  | 'out_of_scope'
+  | 'missing_requirement'
+  | 'conflicting_requirement'
+  | 'dependency_change'
+  | 'missing_access'
+  | 'other';
 
-export interface WorkerResult {
-  status: 'completed' | 'blocked' | 'failed';
+/** Worker 请求修改执行契约时提供的结构化原因。 */
+export interface ContractBlockReason {
+  code: ContractBlockCode;
+  message: string;
+  requestedContractChanges: string[];
+  affectedPaths?: string[];
+}
+
+interface WorkerResultBase {
   summary: string;
   testsRun: string[];
   knownRisks: string[];
@@ -203,6 +215,10 @@ export interface WorkerResult {
   progressImpact: string;
   blockedReason?: string;
 }
+
+export type WorkerResult =
+  | (WorkerResultBase & { status: 'completed' | 'blocked' | 'failed'; contractBlock?: never })
+  | (WorkerResultBase & { status: 'blocked_on_contract'; contractBlock: ContractBlockReason });
 
 export interface ReviewFinding {
   severity: 'critical' | 'high' | 'medium' | 'low';
@@ -233,17 +249,17 @@ export interface RunRecord {
   goalFile: string;
   baseRef: string;
   baseSha: string;
-  /** 外层全局项目标识；由 Lead/goal 创建的历史 run 没有此引用。 */
+  /** 外层全局项目标识；历史本地 run 可能没有此引用。 */
   projectId: string | null;
   /** 提交执行时选定的项目策略修订标识。 */
   projectPolicyRevisionId: string | null;
   /** 提交时固化的完整 ExecutionContract。 */
   executionContractJson: string | null;
-  /** plan 时 Lead 使用的后端（历史列名，保持 schema 不变） */
+  /** 运行来源后端（历史列名，保持 schema 不变）。 */
   adapter: string;
   status: RunStatus;
   manifestJson: string | null;
-  /** plan 时固化的 AgentSnapshot（roles + agents 注册表），保证后续 run 不受配置文件变化影响 */
+  /** 创建运行时固化的 AgentSnapshot，保证后续执行不受配置文件变化影响。 */
   rolesJson: string | null;
   integrationBranch: string | null;
   integrationWorktree: string | null;
@@ -282,4 +298,12 @@ export interface RunEventRecord {
   eventType: string;
   payload: unknown | null;
   createdAt: string;
+}
+
+/** Hook payload for forwarding a worker contract escalation to an outer service. */
+export interface ContractBlockReport {
+  run: RunRecord;
+  task: TaskRecord;
+  agentExecution: AgentExecutionRecord;
+  reason: ContractBlockReason;
 }

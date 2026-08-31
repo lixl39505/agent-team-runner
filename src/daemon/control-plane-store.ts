@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 export type JsonValue = boolean | null | number | string | JsonValue[] | { [key: string]: JsonValue };
 
-export type InteractionKind = 'approval' | 'agent_question';
+export type InteractionKind = 'approval' | 'agent_question' | 'contract_block';
 export type InteractionStatus = 'queued' | 'claimed' | 'resolved';
 export type ControllerStatus = 'connected' | 'disconnected';
 

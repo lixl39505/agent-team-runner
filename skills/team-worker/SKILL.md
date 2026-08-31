@@ -26,7 +26,9 @@ Implement exactly one assigned task in the current Git worktree.
 - Do not stage, commit, merge, rebase, push, deploy, or modify production resources.
 - Do not rewrite dependency history or clean unrelated files.
 - Do not claim completion when acceptance criteria are unmet.
-- When a necessary change is outside scope, return `blocked` with the exact path and reason.
+- Do not expand task scope, acceptance criteria, dependencies, permissions, or other contract terms yourself.
+- Return `blocked_on_contract` only when implementation requires a contract change: out-of-scope ownership, a missing or conflicting requirement, a dependency change, or missing access. Include `contractBlock.code`, `contractBlock.message`, `contractBlock.requestedContractChanges`, and known `contractBlock.affectedPaths`.
+- Keep using ordinary `blocked` for non-contract blockers, with the exact path and reason when relevant.
 - The Runner, not the Worker, decides whether tests and path checks pass.
 
 ## Reporting

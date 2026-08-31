@@ -191,7 +191,7 @@ export function resolveAgent(role: AgentRole, config: RunnerConfig): AgentBindin
   return { agent: config.defaultAgent, ...fallback, source: 'defaultAgent' };
 }
 
-/** 按注册表名解析（task.agent 用）：plan 快照优先，回退当前 config。 */
+/** 按注册表名解析任务 agent：运行快照优先，回退当前 config。 */
 export function resolveAgentByName(name: string, config: RunnerConfig, snapshotAgents?: Record<string, AgentEntry>): AgentBinding {
   const entry = snapshotAgents?.[name] ?? config.agents[name];
   if (!entry) throw new Error(`unknown agent "${name}" (not in the agents registry)`);
@@ -224,12 +224,11 @@ export function parseSnapshot(rolesJson: string | null): AgentSnapshot | null {
   return { version: 2, roles, agents: {} };
 }
 
-/** 全量快照（roles 绑定 + agents 注册表），plan 时写入 runs.roles_json */
+/** 全量快照（roles 绑定 + agents 注册表），创建运行时写入 runs.roles_json。 */
 export function snapshotAgents(config: RunnerConfig): AgentSnapshot {
   return {
     version: 2,
     roles: {
-      lead: resolveAgent('lead', config),
       worker: resolveAgent('worker', config),
       reviewer: resolveAgent('reviewer', config),
       integrator: resolveAgent('integrator', config)
@@ -238,7 +237,7 @@ export function snapshotAgents(config: RunnerConfig): AgentSnapshot {
   };
 }
 
-/** run 阶段解析角色：plan 快照优先（hermetic），无快照回退当前 config。 */
+/** 执行阶段解析角色：运行快照优先（hermetic），无快照回退当前 config。 */
 export function resolveAgentWithSnapshot(role: AgentRole, config: RunnerConfig, rolesJson: string | null): AgentBinding {
   const snapshot = parseSnapshot(rolesJson);
   const entry = snapshot?.roles[role];

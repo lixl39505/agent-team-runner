@@ -46,12 +46,11 @@ test('loadConfig parses v3 yaml agents and roles', () => {
   const repo = tempRepo();
   writeFileSync(join(repo, '.agent-team', 'config.yml'), [
     'version: 3',
-    'defaultAgent: lead-agent',
+    'defaultAgent: default-agent',
     'agents:',
-    '  lead-agent: { backend: codex, model: gpt-5.6-terra }',
+    '  default-agent: { backend: codex, model: gpt-5.6-terra }',
     '  fast-worker: { backend: opencode, model: deepseek/v4-flash }',
     'roles:',
-    '  lead: lead-agent',
     '  worker: fast-worker',
     'concurrency: 5',
     'workspace: {}',
@@ -62,9 +61,9 @@ test('loadConfig parses v3 yaml agents and roles', () => {
     '    - npm test'
   ].join('\n'), { flag: 'w' });
   const config = loadConfig(repo);
-  assert.equal(config.defaultAgent, 'lead-agent');
+  assert.equal(config.defaultAgent, 'default-agent');
   assert.equal(config.concurrency, 5);
-  assert.equal(config.roles.lead, 'lead-agent');
+  assert.equal(config.roles.worker, 'fast-worker');
   assert.equal(config.agents['fast-worker'].model, 'deepseek/v4-flash');
   assert.deepEqual(config.verification.allowedCommandPrefixes, ['npm test']);
 });
@@ -85,12 +84,12 @@ test('applyOverrides writes nested paths with typed values', () => {
   initConfig(repo);
   const config = applyOverrides(loadConfig(repo), [
     { key: 'concurrency', value: '5' },
-    { key: 'roles.lead', value: 'lead-agent' },
+    { key: 'roles.reviewer', value: 'default-agent' },
     { key: 'verification.globalCommands', value: '["npm test"]' },
     { key: 'workspace.branchPrefix', value: 'team-x' }
   ]);
   assert.equal(config.concurrency, 5);
-  assert.equal(config.roles.lead, 'lead-agent');
+  assert.equal(config.roles.reviewer, 'default-agent');
   assert.deepEqual(config.verification.globalCommands, ['npm test']);
   assert.equal(config.workspace.branchPrefix, 'team-x');
 });
@@ -102,6 +101,24 @@ test('applyOverrides keeps unmodified defaults intact', () => {
   assert.equal(config.roles.worker, 'codex.gpt-5.6-terra');
   assert.equal(config.concurrency, 3);
   assert.deepEqual(config.backends.codex, { nativeWindowsSandbox: 'require' });
+});
+
+test('rejects removed Lead and planning configuration keys', () => {
+  const repo = tempRepo();
+  writeFileSync(join(repo, '.agent-team', 'config.yml'), [
+    'version: 3',
+    'workspace: {}',
+    'retry:',
+    '  maxPlanAttempts: 2',
+    'status: {}'
+  ].join('\n'), { flag: 'w' });
+  assert.throws(() => loadConfig(repo), /retry\.maxPlanAttempts has been removed/);
+
+  const overrideRepo = tempRepo();
+  initConfig(overrideRepo);
+  const config = loadConfig(overrideRepo);
+  assert.throws(() => applyOverrides(config, [{ key: 'roles.lead', value: 'worker' }]), /removed configuration key/);
+  assert.throws(() => applyOverrides(config, [{ key: 'retry.maxPlanAttempts', value: '2' }]), /removed configuration key/);
 });
 
 test('validates native Windows sandbox policy', () => {

@@ -253,6 +253,82 @@ test('orchestrator records a blocked worker without starting a reviewer', async 
   }
 });
 
+test('orchestrator records and reports a contract-blocked worker without verification or review', async () => {
+  const repoRoot = await repository();
+  const config = configFor(repoRoot);
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
+  const backend = new ScriptBackend((spec) => {
+    assert.equal(spec.role, 'worker');
+    return {
+      ...workerResult(), status: 'blocked_on_contract',
+      contractBlock: {
+        code: 'out_of_scope', message: 'Task must own src/other.ts.',
+        requestedContractChanges: ['Add src/other.ts to allowedPaths'], affectedPaths: ['src/other.ts']
+      }
+    };
+  });
+  let report;
+  try {
+    await createPlannedRun(db, config);
+    await runOrchestrator({
+      config, db, runId: 'run', backends: backendPool(backend),
+      reportContractBlock: (value) => { report = value; }
+    });
+    const record = db.getTask('run', 'T001');
+    assert.equal(db.getRun('run').status, 'needs_attention');
+    assert.equal(record.status, 'blocked_on_contract');
+    assert.equal(record.phase, 'worker');
+    assert.equal(record.lastError, 'Task must own src/other.ts.');
+    assert.notEqual(record.finishedAt, null);
+    assert.equal(backend.specs.length, 1);
+    assert.ok(eventTypes(db).includes('WORKER_BLOCKED_ON_CONTRACT'));
+    assert.equal(report.run.id, 'run');
+    assert.equal(report.task.status, 'blocked_on_contract');
+    assert.equal(report.agentExecution.role, 'worker');
+    assert.equal(report.reason.code, 'out_of_scope');
+  } finally {
+    db.close();
+  }
+});
+
+test('orchestrator preserves a contract block when its optional reporter fails', async () => {
+  const repoRoot = await repository();
+  const config = configFor(repoRoot);
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
+  const backend = new ScriptBackend(() => ({
+    ...workerResult(), status: 'blocked_on_contract',
+    contractBlock: { code: 'missing_access', message: 'Access is required.', requestedContractChanges: ['Grant access'] }
+  }));
+  try {
+    await createPlannedRun(db, config);
+    await runOrchestrator({
+      config, db, runId: 'run', backends: backendPool(backend),
+      reportContractBlock: () => { throw new Error('report unavailable'); }
+    });
+    assert.equal(db.getTask('run', 'T001').status, 'blocked_on_contract');
+    assert.ok(eventTypes(db).includes('WORKER_CONTRACT_BLOCK_REPORT_FAILED'));
+  } finally {
+    db.close();
+  }
+});
+
+test('orchestrator handles a contract block without an outer reporter', async () => {
+  const repoRoot = await repository();
+  const config = configFor(repoRoot);
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
+  const backend = new ScriptBackend(() => ({
+    ...workerResult(), status: 'blocked_on_contract',
+    contractBlock: { code: 'other', message: 'Contract decision needed.', requestedContractChanges: [] }
+  }));
+  try {
+    await createPlannedRun(db, config);
+    await runOrchestrator({ config, db, runId: 'run', backends: backendPool(backend) });
+    assert.equal(db.getTask('run', 'T001').status, 'blocked_on_contract');
+  } finally {
+    db.close();
+  }
+});
+
 test('orchestrator rejects reviewer changes to the task worktree', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot, { retry: { maxWorkerAttempts: 1 } });

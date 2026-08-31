@@ -38,8 +38,8 @@ function policy(overrides = {}) {
     verificationAllowedCommandPrefixes: ['npm test'],
     baselinePathPolicy: {},
     agentProfileMapping: {
-      defaultAgent: 'lead',
-      agents: { lead: { backend: 'codex' } }
+      defaultAgent: 'worker',
+      agents: { worker: { backend: 'codex' } }
     },
     backendPolicy: {},
     createdAt: '2026-01-01T00:00:00.000Z',
@@ -50,19 +50,19 @@ function policy(overrides = {}) {
 test('converts a complete project policy into an isolated runner config', () => {
   const input = policy({
     agentProfileMapping: {
-      defaultAgent: 'lead',
+      defaultAgent: 'worker',
       agents: {
-        lead: { backend: 'codex', model: 'gpt-5.6-terra', maxTurns: 8 },
+        worker: { backend: 'codex', model: 'gpt-5.6-terra', maxTurns: 8 },
         reviewer: { backend: 'claude', authIsolation: 'isolated' }
       },
-      roles: { lead: 'lead', reviewer: 'reviewer' }
+      roles: { worker: 'worker', reviewer: 'reviewer' }
     },
     backendPolicy: {
       backends: { codex: { command: 'codex-team', extraArgs: ['--quiet'], nativeWindowsSandbox: 'allow-degraded' } },
       concurrency: 5,
       staleAfterMs: 100,
       taskTimeoutMs: 200,
-      retry: { maxPlanAttempts: 3, maxWorkerAttempts: 4, maxReviewCycles: 5 },
+      retry: { maxWorkerAttempts: 4, maxReviewCycles: 5 },
       status: { pollIntervalMs: 300 },
       interactionAlert: { background: '#123456', foreground: '#abcdef' },
       integration: { allowedPaths: ['src/**'], runAgentAfterCherryPick: false }
@@ -78,14 +78,14 @@ test('converts a complete project policy into an isolated runner config', () => 
     branchPrefix: 'agent-team'
   });
   assert.deepEqual(config.verification, { allowedCommandPrefixes: ['npm test'], globalCommands: [] });
-  assert.deepEqual(config.agents.lead, { backend: 'codex', model: 'gpt-5.6-terra', maxTurns: 8 });
-  assert.deepEqual(config.roles, { lead: 'lead', reviewer: 'reviewer' });
+  assert.deepEqual(config.agents.worker, { backend: 'codex', model: 'gpt-5.6-terra', maxTurns: 8 });
+  assert.deepEqual(config.roles, { worker: 'worker', reviewer: 'reviewer' });
   assert.equal(config.backends.codex.command, 'codex-team');
   assert.equal(config.backends.codex.nativeWindowsSandbox, 'allow-degraded');
   assert.deepEqual(config.backends.codex.extraArgs, ['--quiet']);
   assert.deepEqual(
     [config.concurrency, config.staleAfterMs, config.taskTimeoutMs, config.retry, config.status, config.interactionAlert, config.integration],
-    [5, 100, 200, { maxPlanAttempts: 3, maxWorkerAttempts: 4, maxReviewCycles: 5 }, { pollIntervalMs: 300 }, { background: '#123456', foreground: '#abcdef' }, { allowedPaths: ['src/**'], runAgentAfterCherryPick: false }]
+    [5, 100, 200, { maxWorkerAttempts: 4, maxReviewCycles: 5 }, { pollIntervalMs: 300 }, { background: '#123456', foreground: '#abcdef' }, { allowedPaths: ['src/**'], runAgentAfterCherryPick: false }]
   );
 
   config.backends.codex.extraArgs.push('--mutated');
@@ -108,12 +108,12 @@ test('uses DEFAULT_CONFIG for omitted backend policy values', () => {
 test('accepts every optional policy value and preserves defaults for empty nested policies', () => {
   const config = runnerConfigFromProjectPolicy(policy({
     agentProfileMapping: {
-      defaultAgent: 'lead',
+      defaultAgent: 'worker',
       agents: {
-        lead: {
+        worker: {
           backend: 'claude',
           model: 'sonnet',
-          description: 'Lead agent',
+          description: 'Worker agent',
           maxTurns: 2,
           authProfile: 'work_profile',
           authIsolation: 'shared',
@@ -129,10 +129,10 @@ test('accepts every optional policy value and preserves defaults for empty neste
       integration: {}
     }
   }), project, home);
-  assert.deepEqual(config.agents.lead, {
+  assert.deepEqual(config.agents.worker, {
     backend: 'claude',
     model: 'sonnet',
-    description: 'Lead agent',
+    description: 'Worker agent',
     maxTurns: 2,
     authProfile: 'work_profile',
     authIsolation: 'shared',
@@ -144,8 +144,8 @@ test('accepts every optional policy value and preserves defaults for empty neste
 
 test('rejects malformed JSON policy sections', () => {
   assert.throws(() => runnerConfigFromProjectPolicy(policy({ agentProfileMapping: [] }), project, home), /agentProfileMapping must be a JSON object/);
-  assert.throws(() => runnerConfigFromProjectPolicy(policy({ agentProfileMapping: { defaultAgent: 'lead', agents: [] } }), project, home), /agents must be a JSON object/);
-  assert.throws(() => runnerConfigFromProjectPolicy(policy({ agentProfileMapping: { defaultAgent: 'lead', agents: { lead: { backend: 'codex' } }, roles: [] } }), project, home), /roles must be a JSON object/);
+  assert.throws(() => runnerConfigFromProjectPolicy(policy({ agentProfileMapping: { defaultAgent: 'worker', agents: [] } }), project, home), /agents must be a JSON object/);
+  assert.throws(() => runnerConfigFromProjectPolicy(policy({ agentProfileMapping: { defaultAgent: 'worker', agents: { worker: { backend: 'codex' } }, roles: [] } }), project, home), /roles must be a JSON object/);
   assert.throws(() => runnerConfigFromProjectPolicy(policy({ backendPolicy: [] }), project, home), /backendPolicy must be a JSON object/);
   assert.throws(() => runnerConfigFromProjectPolicy(policy({ verificationAllowedCommandPrefixes: [1] }), project, home), /array of strings/);
 });
@@ -153,15 +153,15 @@ test('rejects malformed JSON policy sections', () => {
 test('rejects unknown policy keys and cannot accept a policy workspace', () => {
   assert.throws(() => runnerConfigFromProjectPolicy(policy({ backendPolicy: { workspace: { repoRoot: '/untrusted' } } }), project, home), /backendPolicy.workspace is not allowed/);
   assert.throws(() => runnerConfigFromProjectPolicy(policy({ backendPolicy: { retry: { extra: 1 } } }), project, home), /backendPolicy.retry.extra is not allowed/);
-  assert.throws(() => runnerConfigFromProjectPolicy(policy({ agentProfileMapping: { defaultAgent: 'lead', agents: { lead: { backend: 'codex' } }, workspace: {} } }), project, home), /agentProfileMapping.workspace is not allowed/);
+  assert.throws(() => runnerConfigFromProjectPolicy(policy({ agentProfileMapping: { defaultAgent: 'worker', agents: { worker: { backend: 'codex' } }, workspace: {} } }), project, home), /agentProfileMapping.workspace is not allowed/);
 });
 
 test('rejects invalid agents, backend ids, and non-positive numeric policy values', () => {
-  assert.throws(() => runnerConfigFromProjectPolicy(policy({ agentProfileMapping: { defaultAgent: null, agents: { lead: { backend: 'codex' } } } }), project, home), /defaultAgent must be a string/);
-  assert.throws(() => runnerConfigFromProjectPolicy(policy({ agentProfileMapping: { defaultAgent: 'missing', agents: { lead: { backend: 'codex' } } } }), project, home), /defaultAgent: unknown agent/);
-  assert.throws(() => runnerConfigFromProjectPolicy(policy({ agentProfileMapping: { defaultAgent: 'lead', agents: { 'bad.name': { backend: 'codex' } } } }), project, home), /invalid agent name/);
-  assert.throws(() => runnerConfigFromProjectPolicy(policy({ agentProfileMapping: { defaultAgent: 'lead', agents: { lead: { backend: 'other' } } } }), project, home), /unknown backend/);
-  assert.throws(() => runnerConfigFromProjectPolicy(policy({ agentProfileMapping: { defaultAgent: 'lead', agents: { lead: { backend: 'codex', authIsolation: 'per-run' } } } }), project, home), /authIsolation/);
+  assert.throws(() => runnerConfigFromProjectPolicy(policy({ agentProfileMapping: { defaultAgent: null, agents: { worker: { backend: 'codex' } } } }), project, home), /defaultAgent must be a string/);
+  assert.throws(() => runnerConfigFromProjectPolicy(policy({ agentProfileMapping: { defaultAgent: 'missing', agents: { worker: { backend: 'codex' } } } }), project, home), /defaultAgent: unknown agent/);
+  assert.throws(() => runnerConfigFromProjectPolicy(policy({ agentProfileMapping: { defaultAgent: 'worker', agents: { 'bad.name': { backend: 'codex' } } } }), project, home), /invalid agent name/);
+  assert.throws(() => runnerConfigFromProjectPolicy(policy({ agentProfileMapping: { defaultAgent: 'worker', agents: { worker: { backend: 'other' } } } }), project, home), /unknown backend/);
+  assert.throws(() => runnerConfigFromProjectPolicy(policy({ agentProfileMapping: { defaultAgent: 'worker', agents: { worker: { backend: 'codex', authIsolation: 'per-run' } } } }), project, home), /authIsolation/);
   assert.throws(() => runnerConfigFromProjectPolicy(policy({ backendPolicy: { backends: { other: {} } } }), project, home), /unknown backend/);
   assert.throws(() => runnerConfigFromProjectPolicy(policy({ backendPolicy: { backends: { claude: { nativeWindowsSandbox: 'unsafe' } } } }), project, home), /nativeWindowsSandbox/);
   assert.throws(() => runnerConfigFromProjectPolicy(policy({ backendPolicy: { integration: { runAgentAfterCherryPick: 'no' } } }), project, home), /must be a boolean/);
@@ -169,7 +169,6 @@ test('rejects invalid agents, backend ids, and non-positive numeric policy value
     { concurrency: 0 },
     { staleAfterMs: -1 },
     { taskTimeoutMs: 1.5 },
-    { retry: { maxPlanAttempts: 0 } },
     { retry: { maxWorkerAttempts: -1 } },
     { retry: { maxReviewCycles: 1.5 } },
     { status: { pollIntervalMs: 0 } }
