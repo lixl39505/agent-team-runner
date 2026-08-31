@@ -3,6 +3,7 @@ import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type {
   AgentExecutionRecord,
+  RunEventRecord,
   RunRecord,
   RunStatus,
   TaskRecord,
@@ -21,6 +22,11 @@ function mapRun(row: Record<string, unknown>): RunRecord {
     goalFile: String(row.goal_file),
     baseRef: String(row.base_ref),
     baseSha: String(row.base_sha),
+    projectId: row.project_id === null || row.project_id === undefined ? null : String(row.project_id),
+    projectPolicyRevisionId: row.project_policy_revision_id === null || row.project_policy_revision_id === undefined
+      ? null : String(row.project_policy_revision_id),
+    executionContractJson: row.execution_contract_json === null || row.execution_contract_json === undefined
+      ? null : String(row.execution_contract_json),
     adapter: String(row.adapter),
     status: String(row.status) as RunStatus,
     manifestJson: row.manifest_json === null ? null : String(row.manifest_json),
@@ -67,6 +73,17 @@ function mapAgentExecution(row: Record<string, unknown>): AgentExecutionRecord {
   };
 }
 
+function mapEvent(row: Record<string, unknown>): RunEventRecord {
+  return {
+    id: Number(row.id),
+    runId: String(row.run_id),
+    taskId: row.task_id === null ? null : String(row.task_id),
+    eventType: String(row.event_type),
+    payload: row.payload_json === null ? null : JSON.parse(String(row.payload_json)),
+    createdAt: String(row.created_at)
+  };
+}
+
 export class StateDatabase {
   readonly db: DatabaseSync;
 
@@ -91,6 +108,9 @@ export class StateDatabase {
         goal_file TEXT NOT NULL,
         base_ref TEXT NOT NULL,
         base_sha TEXT NOT NULL,
+        project_id TEXT,
+        project_policy_revision_id TEXT,
+        execution_contract_json TEXT,
         adapter TEXT NOT NULL,
         status TEXT NOT NULL,
         manifest_json TEXT,
@@ -158,6 +178,9 @@ export class StateDatabase {
       CREATE INDEX IF NOT EXISTS idx_agent_executions_run ON agent_executions(run_id, started_at);
     `);
     this.addColumnIfMissing('runs', 'roles_json', 'TEXT');
+    this.addColumnIfMissing('runs', 'project_id', 'TEXT');
+    this.addColumnIfMissing('runs', 'project_policy_revision_id', 'TEXT');
+    this.addColumnIfMissing('runs', 'execution_contract_json', 'TEXT');
   }
 
   private addColumnIfMissing(table: string, column: string, type: string): void {
@@ -173,20 +196,27 @@ export class StateDatabase {
     goalFile: string;
     baseRef: string;
     baseSha: string;
+    projectId?: string | null;
+    projectPolicyRevisionId?: string | null;
+    executionContractJson?: string | null;
     adapter: string;
   }): void {
     const timestamp = now();
     this.db.prepare(`
       INSERT INTO runs (
-        id, repo_root, goal_file, base_ref, base_sha, adapter, status,
+        id, repo_root, goal_file, base_ref, base_sha, project_id, project_policy_revision_id,
+        execution_contract_json, adapter, status,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'planning', ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'planning', ?, ?)
     `).run(
       input.id,
       input.repoRoot,
       input.goalFile,
       input.baseRef,
       input.baseSha,
+      input.projectId ?? null,
+      input.projectPolicyRevisionId ?? null,
+      input.executionContractJson ?? null,
       input.adapter,
       timestamp,
       timestamp
@@ -297,6 +327,21 @@ export class StateDatabase {
       INSERT INTO events (run_id, task_id, event_type, payload_json, created_at)
       VALUES (?, ?, ?, ?, ?)
     `).run(runId, taskId, eventType, payload === undefined ? null : JSON.stringify(payload), now());
+  }
+
+  listEvents(runId: string, afterEventId = 0, limit = 100): RunEventRecord[] {
+    if (!Number.isSafeInteger(afterEventId) || afterEventId < 0) {
+      throw new Error('afterEventId must be a non-negative integer');
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      throw new Error('limit must be an integer between 1 and 1000');
+    }
+    return (this.db.prepare(`
+      SELECT * FROM events
+      WHERE run_id = ? AND id > ?
+      ORDER BY id ASC
+      LIMIT ?
+    `).all(runId, afterEventId, limit) as Record<string, unknown>[]).map(mapEvent);
   }
 
   startAgentExecution(input: {

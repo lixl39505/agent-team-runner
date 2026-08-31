@@ -8,6 +8,23 @@ type IpcRequester = Pick<LocalIpcClient, 'request'>;
 
 const emptyInput = z.object({}).strict();
 const nonEmptyString = z.string().min(1);
+const jsonValue = z.json();
+
+const projectPolicyInput = z.object({
+  baseRef: nonEmptyString,
+  verificationAllowedCommandPrefixes: z.array(z.string()),
+  baselinePathPolicy: jsonValue,
+  agentProfileMapping: jsonValue,
+  backendPolicy: jsonValue
+}).strict();
+
+const projectRegistrationInput = z.object({
+  gitCommonDir: nonEmptyString,
+  repoRoot: nonEmptyString,
+  displayName: nonEmptyString,
+  gitIdentity: jsonValue,
+  policy: projectPolicyInput
+}).strict();
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -91,6 +108,49 @@ export function createMcpServer(ipc: IpcRequester): McpServer {
     description: 'List runs whose controllers can reconnect.',
     inputSchema: emptyInput
   }, () => requestTool(ipc, 'controller.reconnectable'));
+
+  server.registerTool('agent_team_register_project', {
+    description: 'Register a repository and its execution policy.',
+    inputSchema: projectRegistrationInput
+  }, (input) => requestTool(ipc, 'project.register', input));
+
+  server.registerTool('agent_team_list_projects', {
+    description: 'List registered projects.',
+    inputSchema: emptyInput
+  }, () => requestTool(ipc, 'project.list'));
+
+  server.registerTool('agent_team_submit_execution_contract', {
+    description: 'Submit a validated execution contract for a registered project.',
+    inputSchema: z.object({
+      contract: jsonValue,
+      runId: nonEmptyString.optional()
+    }).strict()
+  }, (input) => requestTool(ipc, 'execution.submit', input));
+
+  server.registerTool('agent_team_start_run', {
+    description: 'Start or resume an execution run.',
+    inputSchema: z.object({ runId: nonEmptyString }).strict()
+  }, (input) => requestTool(ipc, 'execution.start', input));
+
+  server.registerTool('agent_team_cancel_run', {
+    description: 'Cancel an execution run so it can be resumed later.',
+    inputSchema: z.object({ runId: nonEmptyString }).strict()
+  }, (input) => requestTool(ipc, 'execution.cancel', input));
+
+  server.registerTool('agent_team_get_run', {
+    description: 'Get a run, its tasks, and its agent executions.',
+    inputSchema: z.object({ runId: nonEmptyString }).strict()
+  }, (input) => requestTool(ipc, 'execution.get', input));
+
+  server.registerTool('agent_team_read_run_events', {
+    description: 'Read durable run events after a controller cursor and acknowledge that cursor.',
+    inputSchema: z.object({
+      runId: nonEmptyString,
+      clientId: nonEmptyString,
+      afterEventId: z.number().int().nonnegative().optional(),
+      limit: z.number().int().min(1).max(1000).optional()
+    }).strict()
+  }, (input) => requestTool(ipc, 'execution.events', input));
 
   return server;
 }

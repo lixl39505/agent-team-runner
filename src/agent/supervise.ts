@@ -11,6 +11,7 @@ export interface RunAgentInput {
   spec: SessionSpec;
   logPath: string;
   outputPath: string;
+  signal?: AbortSignal | undefined;
 }
 
 /**
@@ -23,6 +24,7 @@ export async function runAgent<T = unknown>(input: RunAgentInput): Promise<Agent
   mkdirSync(dirname(input.outputPath), { recursive: true });
   writeFileSync(input.logPath, '', 'utf8');
   const append = (line: string): void => { appendFileSync(input.logPath, `${line}\n`, 'utf8'); };
+  if (input.signal?.aborted) return failure('agent interrupted before session opened') as unknown as AgentRunOutcome<T>;
 
   let session: AgentSession;
   let pausedAt: number | null = null;
@@ -81,6 +83,7 @@ export async function runAgent<T = unknown>(input: RunAgentInput): Promise<Agent
 
   let timedOut = false;
   let stalled = false;
+  let aborted = false;
   let settled = false;
   let graceTimer: NodeJS.Timeout | null = null;
 
@@ -94,6 +97,14 @@ export async function runAgent<T = unknown>(input: RunAgentInput): Promise<Agent
     }
     void session.interrupt().catch(() => {});
   };
+
+  const onAbort = (): void => {
+    aborted = true;
+    append('[supervisor] abort requested');
+    requestInterrupt();
+  };
+  input.signal?.addEventListener('abort', onAbort, { once: true });
+  if (input.signal?.aborted) onAbort();
 
   const timerInterval = setInterval(() => {
     if (pendingInteractions > 0) return;
@@ -123,24 +134,27 @@ export async function runAgent<T = unknown>(input: RunAgentInput): Promise<Agent
   } finally {
     clearInterval(timerInterval);
     if (graceTimer) clearTimeout(graceTimer);
+    input.signal?.removeEventListener('abort', onAbort);
     await session.close().catch(() => {});
     append(`[session] closed (settled=${String(settled)})`);
   }
 
   const terminalTimedOut = outcome.timedOut || timedOut;
   const terminalStalled = outcome.stalled || stalled;
-  const locallyTerminated = timedOut || stalled;
+  const locallyTerminated = timedOut || stalled || aborted;
   const merged: AgentRunOutcome = {
     ...outcome,
-    ok: !(terminalTimedOut || terminalStalled) && outcome.ok,
-    output: terminalTimedOut || terminalStalled ? null : outcome.output,
+    ok: !(terminalTimedOut || terminalStalled || aborted) && outcome.ok,
+    output: terminalTimedOut || terminalStalled || aborted ? null : outcome.output,
     timedOut: terminalTimedOut,
     stalled: terminalStalled
   };
   if (locallyTerminated) {
-    merged.error = timedOut
-      ? `agent exceeded timeout of ${spec.timeoutMs}ms`
-      : `agent made no progress for ${spec.staleAfterMs}ms`;
+    merged.error = aborted
+      ? 'agent interrupted'
+      : timedOut
+        ? `agent exceeded timeout of ${spec.timeoutMs}ms`
+        : `agent made no progress for ${spec.staleAfterMs}ms`;
   }
   if (merged.output !== null && merged.output !== undefined) {
     writeJson(input.outputPath, merged.output);

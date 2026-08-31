@@ -202,6 +202,18 @@ export class ProjectRegistry {
     `).get(project.currentPolicyRevisionId) as Record<string, unknown>);
   }
 
+  getProjectPolicyRevision(projectId: string, revisionId: string): ProjectPolicyRevision {
+    const project = this.getProject(projectId);
+    const revision = this.db.prepare(`
+      SELECT * FROM project_policy_revisions WHERE id = ?
+    `).get(revisionId) as Record<string, unknown> | undefined;
+    if (!revision) throw new Error(`Project policy revision not found: ${revisionId}`);
+    if (String(revision.project_id) !== project.id) {
+      throw new Error(`Project policy revision ${revisionId} does not belong to project: ${project.id}`);
+    }
+    return mapPolicyRevision(revision);
+  }
+
   listProjects(): ProjectRecord[] {
     return (this.db.prepare('SELECT * FROM projects ORDER BY display_name, id').all() as Record<string, unknown>[]).map(mapProject);
   }

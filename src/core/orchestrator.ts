@@ -62,6 +62,7 @@ export async function runOrchestrator(input: {
   requestApproval?: ApprovalHandler;
   requestUserInput?: UserInputHandler;
   onAgentEvent?: AgentEventSink;
+  signal?: AbortSignal | undefined;
   /** Test seam: production creates its own managed backend pool. */
   backends?: Record<BackendId, AgentBackend> | BackendPool;
 }): Promise<void> {
@@ -81,18 +82,24 @@ export async function runOrchestrator(input: {
   const active = new Map<string, Promise<void>>();
   const interruptedTasks = new Set<string>();
   let interrupted = false;
-  const onSignal = (): void => {
+  let interruptionMessage = 'Interrupted by user; run again to resume.';
+  const interruptRun = (message: string, setExitCode: boolean): void => {
     if (interrupted) return;
     interrupted = true;
-    process.exitCode = 130;
+    interruptionMessage = message;
+    if (setExitCode) process.exitCode = 130;
     for (const taskId of active.keys()) interruptedTasks.add(taskId);
     db.addEvent(runId, null, 'RUN_INTERRUPTED');
-    db.updateRun(runId, { status: 'running', error: 'Interrupted by user; run again to resume.' });
+    db.updateRun(runId, { status: 'running', error: message });
     disposeBackends(backends);
   };
+  const onSignal = (): void => { interruptRun('Interrupted by user; run again to resume.', true); };
+  const onAbort = (): void => { interruptRun('Interrupted by daemon; run again to resume.', false); };
   process.once('SIGTERM', onSignal);
   process.once('SIGINT', onSignal);
   process.once('SIGHUP', onSignal);
+  input.signal?.addEventListener('abort', onAbort, { once: true });
+  if (input.signal?.aborted) onAbort();
   try {
     while (true) {
       if (interrupted) return;
@@ -115,6 +122,7 @@ export async function runOrchestrator(input: {
       for (const candidate of candidates) {
         const promise = executeTask({
           config, db, runId, backends, record: candidate,
+            signal: input.signal,
             ...(input.requestApproval ? { requestApproval: input.requestApproval } : {}),
             ...(input.requestUserInput ? { requestUserInput: input.requestUserInput } : {}),
             ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {})
@@ -144,6 +152,7 @@ export async function runOrchestrator(input: {
     await integrateRun({
       config, db, runId, backends,
       isInterrupted: () => interrupted,
+      signal: input.signal,
       ...(input.requestApproval ? { requestApproval: input.requestApproval } : {}),
       ...(input.requestUserInput ? { requestUserInput: input.requestUserInput } : {}),
       ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {})
@@ -162,13 +171,14 @@ export async function runOrchestrator(input: {
         db.updateTask(runId, taskId, {
           status: 'changes_requested', phase: 'interrupted',
           attempts: Math.max(0, task.attempts - 1),
-          lastError: 'Interrupted by user; the next run will discard this attempt and start a clean session.', finishedAt: null
+          lastError: `${interruptionMessage.replace('; run again to resume.', '')}; the next run will discard this attempt and start a clean session.`, finishedAt: null
         });
       }
     }
     process.off('SIGTERM', onSignal);
     process.off('SIGINT', onSignal);
     process.off('SIGHUP', onSignal);
+    input.signal?.removeEventListener('abort', onAbort);
     disposeBackends(backends);
     run = db.getRun(runId);
     if (run.status === 'done') db.addEvent(runId, null, 'RUN_COMPLETED');
@@ -184,6 +194,7 @@ async function executeTask(input: {
   requestApproval?: ApprovalHandler;
   requestUserInput?: UserInputHandler;
   onAgentEvent?: AgentEventSink;
+  signal?: AbortSignal | undefined;
 }): Promise<void> {
   const { config, db, runId, backends } = input;
   let record = db.getTask(runId, input.record.taskId);
@@ -224,6 +235,7 @@ async function executeTask(input: {
   const worker = await runTrackedAgent<WorkerResult>({
     db,
     execution: executionInfo(runId, `${task.id}-worker-${attempts}`, 'worker', workerBinding.backend, logPath, workerBinding.model, task.id),
+    signal: input.signal,
     ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {}),
     backend: await getBackend(backends, workerBinding),
     spec: {
@@ -280,6 +292,7 @@ async function executeTask(input: {
   const reviewRun = await runTrackedAgent<ReviewResult>({
     db,
     execution: executionInfo(runId, `${task.id}-reviewer-${reviewCycle}`, 'reviewer', reviewerBinding.backend, reviewLogPath, reviewerBinding.model, task.id),
+    signal: input.signal,
     ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {}),
     backend: await getBackend(backends, reviewerBinding),
     spec: {
@@ -454,6 +467,7 @@ async function integrateRun(input: {
   requestUserInput?: UserInputHandler;
   onAgentEvent?: AgentEventSink;
   isInterrupted: () => boolean;
+  signal?: AbortSignal | undefined;
 }): Promise<void> {
   const { config, db, runId } = input;
   const run = db.getRun(runId);
@@ -481,6 +495,7 @@ async function integrateRun(input: {
     const conflictResult = await runTrackedAgent<IntegrationResult>({
       db,
       execution: executionInfo(runId, `integrator-conflict-${task.id}`, 'integrator', integratorBinding.backend, conflictLogPath, integratorBinding.model, task.id),
+      signal: input.signal,
       ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {}),
       backend: integratorBackend,
       spec: {
@@ -530,6 +545,7 @@ async function integrateRun(input: {
     const integrationRun = await runTrackedAgent<IntegrationResult>({
       db,
       execution: executionInfo(runId, 'integrator-finalize', 'integrator', integratorBinding.backend, integrationLogPath, integratorBinding.model),
+      signal: input.signal,
       ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {}),
       backend: integratorBackend,
       spec: {

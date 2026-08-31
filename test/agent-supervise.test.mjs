@@ -130,6 +130,89 @@ test('runAgent reports open-session failures without throwing', async () => {
   assert.match(outcome.error, /binary missing/);
 });
 
+test('runAgent returns a failed outcome without opening an already aborted session', async () => {
+  const { logPath, outputPath } = paths();
+  const controller = new AbortController();
+  controller.abort();
+  const backend = new FakeBackend();
+
+  const outcome = await runAgent({ backend, spec: spec(), logPath, outputPath, signal: controller.signal });
+
+  assert.equal(outcome.ok, false);
+  assert.match(outcome.error, /interrupted/);
+  assert.equal(backend.sessions.length, 0);
+});
+
+test('runAgent interrupts and closes a running session when aborted', async () => {
+  const { logPath, outputPath } = paths();
+  const controller = new AbortController();
+  let opened;
+  let beganCompletion;
+  let resolveCompletion;
+  let interruptCount = 0;
+  let closeCount = 0;
+  const completion = new Promise((resolve) => { resolveCompletion = resolve; });
+  const backend = new FakeBackend();
+  backend.openSession = async () => {
+    opened();
+    return {
+      async interrupt() {
+        interruptCount += 1;
+        resolveCompletion({ ok: false, output: null, error: 'interrupted', timedOut: false, stalled: false });
+      },
+      async close() { closeCount += 1; },
+      completion: () => {
+        beganCompletion();
+        return completion;
+      }
+    };
+  };
+  const opening = new Promise((resolve) => { opened = resolve; });
+  const completionStarted = new Promise((resolve) => { beganCompletion = resolve; });
+  const running = runAgent({ backend, spec: spec(), logPath, outputPath, signal: controller.signal });
+  await opening;
+  await completionStarted;
+  controller.abort();
+  const outcome = await running;
+
+  assert.equal(outcome.ok, false);
+  assert.equal(interruptCount, 1);
+  assert.equal(closeCount, 1);
+});
+
+test('runAgent interrupts a session that opens after its signal is aborted', async () => {
+  const { logPath, outputPath } = paths();
+  const controller = new AbortController();
+  let beginOpen;
+  let finishOpen;
+  let resolveCompletion;
+  let interruptCount = 0;
+  const opening = new Promise((resolve) => { finishOpen = resolve; });
+  const completion = new Promise((resolve) => { resolveCompletion = resolve; });
+  const backend = new FakeBackend();
+  backend.openSession = async () => {
+    beginOpen();
+    await opening;
+    return {
+      async interrupt() {
+        interruptCount += 1;
+        resolveCompletion({ ok: false, output: null, error: 'interrupted', timedOut: false, stalled: false });
+      },
+      async close() {},
+      completion: () => completion
+    };
+  };
+  const openingStarted = new Promise((resolve) => { beginOpen = resolve; });
+  const running = runAgent({ backend, spec: spec(), logPath, outputPath, signal: controller.signal });
+  await openingStarted;
+  controller.abort();
+  finishOpen();
+  const outcome = await running;
+
+  assert.equal(outcome.ok, false);
+  assert.equal(interruptCount, 1);
+});
+
 test('runAgent excludes approval waits from hard and stale timeouts', async () => {
   const { logPath, outputPath } = paths();
   let resolveApproval;

@@ -94,7 +94,47 @@ test('creates a revision only when the policy changes', () => {
       ...projectInput({ policy: { ...projectInput().policy, baseRef: 'release' } }).policy,
       createdAt: registry.getProjectPolicy(second.id).createdAt
     });
+    assert.deepEqual(registry.getProjectPolicyRevision(first.id, `${first.id}:r1`), {
+      id: `${first.id}:r1`,
+      projectId: first.id,
+      revision: 1,
+      ...projectInput().policy,
+      createdAt: registry.getProjectPolicyRevision(first.id, `${first.id}:r1`).createdAt
+    });
     assert.equal(registry.db.prepare('SELECT COUNT(*) AS count FROM project_policy_revisions').get().count, 2);
+  } finally {
+    registry.close();
+  }
+});
+
+test('rejects a policy revision belonging to another project', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'agent-team-project-registry-'));
+  const registry = new ProjectRegistry(join(directory, 'projects.sqlite'));
+  try {
+    const first = registry.registerProject(projectInput());
+    const second = registry.registerProject(projectInput({
+      gitCommonDir: '/repos/other/.git',
+      repoRoot: '/repos/other',
+      displayName: 'Other'
+    }));
+    assert.throws(
+      () => registry.getProjectPolicyRevision(first.id, second.currentPolicyRevisionId),
+      new RegExp(`Project policy revision ${second.currentPolicyRevisionId} does not belong to project: ${first.id}`)
+    );
+  } finally {
+    registry.close();
+  }
+});
+
+test('rejects an unknown policy revision', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'agent-team-project-registry-'));
+  const registry = new ProjectRegistry(join(directory, 'projects.sqlite'));
+  try {
+    const project = registry.registerProject(projectInput());
+    assert.throws(
+      () => registry.getProjectPolicyRevision(project.id, `${project.id}:r999`),
+      new RegExp(`Project policy revision not found: ${project.id}:r999`)
+    );
   } finally {
     registry.close();
   }
@@ -106,6 +146,7 @@ test('reports unknown projects and lists projects by display name', () => {
   try {
     assert.throws(() => registry.getProject('missing'), /Project not found: missing/);
     assert.throws(() => registry.getProjectPolicy('missing'), /Project not found: missing/);
+    assert.throws(() => registry.getProjectPolicyRevision('missing', 'revision'), /Project not found: missing/);
     registry.registerProject(projectInput({
       gitCommonDir: '/repos/zebra/.git',
       displayName: 'Zebra'

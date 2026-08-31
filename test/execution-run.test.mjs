@@ -63,7 +63,14 @@ test('creates an executable planned run from an external contract', async () => 
   const config = configFor(repoRoot);
   const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   try {
-    const runId = await createExecutionRun({ config, db, contract: contract(repoRoot), runId: 'external-run' });
+    const executionContract = contract(repoRoot);
+    const runId = await createExecutionRun({
+      config,
+      db,
+      contract: executionContract,
+      projectPolicyRevisionId: 'policy-revision-42',
+      runId: 'external-run'
+    });
     const run = db.getRun(runId);
     const manifest = JSON.parse(run.manifestJson);
 
@@ -73,7 +80,10 @@ test('creates an executable planned run from an external contract', async () => 
     assert.equal(run.adapter, 'external');
     assert.equal(run.baseRef, 'HEAD');
     assert.match(run.baseSha, /^[0-9a-f]{40}$/);
-    assert.deepEqual(manifest.tasks, contract(repoRoot).tasks);
+    assert.equal(run.projectId, 'external-project');
+    assert.equal(run.projectPolicyRevisionId, 'policy-revision-42');
+    assert.deepEqual(JSON.parse(run.executionContractJson), executionContract);
+    assert.deepEqual(manifest.tasks, executionContract.tasks);
     assert.equal(JSON.parse(run.rolesJson).version, 2);
     assert.deepEqual(db.listTasks(runId).map((task) => task.taskId), ['T001']);
     assert.deepEqual(JSON.parse(readFileSync(join(config.workspace.stateDir, 'runs', runId, 'contract.json'), 'utf8')), contract(repoRoot));

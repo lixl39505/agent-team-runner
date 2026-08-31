@@ -53,8 +53,22 @@ export interface AttachControllerInput {
   lastAckEventId?: number | null;
 }
 
+export interface WaitForInteractionAnswerOptions {
+  pollIntervalMs?: number;
+  signal?: AbortSignal;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+const DEFAULT_INTERACTION_ANSWER_POLL_INTERVAL_MS = 10;
+
 function now(): string {
   return new Date().toISOString();
+}
+
+function assertNonNegativeEventId(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${label} must be a non-negative integer`);
+  }
 }
 
 function mapInteraction(row: Record<string, unknown>): InteractionRecord {
@@ -86,6 +100,41 @@ function mapController(row: Record<string, unknown>): ControllerRecord {
     claimedAt: String(row.claimed_at),
     releasedAt: row.released_at === null ? null : String(row.released_at)
   };
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new Error('Waiting for interaction answer was aborted');
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortReason(signal);
+}
+
+async function sleepUntilAbort(
+  sleep: (ms: number) => Promise<void>,
+  milliseconds: number,
+  signal?: AbortSignal
+): Promise<void> {
+  throwIfAborted(signal);
+  if (!signal) return sleep(milliseconds);
+
+  await new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener('abort', onAbort);
+      reject(abortReason(signal));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    void sleep(milliseconds).then(
+      () => {
+        signal.removeEventListener('abort', onAbort);
+        resolve();
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      }
+    );
+  });
 }
 
 /** Durable ownership and human-interaction state for the local daemon. */
@@ -154,6 +203,33 @@ export class ControlPlaneStore {
     return (rows as Record<string, unknown>[]).map(mapInteraction);
   }
 
+  getInteraction(id: string): InteractionRecord {
+    const row = this.findInteraction(id);
+    if (!row) throw new Error(`Interaction not found: ${id}`);
+    return mapInteraction(row);
+  }
+
+  async waitForInteractionAnswer(
+    id: string,
+    options: WaitForInteractionAnswerOptions = {}
+  ): Promise<JsonValue> {
+    const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_INTERACTION_ANSWER_POLL_INTERVAL_MS;
+    if (!Number.isInteger(pollIntervalMs) || pollIntervalMs <= 0) {
+      throw new Error('pollIntervalMs must be a positive integer');
+    }
+
+    const sleep = options.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => {
+      setTimeout(resolve, milliseconds);
+    }));
+
+    while (true) {
+      throwIfAborted(options.signal);
+      const interaction = this.getInteraction(id);
+      if (interaction.status === 'resolved') return interaction.response;
+      await sleepUntilAbort(sleep, pollIntervalMs, options.signal);
+    }
+  }
+
   claimInteraction(id: string, clientId: string): InteractionRecord {
     const row = this.db.prepare(`
       UPDATE interactions
@@ -195,17 +271,23 @@ export class ControlPlaneStore {
 
   attachController(input: AttachControllerInput): ControllerRecord {
     const timestamp = now();
+    if (input.lastAckEventId !== undefined && input.lastAckEventId !== null) {
+      assertNonNegativeEventId(input.lastAckEventId, 'lastAckEventId');
+    }
+    const hasLastAckEventId = input.lastAckEventId !== undefined;
     const lastAckEventId = input.lastAckEventId ?? null;
     let row = this.db.prepare(`
       UPDATE external_run_controllers
       SET host = ?, external_thread_id = ?, client_id = ?, status = 'connected',
-          last_ack_event_id = ?, claimed_at = ?, released_at = NULL
+          last_ack_event_id = CASE WHEN ? THEN ? ELSE last_ack_event_id END,
+          claimed_at = ?, released_at = NULL
       WHERE run_id = ? AND status = 'disconnected'
       RETURNING *
     `).get(
       input.host,
       input.externalThreadId,
       input.clientId,
+      hasLastAckEventId ? 1 : 0,
       lastAckEventId,
       timestamp,
       input.runId
@@ -230,12 +312,33 @@ export class ControlPlaneStore {
 
     row = this.db.prepare(`
       UPDATE external_run_controllers
+      SET last_ack_event_id = CASE WHEN ? THEN ? ELSE last_ack_event_id END
+      WHERE run_id = ? AND status = 'connected' AND client_id = ?
+      RETURNING *
+    `).get(hasLastAckEventId ? 1 : 0, lastAckEventId, input.runId, input.clientId) as Record<string, unknown> | undefined;
+    if (row) return mapController(row);
+    throw new Error(`Run controller is owned by another client: ${input.runId}`);
+  }
+
+  getController(runId: string): ControllerRecord {
+    const row = this.findController(runId);
+    if (!row) throw new Error(`Run controller not found: ${runId}`);
+    return mapController(row);
+  }
+
+  acknowledgeController(runId: string, clientId: string, lastAckEventId: number): ControllerRecord {
+    assertNonNegativeEventId(lastAckEventId, 'lastAckEventId');
+    const row = this.db.prepare(`
+      UPDATE external_run_controllers
       SET last_ack_event_id = ?
       WHERE run_id = ? AND status = 'connected' AND client_id = ?
       RETURNING *
-    `).get(lastAckEventId, input.runId, input.clientId) as Record<string, unknown> | undefined;
+    `).get(lastAckEventId, runId, clientId) as Record<string, unknown> | undefined;
     if (row) return mapController(row);
-    throw new Error(`Run controller is owned by another client: ${input.runId}`);
+
+    const existing = this.findController(runId);
+    if (!existing) throw new Error(`Run controller not found: ${runId}`);
+    throw new Error(`Run controller is not owned by client: ${clientId}`);
   }
 
   disconnectController(runId: string, clientId: string): ControllerRecord {

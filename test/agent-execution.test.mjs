@@ -34,3 +34,21 @@ test('tracked execution handles minimal test doubles and failed outcomes', async
   assert.equal(updates.at(-1)[2].status, 'failed');
   assert.equal(executionInfo('run', 'lead-2', 'lead', 'claude', '/tmp/lead.log').taskId, undefined);
 });
+
+test('tracked execution forwards an abort signal to the supervisor', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const backend = new FakeBackend();
+  const result = await runTrackedAgent({
+    db: { updateAgentExecution() {} },
+    execution: executionInfo('run', 'worker-1', 'worker', 'claude', '/tmp/worker.log'),
+    backend,
+    spec: spec(),
+    logPath: '/tmp/worker.log',
+    outputPath: '/tmp/worker.json',
+    signal: controller.signal
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(backend.sessions.length, 0);
+});

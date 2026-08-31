@@ -313,3 +313,62 @@ test('orchestrator rebuilds an interrupted integration worktree before finalizat
     db.close();
   }
 });
+
+test('orchestrator records daemon aborts without setting the process exit code', async () => {
+  const repoRoot = await repository();
+  const config = configFor(repoRoot);
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
+  const controller = new AbortController();
+  const exitCode = process.exitCode;
+  process.exitCode = undefined;
+  let interrupted = 0;
+  const backend = new ScriptBackend((spec) => {
+    assert.equal(spec.role, 'worker');
+    controller.abort();
+    return { status: 'completed', summary: 'too late', testsRun: [], knownRisks: [], architectureImpact: 'none', progressImpact: 'none' };
+  });
+  const originalOpenSession = backend.openSession.bind(backend);
+  backend.openSession = async (spec) => {
+    const session = await originalOpenSession(spec);
+    return { ...session, interrupt: async () => { interrupted += 1; } };
+  };
+  try {
+    await createApprovedRun(db, config);
+    db.updateTask('run', 'T001', { status: 'pending', phase: 'pending', commitSha: null });
+    await runOrchestrator({ config, db, runId: 'run', backends: backendPool(backend), signal: controller.signal });
+
+    assert.equal(interrupted, 1);
+    assert.equal(process.exitCode, undefined);
+    assert.equal(db.getRun('run').status, 'running');
+    assert.equal(db.getRun('run').error, 'Interrupted by daemon; run again to resume.');
+    assert.equal(eventTypes(db, 'run').includes('RUN_INTERRUPTED'), true);
+  } finally {
+    process.exitCode = exitCode;
+    db.close();
+  }
+});
+
+test('orchestrator handles an already aborted daemon signal without opening a session', async () => {
+  const repoRoot = await repository();
+  const config = configFor(repoRoot);
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
+  const controller = new AbortController();
+  const exitCode = process.exitCode;
+  process.exitCode = undefined;
+  controller.abort();
+  const backend = new ScriptBackend(() => {
+    throw new Error('agent must not start');
+  });
+  try {
+    await createApprovedRun(db, config);
+    db.updateTask('run', 'T001', { status: 'pending', phase: 'pending', commitSha: null });
+    await runOrchestrator({ config, db, runId: 'run', backends: backendPool(backend), signal: controller.signal });
+
+    assert.equal(backend.specs.length, 0);
+    assert.equal(process.exitCode, undefined);
+    assert.equal(db.getRun('run').error, 'Interrupted by daemon; run again to resume.');
+  } finally {
+    process.exitCode = exitCode;
+    db.close();
+  }
+});

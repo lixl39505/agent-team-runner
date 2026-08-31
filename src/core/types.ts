@@ -233,6 +233,12 @@ export interface RunRecord {
   goalFile: string;
   baseRef: string;
   baseSha: string;
+  /** 外层全局项目标识；由 Lead/goal 创建的历史 run 没有此引用。 */
+  projectId: string | null;
+  /** 提交执行时选定的项目策略修订标识。 */
+  projectPolicyRevisionId: string | null;
+  /** 提交时固化的完整 ExecutionContract。 */
+  executionContractJson: string | null;
   /** plan 时 Lead 使用的后端（历史列名，保持 schema 不变） */
   adapter: string;
   status: RunStatus;
@@ -266,4 +272,14 @@ export interface TaskRecord {
   createdAt: string;
   updatedAt: string;
   finishedAt: string | null;
+}
+
+/** A durable event emitted while executing a run. */
+export interface RunEventRecord {
+  id: number;
+  runId: string;
+  taskId: string | null;
+  eventType: string;
+  payload: unknown | null;
+  createdAt: string;
 }

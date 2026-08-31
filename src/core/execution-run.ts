@@ -28,6 +28,7 @@ export async function createExecutionRun(input: {
   config: RunnerConfig;
   db: StateDatabase;
   contract: unknown;
+  projectPolicyRevisionId?: string;
   runId?: string;
   /** Test seam for deterministic generated run ids. */
   now?: () => Date;
@@ -56,6 +57,9 @@ export async function createExecutionRun(input: {
     goalFile: '<execution-contract>',
     baseRef: contract.project.baseRef,
     baseSha,
+    projectId: contract.project.id,
+    projectPolicyRevisionId: input.projectPolicyRevisionId ?? null,
+    executionContractJson: JSON.stringify(contract),
     adapter: 'external'
   });
 
