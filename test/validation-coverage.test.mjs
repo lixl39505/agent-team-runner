@@ -1,6 +1,6 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { validateExecutionContract, validateIntegrationResult, validateReviewResult } from '../src/core/validation.ts';
+import { validateExecutionContract, validateIntegrationResult, validateReviewResult, validateWorkerResult } from '../src/core/validation.ts';
 
 function task(id, overrides = {}) {
   return { id, title: id, description: `Implement ${id}`, dependsOn: [], allowedPaths: [`src/${id}/**`], blockedPaths: [], acceptance: ['works'], verificationCommands: [], ...overrides };
@@ -38,4 +38,32 @@ test('covers review and integration result fallback and rejection branches', () 
   assert.deepEqual(validateReviewResult({ decision: 'approved', findings: [{ severity: 'low', message: 'Note' }] }).findings, [{ severity: 'low', file: '', message: 'Note' }]);
   assert.throws(() => validateReviewResult({ decision: 'rejected' }), /Invalid review decision/);
   assert.throws(() => validateIntegrationResult({ status: 'unknown' }), /Invalid integration status/);
+});
+
+test('rejects every invalid task graph and contract-block result variant', () => {
+  assert.throws(() => validateExecutionContract(contract([task('T001'), task('T001')])), /Duplicate task id/);
+  assert.throws(() => validateExecutionContract(contract([task('T001', { allowedPaths: [] })])), /no allowed paths/);
+  assert.throws(() => validateExecutionContract(contract([task('T001', { dependsOn: ['T002'] })])), /unknown task/);
+  assert.throws(() => validateExecutionContract(contract([task('T001', { dependsOn: ['T001'] })])), /depend on itself/);
+  assert.throws(() => validateExecutionContract(contract([task('T001', { agent: 1 })])), /invalid agent/);
+  assert.throws(() => validateExecutionContract(contract([task('T001', { allowedPaths: [''] })])), /absolute or empty/);
+
+  assert.throws(() => validateWorkerResult({ status: 'completed', unexpected: true }), /unknown fields/);
+  assert.throws(() => validateWorkerResult({ status: 'blocked_on_contract' }), /requires contractBlock/);
+  assert.throws(() => validateWorkerResult({ status: 'completed', contractBlock: {} }), /only valid/);
+  assert.throws(() => validateWorkerResult({
+    status: 'blocked_on_contract',
+    contractBlock: { code: 'invalid', message: 1, requestedContractChanges: [] }
+  }), /Invalid contractBlock code/);
+  assert.throws(() => validateWorkerResult({
+    status: 'blocked_on_contract',
+    contractBlock: { code: 'other', message: 1, requestedContractChanges: [] }
+  }), /message must be a string/);
+  assert.throws(() => validateWorkerResult({
+    status: 'blocked_on_contract', contractBlock: { code: 'other', message: 'Need a decision' }
+  }), /requestedContractChanges is required/);
+  assert.throws(() => validateWorkerResult({
+    status: 'blocked_on_contract',
+    contractBlock: { code: 'other', message: 'Need a decision', requestedContractChanges: [], unexpected: true }
+  }), /unknown fields/);
 });

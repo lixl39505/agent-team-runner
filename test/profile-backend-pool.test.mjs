@@ -117,3 +117,24 @@ test('isolated OpenCode requires a provider-qualified model', async () => {
     disposeBackends(backends);
   }
 });
+
+test('profile pool treats an empty profile as shared and omits absent backend commands', async () => {
+  const backends = buildBackends(config());
+  try {
+    assert.equal(await backends.get({ agent: 'shared-claude', backend: 'claude', authProfile: '', source: 'test' }), backends.claude);
+    assert.equal(backends.claude.options.command, undefined);
+  } finally {
+    disposeBackends(backends);
+  }
+});
+
+test('profile pool forwards configured backend commands', () => {
+  const configured = config();
+  configured.backends.claude.command = 'custom-claude';
+  const backends = buildBackends(configured);
+  try {
+    assert.equal(backends.claude.options.command, 'custom-claude');
+  } finally {
+    disposeBackends(backends);
+  }
+});

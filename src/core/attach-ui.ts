@@ -78,28 +78,33 @@ export class AttachRunUi {
     if (!this.active || this.paused) return;
     const columns = Math.max(60, this.output.columns ?? 120);
     const rows = Math.max(12, this.output.rows ?? 30);
-    const split = Math.max(38, Math.floor(columns * 0.62));
-    const rightWidth = columns - split - 3;
+    const logsWidth = Math.max(28, Math.floor(columns * 0.48));
+    const taskWidth = Math.max(16, Math.floor((columns - logsWidth - 6) * 0.52));
+    const inboxWidth = columns - logsWidth - taskWidth - 6;
     const run = object(this.state.run);
     const tasks = array(this.state.tasks);
     const executions = array(this.state.agentExecutions);
     const interactions = array(this.state.interactions).filter((item) => object(item).status === 'queued');
-    const left = this.lines.slice(-(rows - 3)).map((line) => clip(line, split - 1));
-    const right = [
+    const logs = this.lines.slice(-(rows - 3)).map((line) => clip(line, logsWidth));
+    const taskPane = [
       `RUN ${text(run.status, 'unknown')}`,
-      `TASKS ${tasks.map((task) => text(object(task).status, 'unknown')).join(', ') || 'none'}`,
+      'TASKS',
+      ...tasks.map((task) => clip(`${text(object(task).taskId, 'unknown')} ${text(object(task).status, 'unknown')} ${text(object(task).title)}`, taskWidth)),
       '',
       'AGENTS',
-      ...executions.map((entry) => executionText(object(entry), rightWidth)),
+      ...executions.map((entry) => executionText(object(entry), taskWidth))
+    ];
+    const inbox = [
+      `INBOX ${interactions.length}`,
       '',
-      `PENDING INTERACTIONS ${interactions.length}`,
-      ...interactions.map((entry) => clip(`${text(object(entry).kind, 'unknown')} ${text(object(entry).agentId, 'unknown')}`, rightWidth))
+      ...interactions.map((entry) => clip(`${text(object(entry).kind, 'unknown')} ${text(object(entry).taskId, '')} ${text(object(entry).agentId, 'unknown')}`, inboxWidth))
     ];
     const contentRows = rows - 2;
     const rendered = Array.from({ length: contentRows }, (_value, index) => {
-      const leftLine = left[index] ?? '';
-      const rightLine = right[index] ?? '';
-      return `${leftLine.padEnd(split)} │ ${rightLine}`;
+      const logLine = logs[index] ?? '';
+      const taskLine = taskPane[index] ?? '';
+      const inboxLine = inbox[index] ?? '';
+      return `${logLine.padEnd(logsWidth)} │ ${taskLine.padEnd(taskWidth)} │ ${inboxLine}`;
     });
     this.output.write(`\x1b[H\x1b[2J\x1b[1m${clip(` Agent Team Attach  ${this.runId} `, columns)}\x1b[0m\n${rendered.join('\n')}\n\x1b[2mCtrl-C exits and requeues unanswered interactions.\x1b[0m`);
   }

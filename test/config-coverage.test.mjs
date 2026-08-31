@@ -47,3 +47,12 @@ test('loadConfig falls back to defaults when no config file exists', () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('loadConfig rejects the removed roles.lead key', () => {
+  const root = repository({ roles: { lead: 'default-claude' } });
+  try {
+    assert.throws(() => loadConfig(root), /roles\.lead has been removed/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -80,16 +80,21 @@ test('MCP bridge lists and dispatches every fixed IPC tool', async () => {
       'agent_team_cancel_run',
       'agent_team_claim_interaction',
       'agent_team_disconnect_controller',
+      'agent_team_get_handoff',
       'agent_team_get_run',
       'agent_team_get_status',
+      'agent_team_heartbeat_controller',
       'agent_team_list_interactions',
       'agent_team_list_projects',
       'agent_team_list_reconnectable_runs',
+      'agent_team_list_runs',
       'agent_team_read_run_events',
       'agent_team_register_project',
       'agent_team_requeue_interactions',
       'agent_team_start_run',
-      'agent_team_submit_execution_contract'
+      'agent_team_submit_execution_contract',
+      'agent_team_update_task_contract',
+      'agent_team_validate_execution_contract'
     ]);
     assert.equal(tools.tools.some((tool) => tool.name.includes('shutdown')), false);
 
@@ -101,13 +106,18 @@ test('MCP bridge lists and dispatches every fixed IPC tool', async () => {
       ['agent_team_requeue_interactions', { clientId: 'client-1' }, 'interaction.requeue_client', { clientId: 'client-1' }],
       ['agent_team_attach_controller', { runId: 'run-1', host: 'host-1', externalThreadId: 'thread-1', clientId: 'client-1', lastAckEventId: 3 }, 'controller.attach', { runId: 'run-1', host: 'host-1', externalThreadId: 'thread-1', clientId: 'client-1', lastAckEventId: 3 }],
       ['agent_team_disconnect_controller', { runId: 'run-1', clientId: 'client-1' }, 'controller.disconnect', { runId: 'run-1', clientId: 'client-1' }],
+      ['agent_team_heartbeat_controller', { runId: 'run-1', clientId: 'client-1' }, 'controller.heartbeat', { runId: 'run-1', clientId: 'client-1' }],
       ['agent_team_list_reconnectable_runs', {}, 'controller.reconnectable', undefined],
       ['agent_team_register_project', projectRegistration(), 'project.register', projectRegistration()],
       ['agent_team_list_projects', {}, 'project.list', undefined],
       ['agent_team_submit_execution_contract', { contract: executionContract(), runId: 'run-1' }, 'execution.submit', { contract: executionContract(), runId: 'run-1' }],
+      ['agent_team_validate_execution_contract', { contract: executionContract() }, 'execution.validate', { contract: executionContract() }],
+      ['agent_team_update_task_contract', { runId: 'run-1', contract: executionContract() }, 'execution.update_contract', { runId: 'run-1', contract: executionContract() }],
       ['agent_team_start_run', { runId: 'run-1' }, 'execution.start', { runId: 'run-1' }],
       ['agent_team_cancel_run', { runId: 'run-1' }, 'execution.cancel', { runId: 'run-1' }],
       ['agent_team_get_run', { runId: 'run-1' }, 'execution.get', { runId: 'run-1' }],
+      ['agent_team_get_handoff', { runId: 'run-1' }, 'execution.handoff', { runId: 'run-1' }],
+      ['agent_team_list_runs', { projectId: 'project-1' }, 'execution.list', { projectId: 'project-1' }],
       ['agent_team_read_run_events', { runId: 'run-1', clientId: 'client-1', afterEventId: 3, limit: 10 }, 'execution.events', { runId: 'run-1', clientId: 'client-1', afterEventId: 3, limit: 10 }]
     ];
 
@@ -125,6 +135,11 @@ test('MCP bridge lists and dispatches every fixed IPC tool', async () => {
     });
     assert.equal(text(listWithoutRun), JSON.stringify({ method: 'interaction.list', params: null }));
     assert.deepEqual(calls.at(-1), { method: 'interaction.list', params: undefined });
+    const listRunsWithoutProject = await client.callTool({
+      name: 'agent_team_list_runs', arguments: {}
+    });
+    assert.equal(text(listRunsWithoutProject), JSON.stringify({ method: 'execution.list', params: null }));
+    assert.deepEqual(calls.at(-1), { method: 'execution.list', params: undefined });
   } finally {
     await closeConnectedServer(connected);
   }

@@ -87,6 +87,7 @@ test('run bindings include manifest task-level agents', () => {
   const bindings = bindingsForRun(config, null, JSON.stringify({ tasks: [{ agent: 'specialist' }] }));
 
   assert.equal(bindings.some((binding) => binding.agent === 'specialist' && binding.backend === 'codex'), true);
+  assert.equal(bindingsForRun(config, null, null).length, 3);
 });
 
 test('preflight rejects maxTurns when the backend does not support it', async () => {
@@ -164,6 +165,18 @@ test('preflight stringifies a non-Error probe crash', async () => {
 
   assert.deepEqual(result.errors, ['agent "test": default model is not available on backend "claude": probe process exited']);
   assert.deepEqual(result.warnings, ['probe on claude/default crashed: probe process exited']);
+});
+
+test('preflight reuses failed probes and reports Error probe crashes', async () => {
+  const cachedFailure = input({ ok: true, degraded: false, detail: 'sandbox ready' });
+  cachedFailure.backends.claude.probe = async () => ({ ok: false, error: 'unavailable', latencyMs: 1 });
+  await checkAgentAvailability(cachedFailure);
+  await checkAgentAvailability(cachedFailure);
+
+  const errorFailure = input({ ok: true, degraded: false, detail: 'sandbox ready' });
+  errorFailure.backends.claude.probe = async () => { throw new Error('probe crashed'); };
+  const result = await checkAgentAvailability(errorFailure);
+  assert.match(result.warnings[0], /probe crashed/);
 });
 
 test('doctor probe reports explicit model successes and non-Error crashes', async () => {

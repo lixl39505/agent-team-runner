@@ -21,7 +21,8 @@ MCP exposes only fixed control-plane tools. A controller can:
 1. Register a Git repository with its execution policy.
 2. Submit an `ExecutionContract` for that registered project.
 3. Attach to the run, read status and durable events, and answer interactions.
-4. Start, resume, or cancel an eligible run.
+4. Validate or revise a blocked run's contract, then start or cancel an eligible run.
+5. Retrieve the durable handoff after an execution completes.
 
 `execution.submit` creates a planned run and schedules it in the daemon. The
 daemon recreates its runtime configuration from the project's pinned policy
@@ -55,8 +56,11 @@ return `blocked_on_contract` with a structured reason. The daemon then:
 - queues a durable `contract_block` interaction for the controller.
 
 Answering that interaction records acknowledgement only. The outer controller
-must submit a revised execution contract rather than silently mutate a pinned
-run.
+must use `agent_team_update_task_contract` with a full revised contract. The
+daemon stores an immutable revision, rejects changes to approved tasks, and
+resets only the blocked task plus its unfinished downstream tasks. Completed
+runs produce `handoff.json` and `handoff.md` beneath the global run directory;
+controllers read the structured form through `agent_team_get_handoff`.
 
 ## Roles And Skills
 

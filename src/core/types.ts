@@ -255,6 +255,8 @@ export interface RunRecord {
   projectPolicyRevisionId: string | null;
   /** 提交时固化的完整 ExecutionContract。 */
   executionContractJson: string | null;
+  /** 当前 ExecutionContract revision；历史本地 run 没有时视为 0。 */
+  contractRevision: number;
   /** 运行来源后端（历史列名，保持 schema 不变）。 */
   adapter: string;
   status: RunStatus;

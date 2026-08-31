@@ -2,7 +2,7 @@ import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { StateDatabase } from '../src/core/db.ts';
@@ -194,6 +194,7 @@ test('AgentTeamDaemon exposes control-plane operations through LocalIpcClient', 
     });
     await daemon.start();
     const client = new LocalIpcClient(home.socket);
+    let foreignInteraction;
     try {
       await client.connect();
       assert.deepEqual(
@@ -201,6 +202,7 @@ test('AgentTeamDaemon exposes control-plane operations through LocalIpcClient', 
         [interaction.id, requeued.id].sort()
       );
       assert.deepEqual((await client.request('interaction.list', { runId: 'run-1' })).map((entry) => entry.id), [interaction.id]);
+      await client.request('controller.attach', { runId: 'run-1', host: 'host-a', clientId: 'client-a' });
       assert.equal((await client.request('interaction.claim', { id: interaction.id, clientId: 'client-a' })).status, 'claimed');
       const answered = await client.request('interaction.answer', {
         id: interaction.id, clientId: 'client-a', response: { approved: true }
@@ -208,6 +210,15 @@ test('AgentTeamDaemon exposes control-plane operations through LocalIpcClient', 
       assert.equal(answered.status, 'resolved');
       assert.deepEqual(answered.response, { approved: true });
       assert.equal(answered.claimedByClientId, 'client-a');
+
+      foreignInteraction = store.queueInteraction({
+        runId: 'run-1', agentId: 'agent-foreign', kind: 'approval', request: { command: 'npm test' }
+      });
+      await client.request('interaction.claim', { id: foreignInteraction.id, clientId: 'client-b' });
+      await assert.rejects(client.request('interaction.answer', {
+        id: foreignInteraction.id, clientId: 'client-b', response: { approved: true }
+      }), /not owned/);
+      assert.equal(store.getInteraction(foreignInteraction.id).status, 'claimed');
 
       await client.request('interaction.claim', { id: requeued.id, clientId: 'client-a' });
       assert.equal(await client.request('interaction.requeue_client', { clientId: 'client-a' }), 1);
@@ -217,6 +228,7 @@ test('AgentTeamDaemon exposes control-plane operations through LocalIpcClient', 
       assert.equal(attached.status, 'connected');
       assert.equal(attached.lastAckEventId, null);
       assert.ok(Date.parse(attached.claimedAt));
+      assert.equal((await client.request('controller.heartbeat', { runId: 'run-1', clientId: 'client-a' })).status, 'connected');
       assert.equal(
         (await client.request('controller.attach', {
           runId: 'run-1', host: 'host-b', externalThreadId: 'thread-1', clientId: 'client-a', lastAckEventId: 7
@@ -240,12 +252,15 @@ test('AgentTeamDaemon exposes control-plane operations through LocalIpcClient', 
       await assert.rejects(client.request('interaction.claim', { id: '', clientId: 'client-a' }), /id/);
       await assert.rejects(client.request('interaction.list', { runId: 1 }), /runId/);
       await assert.rejects(client.request('interaction.answer', { id: interaction.id, clientId: 'client-a' }), /response/);
+      await assert.rejects(client.request('controller.heartbeat', { runId: 'run-1', clientId: 'client-b' }), /not owned/);
       await assert.rejects(client.request('controller.attach', { runId: 'run-2', host: 'host-a', clientId: 'client-a', lastAckEventId: -1 }), /lastAckEventId/);
       await assert.rejects(client.request('controller.reconnectable', {}), /does not accept params/);
     } finally {
       client.close();
       await daemon.stop();
-      assert.deepEqual(store.listInteractions('run-1').map((entry) => entry.id), [interaction.id]);
+      assert.deepEqual(store.listInteractions('run-1').map((entry) => entry.id).sort(), [
+        interaction.id, foreignInteraction.id
+      ].sort());
       store.close();
     }
   });
@@ -813,6 +828,187 @@ test('AgentTeamDaemon marks executor failures in the run database', async () => 
   });
 });
 
+test('AgentTeamDaemon revises a blocked execution contract and resets its downstream tasks', async () => {
+  await withHome(async (home) => {
+    const { repoRoot, gitCommonDir } = await repository(dirname(home.root));
+    let executions = 0;
+    const daemon = new AgentTeamDaemon(home, {
+      runExecutor: async (input) => {
+        executions += 1;
+        if (executions !== 1) return;
+        input.reportContractBlock({
+          task: input.db.getTask(input.runId, 'T001'),
+          agentExecution: { agentId: 'T001-worker-1', sessionId: 'worker-session' },
+          reason: { code: 'out_of_scope', message: 'Need another source path.', requestedContractChanges: ['Allow src/other.ts'] }
+        });
+        input.db.updateTask(input.runId, 'T001', { status: 'blocked_on_contract' });
+      }
+    });
+    await daemon.start();
+    const client = new LocalIpcClient(home.socket);
+    try {
+      await client.connect();
+      const project = await client.request('project.register', {
+        gitCommonDir, repoRoot, displayName: 'Revision execution', gitIdentity: {}, policy: projectPolicy()
+      });
+      const contract = executionContract(project, repoRoot);
+      await client.request('execution.submit', { contract, runId: 'revision-execution' });
+      await waitFor(() => daemon.stateDatabase.getTask('revision-execution', 'T001').status === 'blocked_on_contract');
+      const revised = {
+        ...contract,
+        tasks: [
+          { ...contract.tasks[0], allowedPaths: ['src/**', 'lib/**'] },
+          {
+            ...contract.tasks[0], id: 'T002', externalId: 'SPEC-2', title: 'Verify changed contract',
+            description: 'Implement the dependent work.', dependsOn: ['T001']
+          }
+        ]
+      };
+      const updated = await client.request('execution.update_contract', { runId: 'revision-execution', contract: revised });
+      assert.deepEqual(updated, {
+        runId: 'revision-execution', revision: 2, affectedTaskIds: ['T001', 'T002'], scheduled: true
+      });
+      await waitFor(() => executions === 2);
+      assert.equal(daemon.stateDatabase.getRun('revision-execution').contractRevision, 2);
+      assert.deepEqual(daemon.stateDatabase.listContractRevisions('revision-execution').map((entry) => entry.revision), [1, 2]);
+      assert.deepEqual(daemon.stateDatabase.listTasks('revision-execution').map((task) => [task.taskId, task.status]), [
+        ['T001', 'pending'], ['T002', 'pending']
+      ]);
+    } finally {
+      client.close();
+      await daemon.stop();
+    }
+  });
+});
+
+test('AgentTeamDaemon validates and lists external execution contracts through IPC', async () => {
+  await withHome(async (home) => {
+    const { repoRoot, gitCommonDir } = await repository(dirname(home.root));
+    const daemon = new AgentTeamDaemon(home, { runExecutor: async () => {} });
+    await daemon.start();
+    const client = new LocalIpcClient(home.socket);
+    try {
+      await client.connect();
+      const project = await client.request('project.register', {
+        gitCommonDir, repoRoot, displayName: 'Validated execution', gitIdentity: {}, policy: projectPolicy()
+      });
+      const contract = executionContract(project, repoRoot);
+      assert.deepEqual(await client.request('execution.validate', { contract }), {
+        valid: true, taskCount: 1, projectPolicyRevisionId: project.currentPolicyRevisionId
+      });
+      await assert.rejects(client.request('execution.validate', {
+        contract: { ...contract, tasks: [{ ...contract.tasks[0], verificationCommands: ['git status'] }] }
+      }), /allowlisted/);
+      await assert.rejects(client.request('execution.validate', {}), /contract is required/);
+
+      await client.request('execution.submit', { contract, runId: 'listed-execution-a' });
+      await client.request('execution.submit', { contract, runId: 'listed-execution-b' });
+      assert.deepEqual((await client.request('execution.list')).map((run) => run.id).sort(), [
+        'listed-execution-a', 'listed-execution-b'
+      ]);
+      assert.deepEqual((await client.request('execution.list', { projectId: project.id })).map((run) => run.id).sort(), [
+        'listed-execution-a', 'listed-execution-b'
+      ]);
+      assert.deepEqual(await client.request('execution.list', { projectId: 'missing-project' }), []);
+      await assert.rejects(client.request('execution.list', { projectId: 1 }), /projectId/);
+    } finally {
+      client.close();
+      await daemon.stop();
+    }
+  });
+});
+
+test('AgentTeamDaemon enforces blocked contract revision boundaries', async () => {
+  await withHome(async (home) => {
+    const { repoRoot, gitCommonDir } = await repository(dirname(home.root));
+    const daemon = new AgentTeamDaemon(home, { runExecutor: async () => {} });
+    await daemon.start();
+    const client = new LocalIpcClient(home.socket);
+    try {
+      await client.connect();
+      const project = await client.request('project.register', {
+        gitCommonDir, repoRoot, displayName: 'Revision boundaries', gitIdentity: {}, policy: projectPolicy()
+      });
+      const first = executionContract(project, repoRoot).tasks[0];
+      const contract = {
+        ...executionContract(project, repoRoot),
+        tasks: [
+          first,
+          { ...first, id: 'T002', externalId: 'SPEC-2', title: 'Independent task', allowedPaths: ['lib/**'], dependsOn: [] }
+        ]
+      };
+      await client.request('execution.submit', { contract, runId: 'revision-boundaries' });
+
+      await assert.rejects(client.request('execution.update_contract', {
+        runId: 'revision-boundaries', contract
+      }), /no blocked_on_contract task/);
+      daemon.stateDatabase.updateTask('revision-boundaries', 'T001', { status: 'blocked_on_contract' });
+
+      await assert.rejects(client.request('execution.update_contract', {
+        runId: 'revision-boundaries', contract: { ...contract, project: { ...contract.project, baseRef: 'other' } }
+      }), /cannot change the run project or base ref/);
+      await assert.rejects(client.request('execution.update_contract', {
+        runId: 'revision-boundaries', contract: {
+          ...contract,
+          tasks: [...contract.tasks, {
+            ...first, id: 'T003', externalId: 'SPEC-3', title: 'Unrelated task', allowedPaths: ['test/**'], dependsOn: []
+          }]
+        }
+      }), /must depend on a contract-blocked task/);
+      daemon.stateDatabase.updateTask('revision-boundaries', 'T001', { status: 'blocked_on_contract' });
+      await assert.rejects(client.request('execution.update_contract', {
+        runId: 'revision-boundaries', contract: {
+          ...contract, tasks: [first, { ...contract.tasks[1], allowedPaths: ['test/**'] }]
+        }
+      }), /can only change blocked tasks or their downstream tasks/);
+
+      daemon.stateDatabase.updateTask('revision-boundaries', 'T001', { status: 'blocked_on_contract' });
+      daemon.stateDatabase.updateTask('revision-boundaries', 'T002', { status: 'approved' });
+      await assert.rejects(client.request('execution.update_contract', {
+        runId: 'revision-boundaries', contract: {
+          ...contract, tasks: [first, { ...contract.tasks[1], allowedPaths: ['test/**'] }]
+        }
+      }), /cannot change approved task T002/);
+    } finally {
+      client.close();
+      await daemon.stop();
+    }
+  });
+});
+
+test('AgentTeamDaemon returns completed handoffs and reports unavailable or invalid files', async () => {
+  await withHome(async (home) => {
+    const { repoRoot, gitCommonDir } = await repository(dirname(home.root));
+    const daemon = new AgentTeamDaemon(home, {
+      runExecutor: async (input) => { input.db.updateRun(input.runId, { status: 'done' }); }
+    });
+    await daemon.start();
+    const client = new LocalIpcClient(home.socket);
+    try {
+      await client.connect();
+      const project = await client.request('project.register', {
+        gitCommonDir, repoRoot, displayName: 'Handoff execution', gitIdentity: {}, policy: projectPolicy()
+      });
+      const submitted = await client.request('execution.submit', {
+        contract: executionContract(project, repoRoot), runId: 'handoff-execution'
+      });
+      await waitFor(() => eventTypes(daemon.stateDatabase, submitted.runId).includes('RUN_HANDOFF_CREATED'));
+      const handoff = await client.request('execution.handoff', { runId: submitted.runId });
+      assert.equal(handoff.run.id, submitted.runId);
+      assert.equal(handoff.run.status, 'done');
+      assert.deepEqual(handoff.tasks.map((task) => task.id), ['T001']);
+      assert.equal(handoff.contract.project.id, project.id);
+
+      await assert.rejects(client.request('execution.handoff', { runId: 'missing-handoff' }), /has no handoff/);
+      await writeFile(join(home.runsDir, submitted.runId, 'handoff.json'), '{', 'utf8');
+      await assert.rejects(client.request('execution.handoff', { runId: submitted.runId }));
+    } finally {
+      client.close();
+      await daemon.stop();
+    }
+  });
+});
+
 test('AgentTeamDaemon execution.start rejects terminal and legacy runs', async () => {
   await withHome(async (home) => {
     const daemon = new AgentTeamDaemon(home, { runExecutor: async () => {} });
@@ -933,6 +1129,78 @@ test('connectToDaemon creates and connects a LocalIpcClient', async () => {
       assert.equal((await client.request('health')).home, home.root);
     } finally {
       client.close();
+      await daemon.stop();
+    }
+  });
+});
+
+test('AgentTeamDaemon rejects invalid contract revision states before scheduling', async () => {
+  await withHome(async (home) => {
+    const { repoRoot, gitCommonDir } = await repository(dirname(home.root));
+    const handlers = new Map();
+    const server = {
+      register(method, handler) { handlers.set(method, handler); },
+      async start() {},
+      async stop() {}
+    };
+    const daemon = new AgentTeamDaemon(home, { server, runExecutor: async () => {} });
+    const update = handlers.get('execution.update_contract');
+    const project = daemon.projectRegistry.registerProject({
+      gitCommonDir, repoRoot, displayName: 'Revision cases', gitIdentity: {}, policy: projectPolicy()
+    });
+    const contract = executionContract(project, repoRoot);
+    try {
+      await assert.rejects(update({ runId: 'missing-contract' }), /contract is required/);
+
+      daemon.activeRuns.set('active-run', {});
+      await assert.rejects(update({ runId: 'active-run', contract }), /is active/);
+      daemon.activeRuns.clear();
+
+      daemon.stateDatabase.createRun({
+        id: 'legacy-run', repoRoot, goalFile: 'goal.md', baseRef: 'HEAD', baseSha: 'base', adapter: 'external'
+      });
+      await assert.rejects(update({ runId: 'legacy-run', contract }), /no external execution contract/);
+
+      daemon.stateDatabase.createRun({
+        id: 'policy-fallback', repoRoot, goalFile: 'goal.md', baseRef: 'HEAD', baseSha: 'base',
+        projectId: project.id, executionContractJson: JSON.stringify(contract), adapter: 'external'
+      });
+      await assert.rejects(update({ runId: 'policy-fallback', contract }), /no blocked_on_contract task/);
+
+      const policy = daemon.projectRegistry.getProjectPolicy(project.id);
+      await createExecutionRun({
+        config: runnerConfigFromProjectPolicy(policy, project, home), db: daemon.stateDatabase, contract,
+        projectPolicyRevisionId: policy.id, runId: 'removed-task'
+      });
+      await assert.rejects(update({
+        runId: 'removed-task',
+        contract: { ...contract, tasks: [{ ...contract.tasks[0], id: 'T002', externalId: 'SPEC-2', title: 'Replacement task' }] }
+      }), /cannot remove task T001/);
+    } finally {
+      daemon.activeRuns.clear();
+      await daemon.stop();
+    }
+  });
+});
+
+test('AgentTeamDaemon handoff includes populated optional task fields and null contracts', async () => {
+  await withHome(async (home) => {
+    const daemon = new AgentTeamDaemon(home);
+    const runId = 'legacy-handoff';
+    daemon.stateDatabase.createRun({
+      id: runId, repoRoot: '/repos/handoff', goalFile: 'goal.md', baseRef: 'HEAD', baseSha: 'base', adapter: 'cli'
+    });
+    daemon.stateDatabase.insertTask(runId, executionContract({ id: 'project' }, '/repos/handoff').tasks[0]);
+    daemon.stateDatabase.updateTask(runId, 'T001', { commitSha: 'deadbeef', reviewJson: JSON.stringify({ decision: 'approved' }) });
+    daemon.stateDatabase.updateRun(runId, { status: 'done' });
+    await mkdir(join(home.runsDir, runId), { recursive: true });
+    try {
+      daemon.writeHandoff(runId);
+      const handoff = JSON.parse(await (await import('node:fs/promises')).readFile(join(home.runsDir, runId, 'handoff.json'), 'utf8'));
+      assert.equal(handoff.contract, null);
+      assert.deepEqual(handoff.tasks[0].review, { decision: 'approved' });
+      assert.match(await (await import('node:fs/promises')).readFile(join(home.runsDir, runId, 'handoff.md'), 'utf8'), /deadbeef/);
+    } finally {
       await daemon.stop();
     }
   });

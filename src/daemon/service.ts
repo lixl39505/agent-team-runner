@@ -1,9 +1,16 @@
 import { ensureAgentTeamHome, type AgentTeamHome } from '../core/home.js';
+import { join } from 'node:path';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { StateDatabase } from '../core/db.js';
 import { createExecutionRun } from '../core/execution-run.js';
 import { runOrchestrator } from '../core/orchestrator.js';
+import { agentList } from '../core/agent-config.js';
 import type { AgentEventSink } from '../core/agent-execution.js';
 import type { ContractBlockReport } from '../core/types.js';
+import { validateExecutionContract } from '../core/validation.js';
+import { assertAllowedCommand } from '../core/shell.js';
+import { writeJson, writeTaskMarkdown } from '../core/files.js';
+import type { ExecutionContract, RunManifest } from '../core/types.js';
 import { ProjectRegistry, type JsonValue as ProjectJsonValue, type ProjectPolicyInput } from '../core/project-registry.js';
 import { runnerConfigFromProjectPolicy } from '../core/project-runtime.js';
 import type { ApprovalDecision, ApprovalHandler, UserInputAnswers, UserInputHandler } from '../agent/approval.js';
@@ -269,9 +276,13 @@ export class AgentTeamDaemon {
       if (!Object.hasOwn(input, 'response')) {
         throw new Error('interaction.answer params.response is required');
       }
+      const id = requiredString(input, 'id', 'interaction.answer');
+      const clientId = requiredString(input, 'clientId', 'interaction.answer');
+      const interaction = this.controlPlaneStore.getInteraction(id);
+      this.controlPlaneStore.assertControllerOwnership(interaction.runId, clientId);
       return this.controlPlaneStore.answerInteraction(
-        requiredString(input, 'id', 'interaction.answer'),
-        requiredString(input, 'clientId', 'interaction.answer'),
+        id,
+        clientId,
         input.response as JsonValue
       );
     });
@@ -300,6 +311,13 @@ export class AgentTeamDaemon {
       return this.controlPlaneStore.disconnectController(
         requiredString(input, 'runId', 'controller.disconnect'),
         requiredString(input, 'clientId', 'controller.disconnect')
+      );
+    });
+    this.server.register('controller.heartbeat', async (params) => {
+      const input = objectParams(params, 'controller.heartbeat', ['runId', 'clientId']);
+      return this.controlPlaneStore.heartbeatController(
+        requiredString(input, 'runId', 'controller.heartbeat'),
+        requiredString(input, 'clientId', 'controller.heartbeat')
       );
     });
     this.server.register('controller.reconnectable', async (params) => {
@@ -338,6 +356,105 @@ export class AgentTeamDaemon {
       });
       return { runId, scheduled: this.scheduleRun(runId) };
     });
+    this.server.register('execution.validate', async (params) => {
+      const input = objectParams(params, 'execution.validate', ['contract']);
+      if (!Object.hasOwn(input, 'contract')) throw new Error('execution.validate params.contract is required');
+      assertExecutionContractFields(input.contract);
+      const contract = input.contract as Record<string, unknown>;
+      const projectInput = contract.project as Record<string, unknown>;
+      const project = this.projectRegistry.getProject(requiredString(projectInput, 'id', 'execution.validate params.contract.project'));
+      const policy = this.projectRegistry.getProjectPolicy(project.id);
+      const config = runnerConfigFromProjectPolicy(policy, project, this.home);
+      const validated = validateExecutionContract(input.contract, agentList(config).map((agent) => agent.name));
+      for (const task of validated.tasks) {
+        for (const command of task.verificationCommands) {
+          assertAllowedCommand(command, config.verification.allowedCommandPrefixes);
+        }
+      }
+      return { valid: true, taskCount: validated.tasks.length, projectPolicyRevisionId: policy.id };
+    });
+    this.server.register('execution.update_contract', async (params) => {
+      const input = objectParams(params, 'execution.update_contract', ['runId', 'contract']);
+      const runId = requiredString(input, 'runId', 'execution.update_contract');
+      if (!Object.hasOwn(input, 'contract')) throw new Error('execution.update_contract params.contract is required');
+      if (this.activeRuns.has(runId)) throw new Error(`Run ${runId} is active and cannot accept a contract revision`);
+      assertExecutionContractFields(input.contract);
+      const run = this.stateDatabase.getRun(runId);
+      if (!run.executionContractJson || !run.projectId) throw new Error(`Run ${runId} has no external execution contract`);
+      const project = this.projectRegistry.getProject(run.projectId);
+      const policy = run.projectPolicyRevisionId
+        ? this.projectRegistry.getProjectPolicyRevision(project.id, run.projectPolicyRevisionId)
+        : this.projectRegistry.getProjectPolicy(project.id);
+      const config = runnerConfigFromProjectPolicy(policy, project, this.home);
+      const contract = validateExecutionContract(input.contract, agentList(config).map((agent) => agent.name));
+      for (const task of contract.tasks) {
+        for (const command of task.verificationCommands) assertAllowedCommand(command, config.verification.allowedCommandPrefixes);
+      }
+      const currentContract = JSON.parse(run.executionContractJson) as ExecutionContract;
+      if (contract.project.id !== currentContract.project.id
+        || contract.project.repoRoot !== currentContract.project.repoRoot
+        || contract.project.baseRef !== currentContract.project.baseRef) {
+        throw new Error('Contract revision cannot change the run project or base ref');
+      }
+      const currentTasks = this.stateDatabase.listTasks(runId);
+      const proposedById = new Map(contract.tasks.map((task) => [task.id, task]));
+      for (const task of currentTasks) {
+        const proposed = proposedById.get(task.taskId);
+        if (!proposed) throw new Error(`Contract revision cannot remove task ${task.taskId}`);
+        if (task.status === 'approved' && task.specJson !== JSON.stringify(proposed)) {
+          throw new Error(`Contract revision cannot change approved task ${task.taskId}`);
+        }
+      }
+      const blocked = currentTasks.filter((task) => task.status === 'blocked_on_contract').map((task) => task.taskId);
+      if (blocked.length === 0) throw new Error(`Run ${runId} has no blocked_on_contract task`);
+      const affected = new Set(blocked);
+      while (true) {
+        const next = contract.tasks.filter((task) => task.dependsOn.some((dependency) => affected.has(dependency)));
+        const additions = next.filter((task) => !affected.has(task.id));
+        if (additions.length === 0) break;
+        for (const task of additions) affected.add(task.id);
+      }
+      const currentById = new Map(currentTasks.map((task) => [task.taskId, task]));
+      for (const task of contract.tasks) {
+        const current = currentById.get(task.id);
+        if (!current) {
+          if (!task.dependsOn.some((dependency) => affected.has(dependency))) {
+            throw new Error(`New task ${task.id} must depend on a contract-blocked task`);
+          }
+          this.stateDatabase.insertTask(runId, task);
+          affected.add(task.id);
+          continue;
+        }
+        if (!affected.has(task.id) && current.specJson !== JSON.stringify(task)) {
+          throw new Error(`Contract revision can only change blocked tasks or their downstream tasks: ${task.id}`);
+        }
+        if (affected.has(task.id) && current.status !== 'approved') this.stateDatabase.replaceTaskSpec(runId, task);
+      }
+      const revision = this.stateDatabase.appendContractRevision(runId, JSON.stringify(contract));
+      const manifest: RunManifest = {
+        version: 1,
+        title: `External execution run ${runId}`,
+        summary: `Execution contract revision ${revision} for run ${runId}.`,
+        tasks: contract.tasks
+      };
+      this.stateDatabase.updateRun(runId, {
+        status: 'planned', error: null, finishedAt: null, manifestJson: JSON.stringify(manifest)
+      });
+      const runDir = join(this.home.runsDir, runId);
+      writeJson(join(runDir, 'contract.json'), contract);
+      for (const taskId of affected) {
+        const task = proposedById.get(taskId)!;
+        writeTaskMarkdown(join(runDir, 'tasks', `${task.id}.md`), task, run.baseSha);
+      }
+      this.stateDatabase.addEvent(runId, null, 'EXECUTION_CONTRACT_UPDATED', { revision, affectedTaskIds: [...affected].sort() });
+      return { runId, revision, affectedTaskIds: [...affected].sort(), scheduled: this.scheduleRun(runId) };
+    });
+    this.server.register('execution.list', async (params) => {
+      if (params === undefined) return this.stateDatabase.listRuns();
+      const input = objectParams(params, 'execution.list', ['projectId']);
+      const projectId = optionalString(input, 'projectId', 'execution.list');
+      return this.stateDatabase.listRuns().filter((run) => projectId === undefined || run.projectId === projectId);
+    });
     this.server.register('execution.start', async (params) => {
       const input = objectParams(params, 'execution.start', ['runId']);
       const runId = requiredString(input, 'runId', 'execution.start');
@@ -361,6 +478,19 @@ export class AgentTeamDaemon {
         tasks: this.stateDatabase.listTasks(runId),
         agentExecutions: this.stateDatabase.listAgentExecutions(runId)
       };
+    });
+    this.server.register('execution.handoff', async (params) => {
+      const input = objectParams(params, 'execution.handoff', ['runId']);
+      const runId = requiredString(input, 'runId', 'execution.handoff');
+      const path = join(this.home.runsDir, runId, 'handoff.json');
+      try {
+        return JSON.parse(readFileSync(path, 'utf8')) as unknown;
+      } catch (error) {
+        if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') {
+          throw new Error(`Run ${runId} has no handoff; it must complete before handoff is available`);
+        }
+        throw error;
+      }
     });
     this.server.register('execution.events', async (params) => {
       const input = objectParams(params, 'execution.events', ['runId', 'clientId', 'afterEventId', 'limit']);
@@ -466,6 +596,7 @@ export class AgentTeamDaemon {
           onAgentEvent: this.onAgentEvent(runId),
           signal: controller.signal
         });
+        this.writeHandoff(runId);
       })
       .catch((error: unknown) => {
         const latest = this.stateDatabase.getRun(runId);
@@ -558,6 +689,51 @@ export class AgentTeamDaemon {
         // Observability failures must not interrupt the agent execution.
       }
     };
+  }
+
+  private writeHandoff(runId: string): void {
+    const run = this.stateDatabase.getRun(runId);
+    if (run.status !== 'done') return;
+    const tasks = this.stateDatabase.listTasks(runId);
+    const handoff = {
+      version: 1,
+      run: {
+        id: run.id,
+        projectId: run.projectId,
+        projectPolicyRevisionId: run.projectPolicyRevisionId,
+        contractRevision: run.contractRevision,
+        status: run.status,
+        baseRef: run.baseRef,
+        baseSha: run.baseSha,
+        integrationBranch: run.integrationBranch,
+        integrationCommit: run.integrationCommit
+      },
+      tasks: tasks.map((task) => ({
+        id: task.taskId,
+        title: task.title,
+        status: task.status,
+        commitSha: task.commitSha,
+        attempts: task.attempts,
+        review: task.reviewJson === null ? null : JSON.parse(task.reviewJson),
+        lastError: task.lastError
+      })),
+      contract: run.executionContractJson === null ? null : JSON.parse(run.executionContractJson)
+    };
+    const runDir = join(this.home.runsDir, runId);
+    writeJson(join(runDir, 'handoff.json'), handoff);
+    const lines = [
+      `# Run Handoff: ${runId}`,
+      '',
+      `- Status: ${run.status}`,
+      `- Integration branch: ${run.integrationBranch ?? 'none'}`,
+      `- Integration commit: ${run.integrationCommit ?? 'none'}`,
+      `- Contract revision: ${run.contractRevision}`,
+      '',
+      '## Tasks',
+      ...tasks.map((task) => `- ${task.taskId}: ${task.status}${task.commitSha ? ` (${task.commitSha})` : ''}`)
+    ];
+    writeFileSync(join(runDir, 'handoff.md'), `${lines.join('\n')}\n`, 'utf8');
+    this.stateDatabase.addEvent(runId, null, 'RUN_HANDOFF_CREATED', { path: join(runDir, 'handoff.json') });
   }
 
   private closeOwnedResources(): void {

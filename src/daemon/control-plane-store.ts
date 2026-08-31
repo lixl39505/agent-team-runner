@@ -36,6 +36,8 @@ export interface ControllerRecord {
   releasedAt: string | null;
 }
 
+const CONTROLLER_LEASE_DURATION_MS = 30_000;
+
 export interface QueueInteractionInput {
   runId: string;
   taskId?: string | null;
@@ -173,6 +175,8 @@ export class ControlPlaneStore {
         released_at TEXT
       ) STRICT;
     `);
+    this.addColumnIfMissing('external_run_controllers', 'last_heartbeat_at', 'TEXT');
+    this.addColumnIfMissing('external_run_controllers', 'lease_expires_at', 'TEXT');
   }
 
   queueInteraction(input: QueueInteractionInput): InteractionRecord {
@@ -271,6 +275,7 @@ export class ControlPlaneStore {
 
   attachController(input: AttachControllerInput): ControllerRecord {
     const timestamp = now();
+    const leaseExpiresAt = new Date(Date.now() + CONTROLLER_LEASE_DURATION_MS).toISOString();
     if (input.lastAckEventId !== undefined && input.lastAckEventId !== null) {
       assertNonNegativeEventId(input.lastAckEventId, 'lastAckEventId');
     }
@@ -280,24 +285,28 @@ export class ControlPlaneStore {
       UPDATE external_run_controllers
       SET host = ?, external_thread_id = ?, client_id = ?, status = 'connected',
           last_ack_event_id = CASE WHEN ? THEN ? ELSE last_ack_event_id END,
-          claimed_at = ?, released_at = NULL
-      WHERE run_id = ? AND status = 'disconnected'
+          claimed_at = ?, released_at = NULL, last_heartbeat_at = ?, lease_expires_at = ?
+      WHERE run_id = ? AND (status = 'disconnected' OR lease_expires_at < ?)
       RETURNING *
     `).get(
       input.host,
       input.externalThreadId,
       input.clientId,
       hasLastAckEventId ? 1 : 0,
-      lastAckEventId,
-      timestamp,
-      input.runId
+        lastAckEventId,
+        timestamp,
+        timestamp,
+        leaseExpiresAt,
+        input.runId,
+        timestamp
     ) as Record<string, unknown> | undefined;
     if (row) return mapController(row);
 
     row = this.db.prepare(`
       INSERT INTO external_run_controllers (
         run_id, host, external_thread_id, client_id, status, last_ack_event_id, claimed_at, released_at
-      ) VALUES (?, ?, ?, ?, 'connected', ?, ?, NULL)
+        , last_heartbeat_at, lease_expires_at
+      ) VALUES (?, ?, ?, ?, 'connected', ?, ?, NULL, ?, ?)
       ON CONFLICT(run_id) DO NOTHING
       RETURNING *
     `).get(
@@ -305,17 +314,20 @@ export class ControlPlaneStore {
       input.host,
       input.externalThreadId,
       input.clientId,
-      lastAckEventId,
-      timestamp
+        lastAckEventId,
+        timestamp,
+        timestamp,
+        leaseExpiresAt
     ) as Record<string, unknown> | undefined;
     if (row) return mapController(row);
 
     row = this.db.prepare(`
       UPDATE external_run_controllers
-      SET last_ack_event_id = CASE WHEN ? THEN ? ELSE last_ack_event_id END
+      SET last_ack_event_id = CASE WHEN ? THEN ? ELSE last_ack_event_id END,
+          last_heartbeat_at = ?, lease_expires_at = ?
       WHERE run_id = ? AND status = 'connected' AND client_id = ?
       RETURNING *
-    `).get(hasLastAckEventId ? 1 : 0, lastAckEventId, input.runId, input.clientId) as Record<string, unknown> | undefined;
+    `).get(hasLastAckEventId ? 1 : 0, lastAckEventId, timestamp, leaseExpiresAt, input.runId, input.clientId) as Record<string, unknown> | undefined;
     if (row) return mapController(row);
     throw new Error(`Run controller is owned by another client: ${input.runId}`);
   }
@@ -330,10 +342,17 @@ export class ControlPlaneStore {
     assertNonNegativeEventId(lastAckEventId, 'lastAckEventId');
     const row = this.db.prepare(`
       UPDATE external_run_controllers
-      SET last_ack_event_id = ?
-      WHERE run_id = ? AND status = 'connected' AND client_id = ?
+      SET last_ack_event_id = ?, last_heartbeat_at = ?, lease_expires_at = ?
+      WHERE run_id = ? AND status = 'connected' AND client_id = ? AND lease_expires_at >= ?
       RETURNING *
-    `).get(lastAckEventId, runId, clientId) as Record<string, unknown> | undefined;
+    `).get(
+      lastAckEventId,
+      now(),
+      new Date(Date.now() + CONTROLLER_LEASE_DURATION_MS).toISOString(),
+      runId,
+      clientId,
+      now()
+    ) as Record<string, unknown> | undefined;
     if (row) return mapController(row);
 
     const existing = this.findController(runId);
@@ -356,6 +375,32 @@ export class ControlPlaneStore {
     throw new Error(`Run controller is not owned by client: ${clientId}`);
   }
 
+  heartbeatController(runId: string, clientId: string): ControllerRecord {
+    const timestamp = now();
+    const row = this.db.prepare(`
+      UPDATE external_run_controllers
+      SET last_heartbeat_at = ?, lease_expires_at = ?
+      WHERE run_id = ? AND status = 'connected' AND client_id = ? AND lease_expires_at >= ?
+      RETURNING *
+    `).get(
+      timestamp,
+      new Date(Date.now() + CONTROLLER_LEASE_DURATION_MS).toISOString(),
+      runId,
+      clientId,
+      timestamp
+    ) as Record<string, unknown> | undefined;
+    if (row) return mapController(row);
+    throw new Error(`Run controller is not owned by client: ${clientId}`);
+  }
+
+  assertControllerOwnership(runId: string, clientId: string): void {
+    const row = this.db.prepare(`
+      SELECT 1 FROM external_run_controllers
+      WHERE run_id = ? AND status = 'connected' AND client_id = ? AND lease_expires_at >= ?
+    `).get(runId, clientId, now());
+    if (!row) throw new Error(`Run controller is not owned by client: ${clientId}`);
+  }
+
   listReconnectableRuns(): ControllerRecord[] {
     return (this.db.prepare(`
       SELECT * FROM external_run_controllers
@@ -374,5 +419,10 @@ export class ControlPlaneStore {
 
   private findController(runId: string): Record<string, unknown> | undefined {
     return this.db.prepare('SELECT * FROM external_run_controllers WHERE run_id = ?').get(runId) as Record<string, unknown> | undefined;
+  }
+
+  private addColumnIfMissing(table: string, column: string, definition: string): void {
+    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (!columns.some((entry) => entry.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 }

@@ -44,6 +44,8 @@ test('Codex covers probe, platform, and rejected-turn fallbacks', async () => {
   defaultChild.emit('close', 0);
   assert.equal((await defaultDiscovery).installed, true);
 
+  assert.equal(typeof (await new CodexBackend().discover()).installed, 'boolean');
+
   const blocked = new CodexBackend();
   blocked.checkPlatform = async () => ({ ok: false, degraded: false, detail: 'blocked' });
   await assert.rejects(blocked.openSession(spec()), /blocked/);
@@ -69,6 +71,21 @@ test('Codex covers probe, platform, and rejected-turn fallbacks', async () => {
     return 'accept';
   } });
   assert.deepEqual(await missingCommand.handleServerRequest('item/commandExecution/requestApproval', { threadId: 'thread' }), { decision: 'accept' });
+});
+
+test('Codex restarts when initialized connections are missing or exited', async () => {
+  const backend = new CodexBackend();
+  backend.initialized = false;
+  backend.initPromise = Promise.resolve();
+  await backend.ensureServer();
+  backend.initialized = true;
+  backend.connection = null;
+  backend.initPromise = Promise.resolve();
+  await backend.ensureServer();
+  backend.connection = { exited: true };
+  await backend.ensureServer();
+  backend.connection = { exited: false };
+  await backend.ensureServer();
 });
 
 test('Codex covers optional approval and input fields', async () => {

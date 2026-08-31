@@ -21,3 +21,14 @@ test('database preserves null optional agent execution fields', () => {
     db.close();
   }
 });
+
+test('database refuses contract revisions for legacy runs', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'agent-team-db-contract-'));
+  const db = new StateDatabase(join(directory, 'state.sqlite'));
+  try {
+    db.createRun({ id: 'legacy', repoRoot: directory, goalFile: 'goal.md', baseRef: 'HEAD', baseSha: 'base', adapter: 'cli' });
+    assert.throws(() => db.appendContractRevision('legacy', '{}'), /has no execution contract/);
+  } finally {
+    db.close();
+  }
+});

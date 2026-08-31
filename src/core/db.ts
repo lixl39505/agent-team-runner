@@ -27,6 +27,7 @@ function mapRun(row: Record<string, unknown>): RunRecord {
       ? null : String(row.project_policy_revision_id),
     executionContractJson: row.execution_contract_json === null || row.execution_contract_json === undefined
       ? null : String(row.execution_contract_json),
+    contractRevision: Number(row.contract_revision),
     adapter: String(row.adapter),
     status: String(row.status) as RunStatus,
     manifestJson: row.manifest_json === null ? null : String(row.manifest_json),
@@ -111,6 +112,7 @@ export class StateDatabase {
         project_id TEXT,
         project_policy_revision_id TEXT,
         execution_contract_json TEXT,
+        contract_revision INTEGER NOT NULL DEFAULT 0,
         adapter TEXT NOT NULL,
         status TEXT NOT NULL,
         manifest_json TEXT,
@@ -173,6 +175,15 @@ export class StateDatabase {
         FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
       ) STRICT;
 
+      CREATE TABLE IF NOT EXISTS execution_contract_revisions (
+        run_id TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        contract_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (run_id, revision),
+        FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+      ) STRICT;
+
       CREATE INDEX IF NOT EXISTS idx_tasks_run_status ON tasks(run_id, status);
       CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, id);
       CREATE INDEX IF NOT EXISTS idx_agent_executions_run ON agent_executions(run_id, started_at);
@@ -181,6 +192,7 @@ export class StateDatabase {
     this.addColumnIfMissing('runs', 'project_id', 'TEXT');
     this.addColumnIfMissing('runs', 'project_policy_revision_id', 'TEXT');
     this.addColumnIfMissing('runs', 'execution_contract_json', 'TEXT');
+    this.addColumnIfMissing('runs', 'contract_revision', 'INTEGER NOT NULL DEFAULT 0');
   }
 
   private addColumnIfMissing(table: string, column: string, type: string): void {
@@ -205,9 +217,9 @@ export class StateDatabase {
     this.db.prepare(`
       INSERT INTO runs (
         id, repo_root, goal_file, base_ref, base_sha, project_id, project_policy_revision_id,
-        execution_contract_json, adapter, status,
+        execution_contract_json, contract_revision, adapter, status,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'planning', ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planning', ?, ?)
     `).run(
       input.id,
       input.repoRoot,
@@ -216,11 +228,18 @@ export class StateDatabase {
       input.baseSha,
       input.projectId ?? null,
       input.projectPolicyRevisionId ?? null,
-      input.executionContractJson ?? null,
-      input.adapter,
+        input.executionContractJson ?? null,
+        input.executionContractJson === undefined || input.executionContractJson === null ? 0 : 1,
+        input.adapter,
       timestamp,
       timestamp
     );
+    if (input.executionContractJson !== undefined && input.executionContractJson !== null) {
+      this.db.prepare(`
+        INSERT INTO execution_contract_revisions (run_id, revision, contract_json, created_at)
+        VALUES (?, 1, ?, ?)
+      `).run(input.id, input.executionContractJson, timestamp);
+    }
     this.addEvent(input.id, null, 'RUN_CREATED', input);
   }
 
@@ -234,6 +253,37 @@ export class StateDatabase {
 
   listRuns(): RunRecord[] {
     return (this.db.prepare('SELECT * FROM runs ORDER BY created_at DESC').all() as Record<string, unknown>[]).map(mapRun);
+  }
+
+  listContractRevisions(runId: string): Array<{ revision: number; contractJson: string; createdAt: string }> {
+    return (this.db.prepare(`
+      SELECT revision, contract_json, created_at
+      FROM execution_contract_revisions WHERE run_id = ? ORDER BY revision
+    `).all(runId) as Record<string, unknown>[]).map((row) => ({
+      revision: Number(row.revision), contractJson: String(row.contract_json), createdAt: String(row.created_at)
+    }));
+  }
+
+  appendContractRevision(runId: string, contractJson: string): number {
+    const run = this.getRun(runId);
+    if (run.executionContractJson === null) throw new Error(`Run ${runId} has no execution contract`);
+    const revision = run.contractRevision + 1;
+    const timestamp = now();
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      this.db.prepare(`
+        INSERT INTO execution_contract_revisions (run_id, revision, contract_json, created_at)
+        VALUES (?, ?, ?, ?)
+      `).run(runId, revision, contractJson, timestamp);
+      this.db.prepare(`
+        UPDATE runs SET execution_contract_json = ?, contract_revision = ?, updated_at = ? WHERE id = ?
+      `).run(contractJson, revision, timestamp, runId);
+      this.db.exec('COMMIT;');
+    } catch (error) {
+      this.db.exec('ROLLBACK;');
+      throw error;
+    }
+    return revision;
   }
 
   updateRun(id: string, patch: Partial<{
@@ -273,6 +323,17 @@ export class StateDatabase {
       ) VALUES (?, ?, ?, ?, 'pending', ?, ?)
     `).run(runId, spec.id, spec.title, JSON.stringify(spec), timestamp, timestamp);
     this.addEvent(runId, spec.id, 'TASK_CREATED', spec);
+  }
+
+  replaceTaskSpec(runId: string, spec: TaskSpec): void {
+    const timestamp = now();
+    this.db.prepare(`
+      UPDATE tasks
+      SET title = ?, spec_json = ?, status = 'pending', phase = NULL, branch = NULL, worktree = NULL,
+          start_sha = NULL, commit_sha = NULL, attempts = 0, review_cycles = 0, last_error = NULL,
+          review_json = NULL, finished_at = NULL, updated_at = ?
+      WHERE run_id = ? AND task_id = ?
+    `).run(spec.title, JSON.stringify(spec), timestamp, runId, spec.id);
   }
 
   getTask(runId: string, taskId: string): TaskRecord {

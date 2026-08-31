@@ -104,6 +104,11 @@ export function createMcpServer(ipc: IpcRequester): McpServer {
     inputSchema: z.object({ runId: nonEmptyString, clientId: nonEmptyString }).strict()
   }, (input) => requestTool(ipc, 'controller.disconnect', input));
 
+  server.registerTool('agent_team_heartbeat_controller', {
+    description: 'Renew the temporary ownership lease for an attached run controller.',
+    inputSchema: z.object({ runId: nonEmptyString, clientId: nonEmptyString }).strict()
+  }, (input) => requestTool(ipc, 'controller.heartbeat', input));
+
   server.registerTool('agent_team_list_reconnectable_runs', {
     description: 'List runs whose controllers can reconnect.',
     inputSchema: emptyInput
@@ -127,6 +132,25 @@ export function createMcpServer(ipc: IpcRequester): McpServer {
     }).strict()
   }, (input) => requestTool(ipc, 'execution.submit', input));
 
+  server.registerTool('agent_team_validate_execution_contract', {
+    description: 'Validate an execution contract against the registered project policy without creating a run.',
+    inputSchema: z.object({ contract: jsonValue }).strict()
+  }, (input) => requestTool(ipc, 'execution.validate', input));
+
+  server.registerTool('agent_team_list_runs', {
+    description: 'List daemon runs, optionally limited to one project.',
+    inputSchema: z.object({ projectId: nonEmptyString.optional() }).strict()
+  }, (input) => requestTool(
+    ipc,
+    'execution.list',
+    input.projectId === undefined ? undefined : { projectId: input.projectId }
+  ));
+
+  server.registerTool('agent_team_update_task_contract', {
+    description: 'Apply a revised execution contract to a run blocked on contract scope or requirements.',
+    inputSchema: z.object({ runId: nonEmptyString, contract: jsonValue }).strict()
+  }, (input) => requestTool(ipc, 'execution.update_contract', input));
+
   server.registerTool('agent_team_start_run', {
     description: 'Start or resume an execution run.',
     inputSchema: z.object({ runId: nonEmptyString }).strict()
@@ -141,6 +165,11 @@ export function createMcpServer(ipc: IpcRequester): McpServer {
     description: 'Get a run, its tasks, and its agent executions.',
     inputSchema: z.object({ runId: nonEmptyString }).strict()
   }, (input) => requestTool(ipc, 'execution.get', input));
+
+  server.registerTool('agent_team_get_handoff', {
+    description: 'Get the durable handoff for a completed execution run.',
+    inputSchema: z.object({ runId: nonEmptyString }).strict()
+  }, (input) => requestTool(ipc, 'execution.handoff', input));
 
   server.registerTool('agent_team_read_run_events', {
     description: 'Read durable run events after a controller cursor and acknowledge that cursor.',

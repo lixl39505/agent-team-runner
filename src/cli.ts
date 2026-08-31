@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { initConfig } from './core/config.js';
-import { ensureGitignore, syncSkills } from './core/files.js';
+import { syncSkills } from './core/files.js';
 import { ensureGitRepo } from './core/git.js';
 import { isBackendId, isValidAgentName } from './core/agent-config.js';
 import { createCredentialStore } from './core/credentials.js';
@@ -36,10 +35,7 @@ async function main(): Promise<void> {
   if (command === 'init') {
     const repoRoot = resolve(argv.shift() ?? process.cwd());
     await ensureGitRepo(repoRoot);
-    const configFile = initConfig(repoRoot);
-    ensureGitignore(repoRoot);
     const skills = syncSkills(repoRoot);
-    console.log(`Initialized: ${configFile}`);
     console.log(`Synced ${skills.length} host skill files.`);
     return;
   }
@@ -131,7 +127,7 @@ function printHelp(): void {
   console.log(`agent-team-runner
 
 Commands:
-  init [repo]                         Initialize config and sync role skills
+  init [repo]                         Sync host skills without modifying repository config
   start [--home PATH]                 Start the local daemon
   mcp [--home PATH]                   Run the MCP server
   attach <run-id> [--home PATH]       Attach an interactive daemon run dashboard

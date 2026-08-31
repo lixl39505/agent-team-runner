@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig } from '../src/core/config.ts';
+import { validateAgents } from '../src/core/agent-config.ts';
 
 test('loadConfig requires an explicit v3 version', () => {
   const repo = mkdtempSync(join(tmpdir(), 'agent-team-config-version-'));
@@ -14,4 +15,13 @@ test('loadConfig requires an explicit v3 version', () => {
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }
+});
+
+test('validateAgents ignores unassigned roles', () => {
+  const result = validateAgents({
+    defaultAgent: 'worker',
+    agents: { worker: { backend: 'claude' } },
+    roles: { worker: '' }
+  });
+  assert.equal(result.ok, true);
 });

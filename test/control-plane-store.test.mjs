@@ -284,3 +284,28 @@ test('acknowledges controller cursors only for the connected owner', () => {
     assert.equal(reconnected.lastAckEventId, 9);
   });
 });
+
+test('reclaims expired controller leases and rejects expired ownership operations', () => {
+  withStore((store) => {
+    store.attachController({ runId: 'run-lease', host: 'host-a', externalThreadId: 'thread-a', clientId: 'client-a' });
+    store.db.prepare('UPDATE external_run_controllers SET lease_expires_at = ? WHERE run_id = ?')
+      .run('2000-01-01T00:00:00.000Z', 'run-lease');
+
+    assert.throws(() => store.heartbeatController('run-lease', 'client-a'), /not owned/);
+    assert.throws(() => store.acknowledgeController('run-lease', 'client-a', 1), /not owned/);
+    assert.throws(() => store.assertControllerOwnership('run-lease', 'client-a'), /not owned/);
+
+    const reclaimed = store.attachController({
+      runId: 'run-lease', host: 'host-b', externalThreadId: 'thread-b', clientId: 'client-b', lastAckEventId: 2
+    });
+    assert.equal(reclaimed.clientId, 'client-b');
+    assert.equal(reclaimed.host, 'host-b');
+    assert.equal(reclaimed.lastAckEventId, 2);
+    store.assertControllerOwnership('run-lease', 'client-b');
+    assert.equal(store.heartbeatController('run-lease', 'client-b').status, 'connected');
+
+    store.db.prepare('UPDATE external_run_controllers SET lease_expires_at = ? WHERE run_id = ?')
+      .run('2000-01-01T00:00:00.000Z', 'run-lease');
+    assert.throws(() => store.assertControllerOwnership('run-lease', 'client-b'), /not owned/);
+  });
+});
