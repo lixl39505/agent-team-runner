@@ -10,6 +10,7 @@ export default defineConfig({
     coverage: {
       provider: 'istanbul',
       reporter: ['text', 'lcov'],
+      all: true,
       include: ['src/**/*.ts'],
       exclude: ['src/agent/codex/protocol/**'],
       thresholds: {

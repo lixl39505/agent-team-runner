@@ -63,7 +63,9 @@ const mockSources = {
       { backend: 'opencode', ok: false }
     ];
   `,
-  './agent/approval.js': `export class TerminalApprovalBroker { request() {}; requestUserInput() {}; close() {} }`
+  './agent/approval.js': `export class TerminalApprovalBroker { request() {}; requestUserInput() {}; close() {} }`,
+  './daemon-cli.js': `export const runDaemonCli = async () => {};`,
+  './mcp-cli.js': `export const runMcpCli = async () => {};`
 };
 
 export async function resolve(specifier, context, nextResolve) {

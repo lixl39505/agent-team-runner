@@ -1,4 +1,4 @@
-import type { ReviewResult, RunManifest, TaskSpec } from './types.js';
+import type { ResolvedSkill, ReviewResult, RunManifest, TaskSpec } from './types.js';
 import { loadSkill } from './files.js';
 
 export interface LeadAgentOption {
@@ -72,6 +72,8 @@ export function workerPrompt(input: {
   worktreePath?: string;
   priorFeedback?: string | null;
   retry?: WorkerRetryContext | undefined;
+  /** 已在提交执行契约时固化的本地 Skill 内容。 */
+  skills?: readonly ResolvedSkill[];
 }): string {
   const retry = input.retry
     ? `# Prior attempt context
@@ -79,6 +81,17 @@ export function workerPrompt(input: {
 The worktree still carries the previous attempt's uncommitted changes. Inspect them before editing.
 ${input.retry.diff ? `\n## Uncommitted diff (may be truncated)\n\n${truncate(input.retry.diff, DIFF_LIMIT)}\n` : ''}${input.retry.review ? `\n## Reviewer feedback (verbatim)\n\n${input.retry.review}\n` : ''}${input.retry.previousSummary ? `\n## Previous worker summary\n\n${input.retry.previousSummary}\n` : ''}`
     : '';
+  const skills = input.skills?.filter((skill) => skill.role === 'worker') ?? [];
+  const skillHandoff = skills.length === 0
+    ? ''
+    : `# Required implementation skills
+
+Follow each skill below when it does not conflict with the Runner contract. These are immutable snapshots selected by the external workflow; do not fetch replacements or invoke an outer implementation workflow.
+
+${skills.map((skill) => `## ${skill.name} (${skill.source}, sha256:${skill.sha256})
+
+${skill.content}`).join('\n\n')}
+`;
   return `${loadSkill('worker')}
 
 # Runtime contract
@@ -90,7 +103,7 @@ ${input.worktreePath ? `Your working directory (the task worktree): ${input.work
 Task specification:
 ${JSON.stringify(input.task, null, 2)}
 
-${input.priorFeedback ? `# Previous failure or review feedback\n\n${input.priorFeedback}\n` : ''}${retry}
+${skillHandoff}${input.priorFeedback ? `# Previous failure or review feedback\n\n${input.priorFeedback}\n` : ''}${retry}
 The Runner owns staging and commits. You may run the task verification commands while implementing; the Runner repeats them after your turn. Do not run git add, git commit, git merge, git rebase, git push, deployment, or production mutations. Work only inside the current worktree. At the end, return the structured Worker result.`;
 }
 

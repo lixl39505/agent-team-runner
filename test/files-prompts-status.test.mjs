@@ -166,6 +166,19 @@ test('workerPrompt renders optional worktree, feedback, and complete retry conte
   assert.equal(withoutOptionals.includes('Uncommitted diff'), false);
   assert.equal(workerPrompt({ task, startSha: 'start', runId: 'run-3' }).includes('Prior attempt context'), false);
   assert.match(workerPrompt({ task, startSha: 'start', runId: 'run-4', retry: { diff: 'small diff' } }), /small diff/);
+  const withSkill = workerPrompt({
+    task,
+    startSha: 'start',
+    runId: 'run-5',
+    skills: [
+      { name: 'tdd', role: 'worker', source: 'project', path: '/tmp/tdd/SKILL.md', sha256: 'abc', content: 'Write a failing test first.' },
+      { name: 'review', role: 'reviewer', source: 'project', path: '/tmp/review/SKILL.md', sha256: 'def', content: 'Do not show this to the worker.' }
+    ]
+  });
+  assert.match(withSkill, /# Required implementation skills/);
+  assert.match(withSkill, /tdd \(project, sha256:abc\)/);
+  assert.match(withSkill, /Write a failing test first/);
+  assert.equal(withSkill.includes('Do not show this to the worker.'), false);
 });
 
 test('reviewerPrompt and integrationPrompt render their conditional contexts', () => {

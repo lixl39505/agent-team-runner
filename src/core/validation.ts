@@ -1,4 +1,4 @@
-import type { IntegrationResult, LeadResult, ReviewResult, TaskSpec, WorkerResult } from './types.js';
+import type { ExecutionContract, IntegrationResult, LeadResult, ReviewResult, SkillRequirement, TaskSpec, WorkerResult } from './types.js';
 
 function assertObject(value: unknown, label: string): asserts value is Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -30,7 +30,7 @@ export function validateLeadResult(value: unknown, validAgentNames?: string[]): 
   return { version: 1, title: value.title, summary: value.summary, tasks };
 }
 
-function validateTaskSpec(value: unknown, index: number, validAgentNames?: string[]): TaskSpec {
+export function validateTaskSpec(value: unknown, index: number, validAgentNames?: string[]): TaskSpec {
   assertObject(value, `Task ${index}`);
   const id = String(value.id ?? '');
   if (!/^[A-Z][A-Z0-9_-]{1,31}$/.test(id)) {
@@ -71,10 +71,89 @@ function validateTaskSpec(value: unknown, index: number, validAgentNames?: strin
     acceptance: stringArray(value.acceptance, `${id}.acceptance`),
     verificationCommands: stringArray(value.verificationCommands ?? [], `${id}.verificationCommands`)
   };
+  if (value.externalId !== undefined) {
+    if (typeof value.externalId !== 'string' || value.externalId.length === 0) {
+      throw new Error(`Task ${id} has invalid externalId`);
+    }
+    result.externalId = value.externalId;
+  }
+  if (value.implementationGuidance !== undefined) {
+    result.implementationGuidance = stringArray(value.implementationGuidance, `${id}.implementationGuidance`);
+  }
+  if (value.implementationSkills !== undefined) {
+    if (!Array.isArray(value.implementationSkills)) throw new Error(`Task ${id}.implementationSkills must be an array`);
+    result.implementationSkills = value.implementationSkills.map((skill, skillIndex) => validateSkillRequirement(skill, id, skillIndex));
+  }
   if (typeof value.role === 'string') result.role = value.role;
   if (typeof agent === 'string' && agent) result.agent = agent;
   if (typeof value.allowNoChanges === 'boolean') result.allowNoChanges = value.allowNoChanges;
   return result;
+}
+
+function validateSkillRequirement(value: unknown, taskId: string, index: number): SkillRequirement {
+  assertObject(value, `Task ${taskId}.implementationSkills[${index}]`);
+  const name = String(value.name ?? '');
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/i.test(name)) {
+    throw new Error(`Task ${taskId} has invalid implementation skill name: ${name}`);
+  }
+  const role = String(value.role ?? 'worker');
+  if (!['worker', 'reviewer', 'integrator'].includes(role)) {
+    throw new Error(`Task ${taskId} has invalid implementation skill role: ${role}`);
+  }
+  if (typeof value.required !== 'boolean') {
+    throw new Error(`Task ${taskId} implementation skill ${name} requires boolean required`);
+  }
+  const source = String(value.source ?? 'project');
+  if (!['project', 'user'].includes(source)) {
+    throw new Error(`Task ${taskId} has invalid implementation skill source: ${source}`);
+  }
+  return { name, role: role as SkillRequirement['role'], required: value.required, source: source as SkillRequirement['source'] };
+}
+
+/** 验证外层 SDD 提交的执行契约，不调用 Lead，也不解释来源系统。 */
+export function validateExecutionContract(value: unknown, validAgentNames?: string[]): ExecutionContract {
+  assertObject(value, 'Execution contract');
+  if (Number(value.version) !== 1) throw new Error('Execution contract version must be 1');
+  assertObject(value.project, 'Execution contract project');
+  const projectId = String(value.project.id ?? '');
+  const repoRoot = String(value.project.repoRoot ?? '');
+  const baseRef = String(value.project.baseRef ?? '');
+  if (!projectId || !repoRoot || !baseRef) throw new Error('Execution contract project requires id, repoRoot, and baseRef');
+  assertObject(value.target, 'Execution contract target');
+  const integrationBranch = value.target.integrationBranch;
+  if (integrationBranch !== undefined && (typeof integrationBranch !== 'string' || integrationBranch.length === 0)) {
+    throw new Error('Execution contract target.integrationBranch must be a non-empty string');
+  }
+  if (!Array.isArray(value.tasks) || value.tasks.length === 0) {
+    throw new Error('Execution contract must contain at least one task');
+  }
+  const tasks = value.tasks.map((task, index) => validateTaskSpec(task, index, validAgentNames));
+  validateTaskGraph(tasks);
+  validateParallelPathOwnership(tasks);
+  const provenance = validateProvenance(value.provenance);
+  return {
+    version: 1,
+    project: { id: projectId, repoRoot, baseRef },
+    target: integrationBranch === undefined ? {} : { integrationBranch },
+    ...(provenance ? { provenance } : {}),
+    tasks
+  };
+}
+
+function validateProvenance(value: unknown): ExecutionContract['provenance'] | undefined {
+  if (value === undefined) return undefined;
+  assertObject(value, 'Execution contract provenance');
+  if (!Array.isArray(value.documents)) throw new Error('Execution contract provenance.documents must be an array');
+  return {
+    documents: value.documents.map((document, index) => {
+      assertObject(document, `Execution contract provenance.documents[${index}]`);
+      const kind = String(document.kind ?? '');
+      const locator = String(document.locator ?? '');
+      const revision = String(document.revision ?? '');
+      if (!kind || !locator || !revision) throw new Error(`Execution contract provenance.documents[${index}] requires kind, locator, and revision`);
+      return { kind, locator, revision };
+    })
+  };
 }
 
 export function validateTaskGraph(tasks: TaskSpec[]): void {

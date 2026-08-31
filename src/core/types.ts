@@ -22,6 +22,7 @@ export type TaskStatus =
   | 'changes_requested'
   | 'approved'
   | 'blocked'
+  | 'blocked_on_contract'
   | 'failed';
 
 /** 后端传输层接线：如何找到/启动对应的 Code Agent 运行时 */
@@ -110,6 +111,8 @@ export interface RunnerConfig {
 
 export interface TaskSpec {
   id: string;
+  /** 外层 SDD 的不透明任务标识，仅用于交接与追溯。 */
+  externalId?: string;
   title: string;
   description: string;
   role?: string;
@@ -120,7 +123,50 @@ export interface TaskSpec {
   blockedPaths: string[];
   acceptance: string[];
   verificationCommands: string[];
+  /** 外层选择的本地 Skill；Runner 在提交 run 时解析并固化内容。 */
+  implementationSkills?: SkillRequirement[];
+  /** 不依赖 Skill 的实施方法约束，例如测试先行。 */
+  implementationGuidance?: string[];
   allowNoChanges?: boolean;
+}
+
+export interface SkillRequirement {
+  name: string;
+  role: 'worker' | 'reviewer' | 'integrator';
+  required: boolean;
+  source: 'project' | 'user';
+}
+
+export interface ResolvedSkill {
+  name: string;
+  role: SkillRequirement['role'];
+  source: SkillRequirement['source'];
+  path: string;
+  sha256: string;
+  content: string;
+}
+
+export interface ExecutionProvenanceDocument {
+  kind: string;
+  locator: string;
+  revision: string;
+}
+
+/** 外层 SDD 交给执行层的完整、可验证 DAG。 */
+export interface ExecutionContract {
+  version: 1;
+  project: {
+    id: string;
+    repoRoot: string;
+    baseRef: string;
+  };
+  target: {
+    integrationBranch?: string;
+  };
+  provenance?: {
+    documents: ExecutionProvenanceDocument[];
+  };
+  tasks: TaskSpec[];
 }
 
 /** A concrete Lead/Worker/Reviewer/Integrator invocation within a run. */

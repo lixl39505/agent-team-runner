@@ -21,6 +21,8 @@ import { TerminalApprovalBroker } from './agent/approval.js';
 import { createCredentialStore } from './core/credentials.js';
 import { promptMaskedSecret } from './core/terminal-input.js';
 import { LiveRunUi } from './core/live-ui.js';
+import { runDaemonCli } from './daemon-cli.js';
+import { runMcpCli } from './mcp-cli.js';
 
 let argv: string[] = [];
 let command: string | undefined;
@@ -398,15 +400,30 @@ export async function runCli(args: string[] = process.argv.slice(2)): Promise<vo
   argv = [...args];
   command = argv.shift();
   rawConfigOverrides = [];
-  while (true) {
-    const index = argv.indexOf('-c');
-    if (index < 0) break;
-    const value = argv[index + 1];
-    if (!value || value.startsWith('--')) throw new Error('-c requires a value like roles.lead=codex.terra');
-    argv.splice(index, 2);
-    rawConfigOverrides.push(value);
+  try {
+    if (command === 'start' || command === 'mcp') {
+      const controlPlaneCommand = command;
+      const controlPlaneArgs = argv;
+      argv = [];
+      command = undefined;
+      if (controlPlaneCommand === 'start') await runDaemonCli(controlPlaneArgs);
+      else await runMcpCli(controlPlaneArgs);
+      return;
+    }
+    while (true) {
+      const index = argv.indexOf('-c');
+      if (index < 0) break;
+      const value = argv[index + 1];
+      if (!value || value.startsWith('--')) throw new Error('-c requires a value like roles.lead=codex.terra');
+      argv.splice(index, 2);
+      rawConfigOverrides.push(value);
+    }
+    await main();
+  } finally {
+    argv = [];
+    command = undefined;
+    rawConfigOverrides = [];
   }
-  await main();
 }
 
 function printHelp(): void {
@@ -414,6 +431,8 @@ function printHelp(): void {
 
 Commands:
   init [repo]                         Initialize config and sync role skills
+  start [--home PATH]                 Start the local daemon
+  mcp [--home PATH]                   Run the MCP server
   doctor [--repo PATH]               Check repository and agent backends
   skills sync [--repo PATH]          Mirror portable skills for Codex/OpenCode/Claude
   auth set --backend ID --profile N  Save an API key in the macOS Keychain
