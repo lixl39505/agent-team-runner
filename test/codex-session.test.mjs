@@ -53,25 +53,33 @@ test('Codex session maps notifications to events and a structured turn result', 
 });
 
 test('Codex resumes a thread before starting its continuation turn', async () => {
-  const value = await open({ resumeSessionId: 'saved-thread' });
+  const value = await open({ resumeSessionId: 'saved-thread', model: 'gpt-test' });
   assert.equal(value.session.sessionId, 'resumed-thread');
   assert.deepEqual(value.requests.slice(0, 2), [
     {
       method: 'thread/resume',
       params: {
-        threadId: 'saved-thread', cwd: '/workspace', approvalPolicy: 'untrusted', sandbox: 'workspace-write'
+        threadId: 'saved-thread', cwd: '/workspace', model: 'gpt-test', approvalPolicy: 'untrusted', sandbox: 'workspace-write'
       }
     },
     {
       method: 'turn/start',
       params: {
         threadId: 'resumed-thread', input: [{ type: 'text', text: 'Return JSON', text_elements: [] }],
-        cwd: '/workspace', approvalPolicy: 'untrusted',
+        cwd: '/workspace', model: 'gpt-test', approvalPolicy: 'untrusted',
         sandboxPolicy: { type: 'workspaceWrite', writableRoots: ['/workspace'], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true },
         outputSchema: { type: 'object' }
       }
     }
   ]);
+});
+
+test('Codex sends resumed read-only sessions without an optional model', async () => {
+  const value = await open({ resumeSessionId: 'saved-thread', access: 'read-only' });
+  assert.deepEqual(value.requests[0], {
+    method: 'thread/resume',
+    params: { threadId: 'saved-thread', cwd: '/workspace', approvalPolicy: 'untrusted', sandbox: 'read-only' }
+  });
 });
 
 test('Codex sessions return parse and failed-turn errors and settle on close', async () => {

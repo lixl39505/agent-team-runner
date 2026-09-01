@@ -1,11 +1,10 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   ensureDir,
-  ensureGitignore,
   loadSkill,
   readJson,
   readText,
@@ -95,21 +94,6 @@ test('writeTaskMarkdown renders populated and empty task lists', () => {
     assert.match(emptyText, /- 依赖任务: 无/);
     assert.match(emptyText, /- Agent: 继承 worker 角色配置/);
     assert.equal((emptyText.match(/- 无/g) ?? []).length, 4);
-  });
-});
-
-test('ensureGitignore creates, appends without a newline, and remains idempotent', () => {
-  withTempDir((directory) => {
-    const gitignore = join(directory, '.gitignore');
-    ensureGitignore(directory);
-    const markers = ['.agent-team/state.sqlite', '.agent-team/state.sqlite-*', '.agent-team/runs/'];
-    assert.deepEqual(readText(gitignore).trim().split('\n'), markers);
-
-    writeFileSync(gitignore, `.agent-team/state.sqlite\ncustom-entry`, 'utf8');
-    ensureGitignore(directory);
-    assert.equal(readText(gitignore), '.agent-team/state.sqlite\ncustom-entry\n.agent-team/state.sqlite-*\n.agent-team/runs/\n');
-    ensureGitignore(directory);
-    assert.equal(readText(gitignore).match(/\.agent-team\/state\.sqlite/g).length, 2);
   });
 });
 

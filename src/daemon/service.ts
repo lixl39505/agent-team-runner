@@ -24,6 +24,7 @@ import type { ApprovalDecision, ApprovalHandler, UserInputAnswers, UserInputHand
 import { ControlPlaneStore, type JsonValue } from './control-plane-store.js';
 import { DaemonInstanceLock, type DaemonMetadata } from './instance-lock.js';
 import { LocalIpcClient, LocalIpcServer } from './ipc.js';
+import { HostAdapter, type HostAction } from '../host/adapter.js';
 
 type RunExecutor = (input: Pick<Parameters<typeof runOrchestrator>[0],
   'config' | 'db' | 'runId' | 'requestApproval' | 'requestUserInput' | 'reportContractBlock' | 'onAgentEvent' | 'signal'
@@ -49,6 +50,8 @@ export interface AgentTeamDaemonOptions {
   controlPlaneStore?: ControlPlaneStore;
   projectRegistry?: ProjectRegistry;
   stateDatabase?: StateDatabase;
+  /** Optional, explicitly declared bridge to a Host-owned thread or review API. */
+  hostAdapter?: HostAdapter;
   /** Test seam; the default dispatches the run to the core orchestrator. */
   runExecutor?: RunExecutor;
 }
@@ -84,6 +87,12 @@ function optionalString(params: Record<string, unknown>, field: string, method: 
 function optionalBoolean(params: Record<string, unknown>, field: string, method: string): boolean | undefined {
   const value = params[field];
   if (value === undefined) return undefined;
+  if (typeof value !== 'boolean') throw new Error(`${method} params.${field} must be a boolean`);
+  return value;
+}
+
+function requiredBoolean(params: Record<string, unknown>, field: string, method: string): boolean {
+  const value = params[field];
   if (typeof value !== 'boolean') throw new Error(`${method} params.${field} must be a boolean`);
   return value;
 }
@@ -266,6 +275,7 @@ export class AgentTeamDaemon {
   private readonly stateDatabase: StateDatabase;
   private readonly ownsStateDatabase: boolean;
   private readonly runExecutor: RunExecutor;
+  private readonly hostAdapter: HostAdapter;
   private readonly activeRuns = new Map<string, ActiveRun>();
   private readonly waitingRuns = new Set<string>();
   private readonly daemonEpoch = randomUUID();
@@ -291,6 +301,7 @@ export class AgentTeamDaemon {
     this.ownsStateDatabase = options.stateDatabase === undefined;
     this.stateDatabase = options.stateDatabase ?? new StateDatabase(this.home.stateDb);
     this.runExecutor = options.runExecutor ?? runOrchestrator;
+    this.hostAdapter = options.hostAdapter ?? new HostAdapter();
     this.server.register('health', async () => ({
       metadata: this.metadata,
       home: this.home.root,
@@ -399,6 +410,33 @@ export class AgentTeamDaemon {
         if (projectId === undefined) return true;
         return this.stateDatabase.getRun(controller.runId).projectId === projectId;
       });
+    });
+    this.server.register('host.capabilities', async (params) => {
+      const input = objectParams(params, 'host.capabilities', ['host']);
+      const host = requiredString(input, 'host', 'host.capabilities');
+      return this.hostAdapter.capabilities(host) ?? {
+        host,
+        known: false,
+        capabilities: null
+      };
+    });
+    this.server.register('controller.resume_external_thread', async (params) => {
+      const input = objectParams(params, 'controller.resume_external_thread', ['runId', 'clientId', 'explicitlyRequested']);
+      return await this.callHostAction(
+        'resumeExternalThread',
+        requiredString(input, 'runId', 'controller.resume_external_thread'),
+        requiredString(input, 'clientId', 'controller.resume_external_thread'),
+        requiredBoolean(input, 'explicitlyRequested', 'controller.resume_external_thread')
+      );
+    });
+    this.server.register('controller.start_review_turn', async (params) => {
+      const input = objectParams(params, 'controller.start_review_turn', ['runId', 'clientId', 'explicitlyRequested']);
+      return await this.callHostAction(
+        'startReviewTurn',
+        requiredString(input, 'runId', 'controller.start_review_turn'),
+        requiredString(input, 'clientId', 'controller.start_review_turn'),
+        requiredBoolean(input, 'explicitlyRequested', 'controller.start_review_turn')
+      );
     });
     this.server.register('project.register', async (params) => {
       const input = objectParams(params, 'project.register', [
@@ -812,6 +850,27 @@ export class AgentTeamDaemon {
     if (code === 'ENOENT') return new Error(`Agent log does not exist: ${runId}/${agentId}`);
     if (code === 'EACCES' || code === 'EPERM') return new Error(`Agent log is not readable: ${runId}/${agentId}`);
     return new Error(`Agent log is unavailable: ${runId}/${agentId}${code ? ` (${code})` : ''}`);
+  }
+
+  private async callHostAction(
+    action: HostAction,
+    runId: string,
+    clientId: string,
+    explicitlyRequested: boolean
+  ) {
+    // Read the durable controller record instead of accepting a caller-supplied thread ID.
+    this.controlPlaneStore.assertControllerOwnership(runId, clientId);
+    const controller = this.controlPlaneStore.getController(runId);
+    const request = {
+      host: controller.host,
+      externalThreadId: controller.externalThreadId,
+      runId,
+      clientId,
+      explicitlyRequested
+    };
+    return action === 'resumeExternalThread'
+      ? await this.hostAdapter.resumeExternalThread(request)
+      : await this.hostAdapter.startReviewTurn(request);
   }
 
   private scheduleRun(runId: string): boolean {

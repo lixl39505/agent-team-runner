@@ -92,6 +92,7 @@ test('MCP bridge lists and dispatches every fixed IPC tool', async () => {
       'agent_team_claim_interaction',
       'agent_team_disconnect_controller',
       'agent_team_get_handoff',
+      'agent_team_get_host_capabilities',
       'agent_team_get_run',
       'agent_team_get_status',
       'agent_team_heartbeat_controller',
@@ -105,6 +106,8 @@ test('MCP bridge lists and dispatches every fixed IPC tool', async () => {
       'agent_team_read_run_events',
       'agent_team_register_project',
       'agent_team_requeue_interactions',
+      'agent_team_resume_external_thread',
+      'agent_team_start_review_turn',
       'agent_team_start_run',
       'agent_team_submit_execution_contract',
       'agent_team_update_task_contract',
@@ -122,6 +125,9 @@ test('MCP bridge lists and dispatches every fixed IPC tool', async () => {
       ['agent_team_disconnect_controller', { runId: 'run-1', clientId: 'client-1' }, 'controller.disconnect', { runId: 'run-1', clientId: 'client-1' }],
       ['agent_team_heartbeat_controller', { runId: 'run-1', clientId: 'client-1' }, 'controller.heartbeat', { runId: 'run-1', clientId: 'client-1' }],
       ['agent_team_list_reconnectable_runs', {}, 'controller.reconnectable', undefined],
+      ['agent_team_get_host_capabilities', { host: 'codex' }, 'host.capabilities', { host: 'codex' }],
+      ['agent_team_resume_external_thread', { runId: 'run-1', clientId: 'client-1', explicitlyRequested: true }, 'controller.resume_external_thread', { runId: 'run-1', clientId: 'client-1', explicitlyRequested: true }],
+      ['agent_team_start_review_turn', { runId: 'run-1', clientId: 'client-1', explicitlyRequested: true }, 'controller.start_review_turn', { runId: 'run-1', clientId: 'client-1', explicitlyRequested: true }],
       ['agent_team_register_project', projectRegistration(), 'project.register', projectRegistration()],
       ['agent_team_list_projects', {}, 'project.list', undefined],
       ['agent_team_archive_project', { projectId: 'project-1' }, 'project.archive', { projectId: 'project-1' }],
@@ -292,6 +298,12 @@ test('MCP bridge rejects unknown and invalid Zod tool input before IPC', async (
     });
     assert.equal(invalidLog.isError, true);
     assert.match(text(invalidLog), /too small|too big|unrecognized key/i);
+    const implicitResume = await connected.client.callTool({
+      name: 'agent_team_resume_external_thread',
+      arguments: { runId: 'run-1', clientId: 'client-1', explicitlyRequested: false }
+    });
+    assert.equal(implicitResume.isError, true);
+    assert.match(text(implicitResume), /invalid input/i);
     assert.deepEqual(calls, []);
   } finally {
     await closeConnectedServer(connected);
@@ -405,7 +417,7 @@ test('MCP gateway requeues an interaction when elicitation is cancelled', async 
     if (method === 'execution.events_since') return { events: [], lastEventId: params.afterEventId };
     if (method === 'controller.attach' || method === 'interaction.claim') return {};
     if (method === 'interaction.list') return [queued];
-    if (method === 'interaction.requeue_client') return 1;
+    if (method === 'interaction.requeue_client') throw new Error('requeue unavailable');
     throw new Error(`unexpected IPC method: ${method}`);
   }, { pollIntervalMs: 5 }, { capabilities: { elicitation: { form: {} } } }, (client) => {
     client.setRequestHandler(ElicitRequestSchema, () => ({ action: 'cancel' }));
@@ -421,4 +433,155 @@ test('MCP gateway requeues an interaction when elicitation is cancelled', async 
   } finally {
     await closeConnectedServer(connected);
   }
+});
+
+test('MCP gateway handles declined approvals and invalid question answers without stranding interactions', async () => {
+  const calls = [];
+  const queued = [
+    { id: 'approval-1', status: 'queued', kind: 'approval', request: {} },
+    { id: 'question-1', status: 'queued', kind: 'agent_question', request: { questions: [{ id: 'choice', multiple: true, options: [{ label: 'yes' }] }] } }
+  ];
+  const claimed = new Set();
+  const connected = await createConnectedServer(async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'execution.events_since') return { events: [], lastEventId: params.afterEventId };
+    if (method === 'controller.attach') return {};
+    if (method === 'interaction.list') return queued.filter((item) => !claimed.has(item.id));
+    if (method === 'interaction.claim') return {};
+    if (method === 'interaction.answer') {
+      claimed.add(params.id);
+      return {};
+    }
+    if (method === 'interaction.requeue_client') return 1;
+    throw new Error(`unexpected IPC method: ${method}`);
+  }, { pollIntervalMs: 5 }, { capabilities: { elicitation: { form: {} } } }, (client) => {
+    let requests = 0;
+    client.setRequestHandler(ElicitRequestSchema, () => {
+      requests += 1;
+      return requests === 1 ? { action: 'decline' } : { action: 'accept', content: { answer_1: 'no' } };
+    });
+  });
+
+  try {
+    await connected.client.callTool({
+      name: 'agent_team_attach_controller', arguments: { runId: 'run-1', host: 'test', clientId: 'mcp-client' }
+    });
+    await waitFor(() => calls.some((call) => call.method === 'interaction.requeue_client'));
+    assert.deepEqual(calls.filter((call) => call.method === 'interaction.answer').map((call) => call.params.response), ['deny']);
+  } finally {
+    await closeConnectedServer(connected);
+  }
+});
+
+test('MCP bridge keeps attachment state unchanged when attach or disconnect fails', async () => {
+  const connected = await createConnectedServer(async (method) => {
+    if (method === 'controller.attach' || method === 'controller.disconnect') throw new Error('controller unavailable');
+    throw new Error(`unexpected IPC method: ${method}`);
+  });
+
+  try {
+    for (const [name, arguments_] of [
+      ['agent_team_attach_controller', { runId: 'run-1', host: 'test', clientId: 'client-1' }],
+      ['agent_team_disconnect_controller', { runId: 'run-1', clientId: 'client-1' }]
+    ]) {
+      const result = await connected.client.callTool({
+        name,
+        arguments: arguments_
+      });
+      assert.equal(result.isError, true);
+      assert.equal(text(result), 'controller unavailable');
+    }
+  } finally {
+    await closeConnectedServer(connected);
+  }
+});
+
+test('MCP server validates gateway poll intervals and accepts the default options object', () => {
+  const server = createMcpServer({ request: async () => ({}) });
+  assert.ok(server);
+  const invalid = createMcpServer({ request: async () => ({}) }, { pollIntervalMs: 0 });
+  assert.throws(() => invalid.server.oninitialized(), /pollIntervalMs/);
+});
+
+test('MCP gateway rejects malformed durable data and retries invalid elicitation outcomes', async () => {
+  const callbacks = [];
+  const calls = [];
+  const events = [
+    null,
+    { id: -1, runId: 'invalid', eventType: 'RUN_STARTED', createdAt: 'now' },
+    { id: 1, runId: 'run-1', eventType: 'RUN_PAUSED', createdAt: 'now' },
+    { id: 2, runId: 'run-1', eventType: 'RUN_CANCELLED', createdAt: 'now' },
+    { id: 3, runId: 'run-1', eventType: 'RUN_FAILED', createdAt: 'now' },
+    { id: 4, runId: 'run-1', eventType: 'RUN_DAEMON_FAILED', createdAt: 'now' }
+  ];
+  const connected = await createConnectedServer(async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'execution.events_since') return { events, lastEventId: 4 };
+    if (method === 'controller.attach' || method === 'controller.disconnect' || method === 'interaction.claim') return {};
+    if (method === 'interaction.list') return [
+      null,
+      { id: 'approval-1', status: 'queued', kind: 'approval', request: {} },
+      { id: 'question-1', status: 'queued', kind: 'agent_question', request: {} }
+    ];
+    if (method === 'interaction.requeue_client') return 1;
+    throw new Error(`unexpected IPC method: ${method}`);
+  }, {
+    pollIntervalMs: 1,
+    setInterval(callback) {
+      callbacks.push(callback);
+      return { unref() {} };
+    },
+    clearInterval() {}
+  }, { capabilities: { elicitation: { form: {} } } }, (client) => {
+    client.setRequestHandler(ElicitRequestSchema, () => ({ action: 'accept', content: { decision: 'invalid' } }));
+  });
+
+  try {
+    await connected.client.callTool({
+      name: 'agent_team_attach_controller', arguments: { runId: 'run-1', host: 'test', clientId: 'client-1' }
+    });
+    await waitFor(() => calls.some((call) => call.method === 'interaction.requeue_client'));
+    connected.server.server.oninitialized();
+    await connected.client.callTool({
+      name: 'agent_team_disconnect_controller', arguments: { runId: 'run-1', clientId: 'other-client' }
+    });
+    callbacks[0]();
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    assert.equal(calls.filter((call) => call.method === 'interaction.claim').length >= 1, true);
+  } finally {
+    await closeConnectedServer(connected);
+  }
+});
+
+test('MCP gateway rejects malformed question forms and answers', async () => {
+  const calls = [];
+  const interactions = [
+    { id: 'secret', status: 'queued', kind: 'agent_question', request: { questions: [{ id: 'x', secret: true }] } },
+    { id: 'freeform', status: 'queued', kind: 'agent_question', request: { questions: [{ id: 'x', options: 'invalid' }] } }
+  ];
+  const connected = await createConnectedServer(async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'execution.events_since') return { events: {}, lastEventId: 0 };
+    if (method === 'controller.attach' || method === 'interaction.claim') return {};
+    if (method === 'interaction.list') return interactions;
+    if (method === 'interaction.requeue_client') return 1;
+    throw new Error(`unexpected IPC method: ${method}`);
+  }, { pollIntervalMs: 5 }, { capabilities: { elicitation: { form: {} } } }, (client) => {
+    client.setRequestHandler(ElicitRequestSchema, () => ({ action: 'decline' }));
+  });
+
+  try {
+    await connected.client.callTool({
+      name: 'agent_team_attach_controller', arguments: { runId: 'run-1', host: 'test', clientId: 'client-1' }
+    });
+    await waitFor(() => calls.filter((call) => call.method === 'interaction.requeue_client').length > 0);
+    assert.equal(calls.some((call) => call.method === 'interaction.claim' && call.params.id === 'secret'), true);
+  } finally {
+    await closeConnectedServer(connected);
+  }
+});
+
+test('MCP gateway closes cleanly before polling starts', async () => {
+  const server = createMcpServer({ request: async () => ({}) });
+  await server.server.onclose();
 });

@@ -27,7 +27,7 @@ function home() {
   return resolveAgentTeamHome({ env: { AGENT_TEAM_HOME: root } });
 }
 
-test('migration dry-run verifies terminal state without writing', async () => {
+test('the isolated legacy reader verifies terminal project state without writing', async () => {
   const repo = fixture();
   const target = home();
   const plan = await migrateLegacyProjectState(repo, target, true);
@@ -108,5 +108,46 @@ test('migration preflight rejects invalid sources and unsafe artifacts before co
     rmSync(missing, { recursive: true, force: true });
     rmSync(invalidDatabase, { recursive: true, force: true });
     rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('migration supports terminal state without optional artifact or worktree directories', async () => {
+  const repo = mkdtempSync(join(tmpdir(), 'agent-team-migrate-state-only-'));
+  const legacy = join(repo, '.agent-team');
+  const db = new StateDatabase(join(legacy, 'state.sqlite'));
+  db.createRun({ id: 'state-only', repoRoot: repo, goalFile: 'goal.md', baseRef: 'HEAD', baseSha: 'abc', adapter: 'claude' });
+  db.updateRun('state-only', { status: 'done' });
+  db.close();
+  const target = home();
+  try {
+    assert.deepEqual(preflightLegacyMigration(repo, target), {
+      sourceRepo: repo, sourceRoot: legacy, stateRuns: 1, runArtifacts: 0, preservedWorktrees: 0
+    });
+    await migrateLegacyProjectState(repo, target);
+    const migrated = new StateDatabase(target.stateDb);
+    try {
+      assert.equal(migrated.getRun('state-only').status, 'done');
+    } finally {
+      migrated.close();
+    }
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(target.root, { recursive: true, force: true });
+  }
+});
+
+test('migration rejects unsafe state run identifiers', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'agent-team-migrate-unsafe-id-'));
+  const legacy = join(repo, '.agent-team');
+  const db = new StateDatabase(join(legacy, 'state.sqlite'));
+  db.createRun({ id: '../unsafe', repoRoot: repo, goalFile: 'goal.md', baseRef: 'HEAD', baseSha: 'abc', adapter: 'claude' });
+  db.updateRun('../unsafe', { status: 'done' });
+  db.close();
+  const target = home();
+  try {
+    assert.throws(() => preflightLegacyMigration(repo, target), /unsafe run id/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(target.root, { recursive: true, force: true });
   }
 });

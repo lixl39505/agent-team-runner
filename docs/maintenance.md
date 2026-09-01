@@ -1,8 +1,8 @@
 # 运行维护指南
 
-本文面向维护本机 `agent-team-runner` daemon 的操作者。运行状态属于
-`$AGENT_TEAM_HOME`，不是目标仓库的 `.agent-team` 目录；目标仓库仅提供 Git
-工作区和可选 implementation Skill。
+本文面向维护本机 `agent-team-runner` daemon 的操作者。运行状态和 project policy
+属于 `$AGENT_TEAM_HOME`，不是目标仓库的 `.agent-team` 目录；目标仓库仅提供 Git
+工作区和可选 implementation Skill。运行时不会读取项目内配置或状态。
 
 ## Daemon 生命周期
 
@@ -14,6 +14,9 @@ endpoint 是 `$AGENT_TEAM_HOME/daemon.sock`，Windows 是 `\\.\pipe\agent-team`�
 - `daemon.lock` 和 `daemon.json` 记录 PID、启动时间和协议版本。存活 PID 的 lock
   会拒绝第二个 daemon；死 PID 或损坏的 lock 会被替换。
 - IPC socket 权限在 Unix-like 平台被限制为 `0600`。不要共享、移动或手工改写 socket。
+- Windows 使用 Node 创建的 `\\.\pipe\agent-team` named pipe；它由当前登录用户的
+  Windows security token 创建。CI 的 Windows job 会运行同一 IPC 生命周期测试，但跨账户
+  ACL 审计仍需在目标 Windows 部署策略中单独确认。
 - `agent-team start`、`agent-team attach` 和 MCP gateway 都只是客户端。离开 Inbox、
   断开 MCP 或关闭终端不会停止 daemon 或取消已提交的 run。
 - 通过 `SIGINT` 或 `SIGTERM` 停止 daemon 时，活跃执行收到 abort，持久状态转为
@@ -57,9 +60,17 @@ controller 对一个 run 具有临时独占 lease。attach 时提供稳定的 `c
 - MCP gateway 关闭时也会执行相同清理，因此 TUI 或另一 MCP client 可以接管。
   若客户端崩溃而未断开，等待 lease 过期后再接管，不要绕过 ownership 直接回答交互。
 
-持久重连不等于 Host thread resume。当前 daemon 保存 `externalThreadId` 并恢复
-control-plane context，但不会替任何 Host 自动恢复外部聊天线程；Host thread resume
-尚未完成。
+持久重连不等于 Host thread resume。daemon 保存 `externalThreadId` 并恢复
+control-plane context。`agent_team_get_host_capabilities` 返回 Claude Code、Codex、
+OpenCode 的显式 capability registry，分别记录 `logging`、`elicitation`、`idleEvent`、
+`resumeExternalThread` 与 `startReviewTurn`。内置条目全部是未验证且未声明，默认拒绝
+外层动作。
+
+只有 controller lease owner 通过 `agent_team_resume_external_thread` 或
+`agent_team_start_review_turn` 提供 `explicitlyRequested: true`，且该 Host capability 已由
+维护者显式声明并注入对应 adapter 时，daemon 才会尝试调用。未知 Host、未声明、无 adapter
+或 adapter 失败都返回 `fallback: "durable_context_and_tui"`，不会改写 controller、事件、
+handoff 或 interaction；改用 `agent-team attach` 与 durable event 工具。
 
 ## MCP Notification 与 Elicitation
 
@@ -80,9 +91,9 @@ MCP gateway 通过 stdio 连接本机 daemon。它的工具是固定控制面，
   secret、嵌套/数组值不安全的问题、无 capability、取消、失败或断线，都会保持 queued
   或重新入队，供 `agent-team attach` 处理。
 
-Host capability spike 不是已完成的交付项。各 Host 对 notification、elicitation、闲置
-会话事件、thread continuation 和断线的实际行为仍需分别验证；不要将本地 fake/protocol
-测试视为 Host 兼容性证明。
+Host capability spike 不是已完成的真实 Host 验收。各 Host 对 notification、elicitation、
+闲置会话事件、thread continuation、review turn 和断线的实际行为仍需分别验证；不要将本地
+fake/protocol 测试或 registry 中的 probe 结果视为 Host UI 兼容性证明。
 
 ## Handoff
 
@@ -103,7 +114,8 @@ agent-team migrate /path/to/repository --dry-run
 agent-team migrate --repo /path/to/repository --home /path/to/global-home
 ```
 
-迁移会执行 SQLite `quick_check`，拒绝非终态 run，检查目标 run 名，并通过 SQLite backup
+迁移器是项目内 `.agent-team` 的唯一 legacy reader：预检阶段只读执行 SQLite `quick_check`，
+拒绝非终态 run，检查目标 run 名，并通过 SQLite backup
 复制而非复制活动 WAL。目标 `$AGENT_TEAM_HOME/state.sqlite` 必须不存在，迁移不会合并
 数据库、覆盖 run 目录或删除源目录。先以 `--dry-run` 验证。
 

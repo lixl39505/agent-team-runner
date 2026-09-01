@@ -401,7 +401,22 @@ export function createMcpServer(ipc: IpcRequester, options: McpGatewayOptions = 
     ipc,
     'controller.reconnectable',
     input.projectId === undefined ? undefined : { projectId: input.projectId }
- ));
+  ));
+
+  server.registerTool('agent_team_get_host_capabilities', {
+    description: 'Read the explicit, Host-specific capability registry. Unverified capabilities are not enabled.',
+    inputSchema: z.object({ host: nonEmptyString }).strict()
+  }, (input) => requestTool(ipc, 'host.capabilities', input));
+
+  server.registerTool('agent_team_resume_external_thread', {
+    description: 'Explicitly request a declared Host adapter to resume this controller thread; durable context remains the fallback.',
+    inputSchema: z.object({ runId: nonEmptyString, clientId: nonEmptyString, explicitlyRequested: z.literal(true) }).strict()
+  }, (input) => requestTool(ipc, 'controller.resume_external_thread', input));
+
+  server.registerTool('agent_team_start_review_turn', {
+    description: 'Explicitly request a declared Host adapter to start an outer review turn; durable context remains the fallback.',
+    inputSchema: z.object({ runId: nonEmptyString, clientId: nonEmptyString, explicitlyRequested: z.literal(true) }).strict()
+  }, (input) => requestTool(ipc, 'controller.start_review_turn', input));
 
   server.registerTool('agent_team_register_project', {
     description: 'Register a repository and its execution policy.',

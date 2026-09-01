@@ -8,7 +8,9 @@ import { LocalIpcClient, LocalIpcServer } from '../src/daemon/ipc.ts';
 
 async function withSocket(run) {
   const directory = await mkdtemp(join(tmpdir(), 'agent-team-ipc-'));
-  const path = join(directory, 'daemon.sock');
+  const path = process.platform === 'win32'
+    ? `\\\\.\\pipe\\agent-team-ipc-${process.pid}-${Date.now()}`
+    : join(directory, 'daemon.sock');
   try {
     await run(path);
   } finally {
@@ -47,11 +49,11 @@ async function waitForMessage(messages, index) {
 
 test('LocalIpcServer and LocalIpcClient exchange requests and clean socket files', async () => {
   await withSocket(async (path) => {
-    await writeFile(path, 'stale socket');
+    if (process.platform !== 'win32') await writeFile(path, 'stale socket');
     const server = new LocalIpcServer();
     server.register('echo', async (params) => ({ params }));
     await server.start(path);
-    assert.equal((await stat(path)).mode & 0o777, 0o600);
+    if (process.platform !== 'win32') assert.equal((await stat(path)).mode & 0o777, 0o600);
     await assert.rejects(server.start(path), /already running/);
 
     const client = new LocalIpcClient(path);
@@ -64,7 +66,7 @@ test('LocalIpcServer and LocalIpcClient exchange requests and clean socket files
     await assert.rejects(client.request('echo'), /connection is closed/);
 
     await server.stop();
-    await assert.rejects(access(path));
+    if (process.platform !== 'win32') await assert.rejects(access(path));
     await server.stop();
   });
 });

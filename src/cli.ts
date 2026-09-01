@@ -160,7 +160,7 @@ Commands:
   start [--home PATH]                 Start or connect to the daemon, then open the Inbox
   mcp [--home PATH]                   Run the MCP server
   attach [run-id] [--home PATH]       Select or attach an interactive daemon run dashboard
-  migrate [repo] [--repo PATH]        Safely migrate terminal legacy state to AGENT_TEAM_HOME
+  migrate [repo] [--repo PATH]        Read and safely migrate terminal legacy state to AGENT_TEAM_HOME
           [--home PATH] [--dry-run]   Never merges or overwrites state.sqlite or run artifacts
   skills sync [--repo PATH]          Mirror portable skills for Codex/OpenCode/Claude
   auth set --backend ID --profile N  Save an API key in the macOS Keychain

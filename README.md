@@ -15,6 +15,9 @@ agent-team mcp
 
 The daemon stores projects, policy revisions, runs, interactions, controller
 ownership, and events below `$AGENT_TEAM_HOME` (or the platform default).
+Target repositories are never read for runner configuration or state. A
+project-local `.agent-team` directory has no runtime meaning; `migrate` is the
+sole, isolated legacy reader for moving terminal state out of that directory.
 `start` reuses a reachable daemon or launches `agent-team-daemon` as a detached
 child, waits for its IPC endpoint, then opens the same Inbox as `attach`.
 Detaching that Inbox never stops the daemon or submitted runs.
@@ -57,7 +60,8 @@ agent-team migrate /path/to/repository --dry-run
 agent-team migrate --repo /path/to/repository --home /path/to/global-home
 ```
 
-`migrate` first verifies the source SQLite database with `quick_check`, rejects
+`migrate` is a read-only legacy source reader before publication: it first verifies
+the source SQLite database with `quick_check`, rejects
 non-terminal runs, and checks every destination run name before writing. It
 creates a SQLite backup rather than copying a live WAL file. Migration is only
 available when `$AGENT_TEAM_HOME/state.sqlite` does not exist: SQLite databases
@@ -94,6 +98,19 @@ These notifications are best-effort connection updates, not a replacement for
 the durable `agent_team_read_run_events` cursor. The gateway uses only standard
 MCP logging notifications rather than a private notification extension, so a
 Host must surface MCP logging messages to display them.
+
+### Host Capability Registry
+
+`agent_team_get_host_capabilities` exposes an explicit registry for Claude Code,
+Codex, and OpenCode. It records `logging`, `elicitation`, `idleEvent`,
+`resumeExternalThread`, and `startReviewTurn` independently. All built-in entries
+are intentionally unverified and disabled until a Host-specific integration is
+declared. `agent_team_resume_external_thread` and
+`agent_team_start_review_turn` require `explicitlyRequested: true`, controller
+lease ownership, a declared capability, and an installed Host adapter. Any refusal
+or adapter failure returns the durable-context/TUI fallback without changing the
+run. Local fake tests and probe skeletons do not prove real third-party Host UI
+behavior.
 
 After `agent_team_attach_controller`, the gateway checks the initialized
 client's `capabilities.elicitation.form`. A client that declares form support

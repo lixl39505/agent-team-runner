@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { DEFAULT_CONFIG } from '../src/core/config.ts';
+import { DEFAULT_CONFIG } from '../src/core/defaults.ts';
 import { StateDatabase } from '../src/core/db.ts';
 import { currentHead, git } from '../src/core/git.ts';
 import { snapshotAgents } from '../src/agent/registry.ts';

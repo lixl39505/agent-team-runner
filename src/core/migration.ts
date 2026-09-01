@@ -34,7 +34,8 @@ function assertRegularTree(path: string): void {
   for (const child of readdirSync(path)) assertRegularTree(join(path, child));
 }
 
-function stateRuns(path: string): Array<{ id: string; status: string }> {
+/** Reads only the supported terminal-state fields from a project-local legacy database. */
+function readLegacyStateRuns(path: string): Array<{ id: string; status: string }> {
   const db = new DatabaseSync(path, { readOnly: true });
   try {
     const check = db.prepare('PRAGMA quick_check').get() as { quick_check?: unknown } | undefined;
@@ -65,7 +66,7 @@ export function preflightLegacyMigration(sourceRepo: string, home: AgentTeamHome
     throw new Error(`Global state database already exists and will not be merged or overwritten: ${home.stateDb}`);
   }
 
-  const runs = stateRuns(sourceState);
+  const runs = readLegacyStateRuns(sourceState);
   for (const run of runs) {
     if (!RUN_NAME.test(run.id)) throw new Error(`Legacy state database has an unsafe run id: ${run.id}`);
     if (!TERMINAL_RUN_STATUSES.has(run.status)) {

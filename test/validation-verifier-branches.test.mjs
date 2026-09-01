@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { validateIntegrationResult, validateReviewResult, validateWorkerResult } from '../src/core/validation.ts';
-import { DEFAULT_CONFIG } from '../src/core/config.ts';
+import { DEFAULT_CONFIG } from '../src/core/defaults.ts';
 import { verifyTaskWorktree, runGlobalVerification } from '../src/core/verifier.ts';
 
 function task(overrides = {}) {

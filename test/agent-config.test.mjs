@@ -1,52 +1,29 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
-import { loadConfig } from '../src/core/config.ts';
+import { DEFAULT_CONFIG } from '../src/core/defaults.ts';
 import { validateAgents, parseInlineAgentSpec } from '../src/core/agent-config.ts';
 import { resolveAgent, resolveTaskAgent, snapshotAgents, parseSnapshot } from '../src/agent/registry.ts';
 
-function tempRepo() {
-  const repo = mkdtempSync(join(tmpdir(), 'agent-team-agents-'));
-  mkdirSync(join(repo, '.agent-team'), { recursive: true });
-  return repo;
+function runnerConfig(overrides = {}) {
+  return {
+    ...DEFAULT_CONFIG,
+    workspace: { ...DEFAULT_CONFIG.workspace },
+    backends: { ...DEFAULT_CONFIG.backends },
+    agents: { ...DEFAULT_CONFIG.agents },
+    roles: { ...DEFAULT_CONFIG.roles },
+    ...overrides
+  };
 }
 
-test('rejects legacy v1 config files', () => {
-  const repo = tempRepo();
-  writeFileSync(join(repo, '.agent-team', 'config.yml'), [
-    'version: 1',
-    'defaultAdapter: codex',
-    'models:',
-    '  terra: gpt-5.6-terra',
-    '  glm52: z-ai/glm-5.2',
-    'roles:',
-    '  lead: codex.terra',
-    '  worker: opencode.deepseek/v4-flash',
-    '  reviewer: opencode.glm52',
-    'adapters:',
-    '  codex:',
-    '    command: codex',
-    '    model: gpt-5.6-terra'
-  ].join('\n'), { flag: 'w' });
-  assert.throws(() => loadConfig(repo), /must declare version: 3/);
-});
-
 test('resolves roles through the registry and falls back to defaultAgent', () => {
-  const repo = tempRepo();
-  writeFileSync(join(repo, '.agent-team', 'config.yml'), [
-    'version: 3',
-    'workspace: {}',
-    'retry: {}',
-    'status: {}',
-    'agents:',
-    '  default-agent: { backend: codex, model: gpt-5.6-terra }',
-    '  fast-worker: { backend: opencode, model: deepseek/v4-flash }',
-    'roles:',
-    '  worker: fast-worker'
-  ].join('\n'), { flag: 'w' });
-  const config = loadConfig(repo);
+  const config = runnerConfig({
+    defaultAgent: 'default-agent',
+    agents: {
+      'default-agent': { backend: 'codex', model: 'gpt-5.6-terra' },
+      'fast-worker': { backend: 'opencode', model: 'deepseek/v4-flash' }
+    },
+    roles: { worker: 'fast-worker' }
+  });
   const worker = resolveAgent('worker', config);
   assert.deepEqual(
     { agent: worker.agent, backend: worker.backend, model: worker.model },
@@ -60,19 +37,11 @@ test('resolves roles through the registry and falls back to defaultAgent', () =>
 });
 
 test('accepts inline backend.model specs and rejects unknown agents', () => {
-  const repo = tempRepo();
-  writeFileSync(join(repo, '.agent-team', 'config.yml'), [
-    'version: 3',
-    'workspace: {}',
-    'retry: {}',
-    'status: {}',
-    'agents:',
-    '  a: { backend: codex }',
-    'roles:',
-    '  reviewer: codex.gpt-5.6-terra',
-    '  worker: no-such-agent'
-  ].join('\n'), { flag: 'w' });
-  const config = loadConfig(repo);
+  const config = runnerConfig({
+    defaultAgent: 'a',
+    agents: { a: { backend: 'codex' } },
+    roles: { reviewer: 'codex.gpt-5.6-terra', worker: 'no-such-agent' }
+  });
   const reviewer = resolveAgent('reviewer', config);
   assert.deepEqual(parseInlineAgentSpec('codex.gpt-5.6-terra'), { backend: 'codex', model: 'gpt-5.6-terra' });
   assert.equal(reviewer.model, 'gpt-5.6-terra');
@@ -81,18 +50,13 @@ test('accepts inline backend.model specs and rejects unknown agents', () => {
 });
 
 test('validates agent auth metadata without accepting secret configuration', () => {
-  const repo = tempRepo();
-  writeFileSync(join(repo, '.agent-team', 'config.yml'), [
-    'version: 3',
-    'workspace: {}',
-    'retry: {}',
-    'status: {}',
-    'agents:',
-    '  valid: { backend: codex, authProfile: work_profile, authIsolation: isolated, baseUrl: https://api.example.com/v1 }',
-    '  invalid: { backend: claude, authProfile: bad.profile, authIsolation: per-run, baseUrl: ftp://api.example.com }',
-    'defaultAgent: valid'
-  ].join('\n'), { flag: 'w' });
-  const validation = validateAgents(loadConfig(repo));
+  const validation = validateAgents(runnerConfig({
+    defaultAgent: 'valid',
+    agents: {
+      valid: { backend: 'codex', authProfile: 'work_profile', authIsolation: 'isolated', baseUrl: 'https://api.example.com/v1' },
+      invalid: { backend: 'claude', authProfile: 'bad.profile', authIsolation: 'per-run', baseUrl: 'ftp://api.example.com' }
+    }
+  }));
   assert.equal(validation.ok, false);
   assert.deepEqual(validation.errors, [
     'agents.invalid.authProfile: invalid profile name (letters/digits/dash/underscore, no dots)',
@@ -102,18 +66,10 @@ test('validates agent auth metadata without accepting secret configuration', () 
 });
 
 test('task.agent resolves with its model (fixes the task.adapter model-drop bug)', () => {
-  const repo = tempRepo();
-  writeFileSync(join(repo, '.agent-team', 'config.yml'), [
-    'version: 3',
-    'workspace: {}',
-    'retry: {}',
-    'status: {}',
-    'agents:',
-    '  heavy: { backend: codex, model: gpt-5.6-terra }',
-    '  light: { backend: claude }',
-    'defaultAgent: light'
-  ].join('\n'), { flag: 'w' });
-  const config = loadConfig(repo);
+  const config = runnerConfig({
+    defaultAgent: 'light',
+    agents: { heavy: { backend: 'codex', model: 'gpt-5.6-terra' }, light: { backend: 'claude' } }
+  });
   const binding = resolveTaskAgent(
     { id: 'T001', title: 't', description: 'd', agent: 'heavy', dependsOn: [], allowedPaths: ['src/**'], blockedPaths: [], acceptance: [], verificationCommands: [] },
     config,
@@ -132,16 +88,10 @@ test('task.agent resolves with its model (fixes the task.adapter model-drop bug)
 });
 
 test('snapshot keeps runs hermetic and parses legacy v1 snapshots', () => {
-  const repo = tempRepo();
-  writeFileSync(join(repo, '.agent-team', 'config.yml'), [
-    'version: 3',
-    'workspace: {}',
-    'retry: {}',
-    'status: {}',
-    'agents:',
-    '  default-agent: { backend: codex, model: gpt-5.6-terra }'
-  ].join('\n'), { flag: 'w' });
-  const config = loadConfig(repo);
+  const config = runnerConfig({
+    defaultAgent: 'default-agent',
+    agents: { 'default-agent': { backend: 'codex', model: 'gpt-5.6-terra' } }
+  });
   const snapshot = snapshotAgents(config);
   assert.equal(snapshot.version, 2);
   assert.ok(snapshot.agents['default-agent']);
@@ -164,7 +114,7 @@ test('allows an intentionally unset role binding', () => {
   const result = validateAgents({
     defaultAgent: 'default',
     agents: { default: { backend: 'claude' } },
-    roles: { worker: 'default' }
+    roles: { worker: 'default', reviewer: '' }
   });
 
   assert.deepEqual(result, { ok: true, errors: [], warnings: [] });

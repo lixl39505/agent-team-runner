@@ -140,6 +140,24 @@ test('lists durable events as ordered JSON records with bounded cursor paginatio
     assert.throws(() => db.listEvents('events', 0.5), /afterEventId/);
     assert.throws(() => db.listEvents('events', 0, 0), /limit/);
     assert.throws(() => db.listEvents('events', 0, 1001), /limit/);
+    assert.equal(db.listEventsSince().length, 4);
+    assert.throws(() => db.listEventsSince(-1), /afterEventId/);
+    assert.throws(() => db.listEventsSince(0, 0), /limit/);
+  } finally {
+    db.close();
+  }
+});
+
+test('replaces task specs and reads legacy task rows without resolved skills', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-team-db-task-spec-'));
+  const db = new StateDatabase(join(dir, 'state.sqlite'));
+  try {
+    db.createRun({ id: 'replace', repoRoot: dir, goalFile: 'goal.md', baseRef: 'HEAD', baseSha: 'abc', adapter: 'claude' });
+    const original = { id: 'T001', title: 'first', description: 'first', dependsOn: [], allowedPaths: [], blockedPaths: [], acceptance: [], verificationCommands: [] };
+    db.insertTask('replace', original);
+    db.replaceTaskSpec('replace', { ...original, title: 'second' });
+    assert.equal(db.getTask('replace', 'T001').title, 'second');
+    assert.equal(db.getTask('replace', 'T001').resolvedSkillsJson, '[]');
   } finally {
     db.close();
   }

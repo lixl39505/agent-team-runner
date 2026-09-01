@@ -4,7 +4,7 @@ import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { bindingsForRun, checkAgentAvailability, probeAll } from '../src/core/preflight.ts';
-import { DEFAULT_CONFIG } from '../src/core/config.ts';
+import { DEFAULT_CONFIG } from '../src/core/defaults.ts';
 import { FakeBackend } from '../src/agent/fake.ts';
 
 function input(platform) {

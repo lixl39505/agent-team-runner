@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { TaskSpec } from './types.js';
@@ -98,18 +98,4 @@ ${list(task.verificationCommands)}
 `;
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, body, 'utf8');
-}
-
-export function ensureGitignore(repoRoot: string): void {
-  const target = join(repoRoot, '.gitignore');
-  const markers = ['.agent-team/state.sqlite', '.agent-team/state.sqlite-*', '.agent-team/runs/'];
-  let current = existsSync(target) ? readFileSync(target, 'utf8') : '';
-  const lines = new Set(current.split(/\r?\n/));
-  for (const marker of markers) {
-    if (!lines.has(marker)) {
-      current += `${current && !current.endsWith('\n') ? '\n' : ''}${marker}\n`;
-      lines.add(marker);
-    }
-  }
-  writeFileSync(target, current, 'utf8');
 }

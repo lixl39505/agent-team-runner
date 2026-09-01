@@ -1,5 +1,5 @@
 import { isBackendId, validateAgents } from './agent-config.js';
-import { DEFAULT_CONFIG } from './config.js';
+import { DEFAULT_CONFIG } from './defaults.js';
 import type { AgentTeamHome } from './home.js';
 import type { JsonValue, ProjectPolicyRevision, ProjectRecord } from './project-registry.js';
 import type { AgentEntry, BackendConfig, BackendId, RunnerConfig } from './types.js';

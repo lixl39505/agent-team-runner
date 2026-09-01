@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DEFAULT_CONFIG } from '../src/core/config.ts';
+import { DEFAULT_CONFIG } from '../src/core/defaults.ts';
 import { ProjectRegistry } from '../src/core/project-registry.ts';
 import { runnerConfigFromProjectPolicy } from '../src/core/project-runtime.ts';
 

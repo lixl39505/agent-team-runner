@@ -514,6 +514,9 @@ test('AgentTeamDaemon registers projects and materializes execution contracts th
       });
       assert.match(project.id, /^project-/);
       assert.deepEqual((await client.request('project.list')).map((entry) => entry.id), [project.id]);
+      assert.deepEqual((await client.request('project.list', {})).map((entry) => entry.id), [project.id]);
+      assert.deepEqual(await client.request('project.skills', { projectId: project.id }), []);
+      assert.deepEqual(await client.request('execution.events_since', {}), { events: [], lastEventId: 0 });
       const archived = await client.request('project.archive', { projectId: project.id });
       assert.match(archived.archivedAt, /^\d{4}-\d{2}-\d{2}T/);
       assert.deepEqual(await client.request('project.list'), []);
@@ -528,6 +531,9 @@ test('AgentTeamDaemon registers projects and materializes execution contracts th
       assert.equal(observer.getRun(submitted.runId).status, 'planned');
       assert.equal(observer.getRun(submitted.runId).projectPolicyRevisionId, project.currentPolicyRevisionId);
       assert.equal(observer.listTasks(submitted.runId).length, 1);
+      await client.request('controller.attach', { runId: submitted.runId, host: 'test', clientId: 'client-1' });
+      await client.request('controller.disconnect', { runId: submitted.runId, clientId: 'client-1' });
+      assert.deepEqual((await client.request('controller.reconnectable', {})).map((entry) => entry.runId), [submitted.runId]);
 
       const execution = await client.request('execution.get', { runId: submitted.runId });
       assert.equal(execution.run.status, 'planned');
@@ -542,6 +548,9 @@ test('AgentTeamDaemon registers projects and materializes execution contracts th
       assert.match(generated.runId, /^execution-/);
       assert.equal(generated.scheduled, true);
       await waitFor(() => executorInputs.length === 2);
+
+      daemon.stateDatabase.updateRun(submitted.runId, { status: 'cancelled', desiredState: 'cancel_requested' });
+      assert.equal((await client.request('execution.start', { runId: submitted.runId })).scheduled, true);
 
       await assert.rejects(client.request('project.register', { unexpected: true }), /unknown field/);
       await assert.rejects(client.request('project.register', {
@@ -589,6 +598,10 @@ test('AgentTeamDaemon execution.start does not schedule an already active run', 
         runId: submitted.runId, scheduled: false
       });
       await waitFor(() => executions === 1);
+      const leaseTimer = daemon.activeRuns.get(submitted.runId).leaseTimer;
+      leaseTimer._onTimeout();
+      daemon.stateDatabase.renewExecutionLease = () => false;
+      leaseTimer._onTimeout();
     } finally {
       release.resolve();
       client.close();

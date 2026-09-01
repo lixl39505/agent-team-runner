@@ -103,6 +103,39 @@ test('OpenCode fails closed rather than creating a session when continuation can
   }
   assert.equal(mapOpenCodeSessionStatus({ type: 'retry' }), 'busy');
   assert.equal(mapOpenCodeSessionStatus({ type: 'unknown' }), 'error');
+  assert.equal(mapOpenCodeSessionStatus(null), 'error');
+  assert.equal(mapOpenCodeSessionStatus({ type: 'idle' }), 'idle');
+});
+
+test('OpenCode exposes non-Error resume transport failures without creating a replacement session', async () => {
+  const backend = new OpenCodeBackend();
+  backend.ensureClient = async () => ({ session: {
+    async get() { throw 'get failed'; },
+    async create() { throw new Error('must not create'); }
+  } });
+  backend.ensureSubscribed = async () => {};
+  backend.questionClient = { question: { async reply() {}, async reject() {} } };
+  await assert.rejects(backend.openSession(sessionSpec({ resumeSessionId: 'saved-session' })), /get failed/);
+
+  backend.ensureClient = async () => ({ session: {
+    async get() { return { data: { id: 'saved-session', directory: '/workspace' } }; },
+    async status() { throw 'status failed'; },
+    async create() { throw new Error('must not create'); }
+  } });
+  await assert.rejects(backend.openSession(sessionSpec({ resumeSessionId: 'saved-session' })), /status failed/);
+
+  backend.ensureClient = async () => ({ session: {
+    async get() { throw new Error('get error'); },
+    async create() { throw new Error('must not create'); }
+  } });
+  await assert.rejects(backend.openSession(sessionSpec({ resumeSessionId: 'saved-session' })), /get error/);
+
+  backend.ensureClient = async () => ({ session: {
+    async get() { return { data: { id: 'saved-session', directory: '/workspace' } }; },
+    async status() { throw new Error('status error'); },
+    async create() { throw new Error('must not create'); }
+  } });
+  await assert.rejects(backend.openSession(sessionSpec({ resumeSessionId: 'saved-session' })), /status error/);
 });
 
 test('OpenCode session maps structured, text, empty, provider, and transport results', async () => {

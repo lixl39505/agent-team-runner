@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { applyOverrides, DEFAULT_CONFIG, initConfig, loadConfig } from '../src/core/config.ts';
+import { DEFAULT_CONFIG } from '../src/core/defaults.ts';
 import { agentList, backendCommand, isBackendId, isValidAgentName, parseInlineAgentSpec, validateAgents } from '../src/core/agent-config.ts';
 import { checkPaths, globMatch, patternMatches } from '../src/core/path-policy.ts';
 import { validateIntegrationResult, validateReviewResult, validateTaskGraph, validateWorkerResult } from '../src/core/validation.ts';
@@ -17,7 +17,6 @@ function tempDir(prefix) {
 
 function repo() {
   const root = tempDir('agent-team-core-');
-  mkdirSync(join(root, '.agent-team'), { recursive: true });
   return root;
 }
 
@@ -49,34 +48,6 @@ function backend(id, overrides = {}) {
     ...overrides
   };
 }
-
-test('config rejects non-mapping input and preserves existing config during init', () => {
-  const root = repo();
-  const path = join(root, '.agent-team', 'config.yml');
-  writeFileSync(path, 'not-a-mapping\n');
-  assert.throws(() => loadConfig(root), /empty or not a mapping/);
-
-  writeFileSync(path, 'version: 3\nworkspace: {}\nretry: {}\nstatus: {}\nconcurrency: 8\n');
-  assert.equal(initConfig(root), path);
-  assert.equal(readFileSync(path, 'utf8'), 'version: 3\nworkspace: {}\nretry: {}\nstatus: {}\nconcurrency: 8\n');
-  assert.equal(loadConfig(root).concurrency, 8);
-});
-
-test('config resolves absolute paths and applies string fallback overrides', () => {
-  const root = repo();
-  writeFileSync(join(root, '.agent-team', 'config.json'), JSON.stringify({
-    version: 3,
-    workspace: { repoRoot: '.', stateDir: '/tmp/agent-team-state', worktreesDir: 'trees' },
-    retry: {},
-    status: {}
-  }));
-  const loaded = loadConfig(root);
-  assert.equal(loaded.workspace.stateDir, '/tmp/agent-team-state');
-  assert.equal(loaded.workspace.worktreesDir, join(root, 'trees'));
-  const overridden = applyOverrides(loaded, [{ key: 'new.branch.value', value: 'not-json' }]);
-  assert.equal(overridden.new.branch.value, 'not-json');
-  assert.throws(() => applyOverrides(loaded, [{ key: '...', value: 'x' }]), /empty key/);
-});
 
 test('agent config validates malformed registry entries', () => {
   const invalid = {
