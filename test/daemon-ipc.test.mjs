@@ -2,6 +2,7 @@ import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile, access, stat } from 'node:fs/promises';
 import { createConnection } from 'node:net';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LocalIpcClient, LocalIpcServer } from '../src/daemon/ipc.ts';
@@ -68,6 +69,44 @@ test('LocalIpcServer and LocalIpcClient exchange requests and clean socket files
     await server.stop();
     if (process.platform !== 'win32') await assert.rejects(access(path));
     await server.stop();
+  });
+});
+
+const windowsAccessTest = process.platform === 'win32'
+  && process.env.AGENT_TEAM_WINDOWS_DENIED_USER
+  && process.env.AGENT_TEAM_WINDOWS_DENIED_PASSWORD
+  ? test
+  : test.skip;
+
+windowsAccessTest('Windows named pipe rejects an independently authenticated local user', async () => {
+  await withSocket(async (path) => {
+    const server = new LocalIpcServer();
+    server.register('echo', async (params) => params);
+    await server.start(path);
+    try {
+      const probe = [
+        "const { createConnection } = require('node:net');",
+        `const socket = createConnection(${JSON.stringify(path)});`,
+        'socket.once(\'connect\', () => process.exit(0));',
+        'socket.once(\'error\', () => process.exit(1));',
+        'setTimeout(() => process.exit(1), 2000).unref();'
+      ].join('');
+      const encodedProbe = Buffer.from(probe).toString('base64');
+      const result = spawnSync('powershell.exe', [
+        '-NoProfile', '-NonInteractive', '-Command',
+        '$credential = [System.Management.Automation.PSCredential]::new($env:AGENT_TEAM_WINDOWS_DENIED_USER, (ConvertTo-SecureString $env:AGENT_TEAM_WINDOWS_DENIED_PASSWORD -AsPlainText -Force));'
+          + `$process = Start-Process -FilePath $env:AGENT_TEAM_NODE -ArgumentList @("-e", "eval(Buffer.from('${encodedProbe}', 'base64').toString())") -Credential $credential -Wait -PassThru;`
+          + 'exit $process.ExitCode'
+      ], {
+        env: {
+          ...process.env,
+          AGENT_TEAM_NODE: process.execPath
+        }
+      });
+      assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`);
+    } finally {
+      await server.stop();
+    }
   });
 });
 

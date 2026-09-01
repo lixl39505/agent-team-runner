@@ -12,10 +12,13 @@ test('daemon reads the durable controller Host/thread and preserves it when adap
   const parent = await mkdtemp(join(tmpdir(), 'agent-team-host-daemon-'));
   const home = resolveAgentTeamHome({ env: { AGENT_TEAM_HOME: join(parent, 'home') } });
   const resumed = [];
+  const transports = {
+    codex: { async resumeExternalThread(request) { resumed.push(request); } }
+  };
   const daemon = new AgentTeamDaemon(home, {
     hostAdapter: new HostAdapter({
-      declarations: { codex: { resumeExternalThread: true } },
-      transports: { codex: { async resumeExternalThread(request) { resumed.push(request); } } }
+      declarations: { codex: { resumeExternalThread: true, startReviewTurn: true } },
+      transports
     })
   });
   daemon.stateDatabase.createRun({
@@ -46,7 +49,15 @@ test('daemon reads the durable controller Host/thread and preserves it when adap
     }]);
     assert.equal((await client.request('controller.start_review_turn', {
       runId: 'run-1', clientId: 'client-1', explicitlyRequested: true
-    })).status, 'undeclared');
+    })).status, 'unavailable');
+    transports.codex.resumeExternalThread = async () => { throw new Error('Host transport unavailable'); };
+    const failed = await client.request('controller.resume_external_thread', {
+      runId: 'run-1', clientId: 'client-1', explicitlyRequested: true
+    });
+    assert.deepEqual(failed, {
+      action: 'resumeExternalThread', host: 'codex', externalThreadId: 'thread-1', attempted: true,
+      status: 'failed', fallback: 'durable_context_and_tui', error: 'Host transport unavailable'
+    });
     assert.deepEqual(daemon.controlPlaneStore.getController('run-1'), {
       runId: 'run-1', host: 'codex', externalThreadId: 'thread-1', clientId: 'client-1',
       status: 'connected', lastAckEventId: null,

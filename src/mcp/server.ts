@@ -7,6 +7,46 @@ import { LocalIpcClient } from '../daemon/ipc.js';
 
 type IpcRequester = Pick<LocalIpcClient, 'request'>;
 
+/** Keeps MCP stdio alive while the independently managed daemon restarts. */
+class ReconnectingIpcRequester implements IpcRequester {
+  private client: LocalIpcClient | undefined;
+  private connecting: Promise<LocalIpcClient> | undefined;
+
+  constructor(private readonly socket: string) {}
+
+  async request(method: string, params?: unknown): Promise<unknown> {
+    try {
+      return await (await this.connectedClient()).request(method, params);
+    } catch (error) {
+      this.reset();
+      throw error;
+    }
+  }
+
+  close(): void {
+    this.reset();
+  }
+
+  private async connectedClient(): Promise<LocalIpcClient> {
+    if (this.client) return this.client;
+    if (this.connecting) return this.connecting;
+    const client = new LocalIpcClient(this.socket);
+    this.connecting = client.connect().then(() => {
+      this.client = client;
+      return client;
+    }).catch((error: unknown) => {
+      client.close();
+      throw error;
+    }).finally(() => { this.connecting = undefined; });
+    return this.connecting;
+  }
+
+  private reset(): void {
+    this.client?.close();
+    this.client = undefined;
+  }
+}
+
 type Interaction = {
   id: string;
   kind: 'approval' | 'agent_question' | 'contract_block';
@@ -324,7 +364,7 @@ async function requestTool(ipc: IpcRequester, method: string, params?: unknown) 
   }
 }
 
-/** Creates the MCP control-plane bridge for an already connected daemon IPC client. */
+/** Creates the MCP control-plane bridge for a daemon IPC requester. */
 export function createMcpServer(ipc: IpcRequester, options: McpGatewayOptions = {}): McpServer {
   const server = new McpServer({ name: 'agent-team', version: '0.1.0' }, { capabilities: { logging: {} } });
   const gateway = new McpGateway(ipc, server, options);
@@ -519,9 +559,8 @@ export function createMcpServer(ipc: IpcRequester, options: McpGatewayOptions = 
 
 /** Connects the stdio MCP bridge to the local agent-team daemon. */
 export async function runMcpServer(home: AgentTeamHome): Promise<void> {
-  const ipc = new LocalIpcClient(home.socket);
+  const ipc = new ReconnectingIpcRequester(home.socket);
   try {
-    await ipc.connect();
     const server = createMcpServer(ipc);
     await server.connect(new StdioServerTransport());
   } catch (error) {

@@ -14,9 +14,12 @@ endpoint 是 `$AGENT_TEAM_HOME/daemon.sock`，Windows 是 `\\.\pipe\agent-team`�
 - `daemon.lock` 和 `daemon.json` 记录 PID、启动时间和协议版本。存活 PID 的 lock
   会拒绝第二个 daemon；死 PID 或损坏的 lock 会被替换。
 - IPC socket 权限在 Unix-like 平台被限制为 `0600`。不要共享、移动或手工改写 socket。
-- Windows 使用 Node 创建的 `\\.\pipe\agent-team` named pipe；它由当前登录用户的
-  Windows security token 创建。CI 的 Windows job 会运行同一 IPC 生命周期测试，但跨账户
-  ACL 审计仍需在目标 Windows 部署策略中单独确认。
+- Windows 使用 Node 创建的 `\\.\pipe\agent-team` named pipe。监听完成后立即通过
+  `SetSecurityInfo` 将 DACL 替换为仅 object owner（daemon 所在当前 OS 用户）的完全访问；
+  Windows CI 也会以独立的非特权本地账户验证连接被拒绝。管理员、`LocalSystem` 等可取得
+  ownership 的特权主体不在此隔离边界内。
+- Node 不允许在 `CreateNamedPipe` 时传入安全描述符，因此 bind 到 DACL 修补之间存在极短
+  TOCTOU 窗口。DACL 修补失败会使 daemon 启动失败；不要将该实现视为可抵御本机特权对手。
 - `agent-team start`、`agent-team attach` 和 MCP gateway 都只是客户端。离开 Inbox、
   断开 MCP 或关闭终端不会停止 daemon 或取消已提交的 run。
 - 通过 `SIGINT` 或 `SIGTERM` 停止 daemon 时，活跃执行收到 abort，持久状态转为

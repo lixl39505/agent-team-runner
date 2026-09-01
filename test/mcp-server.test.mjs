@@ -310,8 +310,8 @@ test('MCP bridge rejects unknown and invalid Zod tool input before IPC', async (
   }
 });
 
-test('runMcpServer closes its IPC client when daemon connection fails', async () => {
-  await assert.rejects(runMcpServer({
+test('runMcpServer starts stdio while its daemon is unavailable', async () => {
+  await runMcpServer({
     root: '/tmp/agent-team-missing',
     stateDb: '/tmp/agent-team-missing/state.sqlite',
     daemonLock: '/tmp/agent-team-missing/daemon.lock',
@@ -320,7 +320,7 @@ test('runMcpServer closes its IPC client when daemon connection fails', async ()
     runsDir: '/tmp/agent-team-missing/runs',
     worktreesDir: '/tmp/agent-team-missing/worktrees',
     preflightDir: '/tmp/agent-team-missing/preflight'
-  }), /IPC connection error/);
+  });
 });
 
 test('MCP gateway sends standard logging notifications from durable run events', async () => {

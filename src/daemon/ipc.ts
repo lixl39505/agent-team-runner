@@ -13,6 +13,12 @@ function isNamedPipe(path: string): boolean {
   return path.startsWith('\\\\.\\pipe\\');
 }
 
+async function restrictNamedPipeToOwner(path: string): Promise<void> {
+  if (!isNamedPipe(path)) return;
+  const { restrictWindowsNamedPipeToOwner } = await import('./windows-named-pipe.js');
+  restrictWindowsNamedPipeToOwner(path);
+}
+
 async function removeSocket(path: string): Promise<void> {
   // Named pipes are kernel objects, not filesystem entries.
   /* istanbul ignore next -- exercised on Windows */
@@ -48,6 +54,9 @@ export class LocalIpcServer {
     await removeSocket(path);
 
     const server = createServer((socket) => this.handleConnection(socket));
+    // Unix domain socket mode is set at bind time. Keep the process umask restrictive
+    // through listen so there is no externally accessible bind-to-chmod interval.
+    const previousUmask = isNamedPipe(path) ? undefined : process.umask(0o177);
     try {
       await new Promise<void>((resolve, reject) => {
         const onError = (error: Error) => {
@@ -60,11 +69,16 @@ export class LocalIpcServer {
           resolve();
         });
       });
-      // Unix domain sockets inherit the process umask. Restrict the control plane even when it is permissive.
+      // Node creates Windows named pipes with its default DACL. Repair it before
+      // publishing the server, and fail closed if the platform ACL cannot be set.
+      await restrictNamedPipeToOwner(path);
+      // Defend against platform behavior that ignores the creation umask.
       if (!isNamedPipe(path)) await chmod(path, 0o600);
     } catch (error) {
       server.close();
       throw error;
+    } finally {
+      if (previousUmask !== undefined) process.umask(previousUmask);
     }
 
     this.server = server;

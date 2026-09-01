@@ -18,7 +18,20 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "agent-team-denied-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $password = "$(New-Guid)Aa1!"
+          New-LocalUser -Name $name -Password (ConvertTo-SecureString $password -AsPlainText -Force) -AccountNeverExpires | Out-Null
+          "AGENT_TEAM_WINDOWS_DENIED_USER=.\\$name" >> $env:GITHUB_ENV
+          "AGENT_TEAM_WINDOWS_DENIED_PASSWORD=$password" >> $env:GITHUB_ENV
+          "AGENT_TEAM_WINDOWS_DENIED_ACCOUNT=$name" >> $env:GITHUB_ENV
+          "::add-mask::$password"
       - run: npm ci
       - run: npm test
+      - if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: Remove-LocalUser -Name $env:AGENT_TEAM_WINDOWS_DENIED_ACCOUNT -ErrorAction SilentlyContinue
       - if: matrix.os == 'ubuntu-latest'
         run: npm run test:coverage

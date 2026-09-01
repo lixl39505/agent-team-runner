@@ -283,6 +283,7 @@ export class AgentTeamDaemon {
   private metadata: DaemonMetadata | undefined;
   private running = false;
   private stopping: Promise<void> | undefined;
+  private controllerLeaseTimer: NodeJS.Timeout | undefined;
   private controlPlaneStoreClosed = false;
   private projectRegistryClosed = false;
   private stateDatabaseClosed = false;
@@ -696,6 +697,11 @@ export class AgentTeamDaemon {
       this.stateDatabase.releaseExpiredExecutionLeases();
       this.controlPlaneStore.releaseExpiredControllerLeases();
       this.controlPlaneStore.requeueDisconnectedControllerInteractions();
+      this.controllerLeaseTimer = setInterval(() => {
+        this.controlPlaneStore.releaseExpiredControllerLeases();
+        this.controlPlaneStore.requeueDisconnectedControllerInteractions();
+      }, 1000);
+      this.controllerLeaseTimer.unref();
       const waitingRunIds = this.stateDatabase.listRuns()
         .filter((run) => this.isAutomaticallySchedulable(run))
         .map((run) => run.id);
@@ -719,6 +725,8 @@ export class AgentTeamDaemon {
     this.running = false;
     const stopping = (async () => {
       try {
+        if (this.controllerLeaseTimer) clearInterval(this.controllerLeaseTimer);
+        this.controllerLeaseTimer = undefined;
         const activeRuns = [...this.activeRuns.values()];
         for (const [runId, activeRun] of this.activeRuns) {
           this.stateDatabase.updateRun(runId, { runtimeState: 'recovering' });

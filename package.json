@@ -32,6 +32,7 @@
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@opencode-ai/sdk": "1.18.21",
     "cross-spawn": "^7.0.6",
+    "koffi": "^3.1.6",
     "yaml": "^2.9.0",
     "zod": "^4.4.3"
   },

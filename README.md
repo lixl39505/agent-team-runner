@@ -46,7 +46,10 @@ slot. `tui.color` controls ANSI styling in `agent-team attach` (`auto`,
 only; this version does not automatically delete run logs or artifacts.
 
 The IPC endpoint remains fixed to `$AGENT_TEAM_HOME/daemon.sock` on Unix-like
-platforms and `\\.\pipe\agent-team` on Windows. Socket path configuration is
+platforms and `\\.\pipe\agent-team` on Windows. Windows immediately replaces
+the pipe DACL with owner-only access after creation; this necessarily leaves a
+small creation-to-repair TOCTOU window because Node does not expose pipe
+security attributes. Socket path configuration is
 not supported.
 
 ## Legacy Migration
