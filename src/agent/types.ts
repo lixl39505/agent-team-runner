@@ -38,6 +38,7 @@ export interface AgentCapabilities {
 export type AgentEvent =
   | { type: 'activity' }
   | { type: 'session'; sessionId: string }
+  | { type: 'session-status'; status: 'idle' | 'busy' | 'error' }
   | { type: 'message'; text: string }
   | { type: 'tool-call'; tool: string; input: unknown }
   | { type: 'tool-result'; tool: string; ok: boolean; summary?: string }

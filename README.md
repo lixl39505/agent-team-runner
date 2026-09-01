@@ -6,7 +6,7 @@ An outer controller owns those decisions and submits an explicit contract.
 
 ## Control Plane
 
-Start the local daemon and connect the MCP bridge:
+Start or connect to the local daemon; `start` then opens the Inbox and `mcp` connects the MCP bridge:
 
 ```sh
 agent-team start
@@ -15,6 +15,9 @@ agent-team mcp
 
 The daemon stores projects, policy revisions, runs, interactions, controller
 ownership, and events below `$AGENT_TEAM_HOME` (or the platform default).
+`start` reuses a reachable daemon or launches `agent-team-daemon` as a detached
+child, waits for its IPC endpoint, then opens the same Inbox as `attach`.
+Detaching that Inbox never stops the daemon or submitted runs.
 
 ## Daemon Bootstrap Configuration
 
@@ -76,6 +79,38 @@ MCP exposes only fixed control-plane tools. A controller can:
 4. Validate or revise a blocked run's contract, then start or cancel an eligible run.
 5. Retrieve the durable handoff after an execution completes.
 
+### MCP Notifications And Elicitation
+
+The stdio gateway consumes the daemon's durable event stream and emits standard
+MCP `notifications/message` logging notifications with logger
+`agent-team.run`. Lifecycle updates use a `data` payload shaped as
+`{ type: "run.status", runId, status, eventId, eventType, createdAt }`.
+When the durable handoff has been written, it emits only
+`{ type: "run.completed", handoff: { runId, available: true } }`; it never
+places the handoff body, task data, contract, or local path in that notification.
+Use `agent_team_get_handoff` to retrieve the durable handoff.
+
+These notifications are best-effort connection updates, not a replacement for
+the durable `agent_team_read_run_events` cursor. The gateway uses only standard
+MCP logging notifications rather than a private notification extension, so a
+Host must surface MCP logging messages to display them.
+
+After `agent_team_attach_controller`, the gateway checks the initialized
+client's `capabilities.elicitation.form`. A client that declares form support
+can receive standard server-initiated `elicitation/create` forms for queued
+approvals and non-sensitive agent questions. The gateway claims the interaction
+before eliciting and answers it with a stable idempotency key only after a valid
+response. It serializes forms one at a time. `contract_block` is deliberately
+never elicited: revise it through the normal controller/TUI contract workflow.
+
+MCP form elicitation cannot safely represent secret questions or arbitrary
+nested/array values; approval forms deliberately omit tool input and
+backend-provided detail. Secret questions, malformed or unsupported questions,
+clients without form capability, cancelled/failed elicitation, and client
+disconnects remain queued or are requeued for `agent-team attach`. Closing the
+MCP connection also stops its single polling timer, requeues interactions it
+claimed, and releases its controller leases, so attach can take over immediately.
+
 `execution.submit` creates a planned run and schedules it in the daemon. The
 daemon recreates its runtime configuration from the project's pinned policy
 revision, so a restart does not depend on the MCP client's process.
@@ -94,16 +129,31 @@ It requeues claimed interactions and releases the controller when it exits.
 
 Without a run ID, a TTY shows registered projects and their runs; use Up/Down
 and Enter to attach, or `q`/Ctrl-C to leave. In an attached dashboard, Up/Down
-select an agent, `a` answers the next Inbox interaction, and `l` reads and renders
-a bounded tail of the selected agent's daemon-recorded log. If that log is
+select an agent; Enter or `a` answers the next Inbox interaction; `d` denies the
+next queued approval; `l` reads a bounded tail of the selected agent's
+daemon-recorded log; and `f` toggles refreshing that tail each poll. If that log is
 unavailable, the dashboard shows that agent's durable event history instead. The
-attach UI is keyboard-only and does
-not provide mouse support or complete MCP elicitation handling. Without a TTY,
-omitting the ID prints the available project/run list and does not attach.
+attach UI enables SGR terminal mouse clicks for run and agent selection only when
+both streams are TTYs and `$TERM` identifies a known VT-compatible terminal. It
+does not enable mouse handling for unknown terminals, multiplexers with disabled
+mouse forwarding, or terminals that do not support SGR mouse sequences. Keyboard
+controls remain available everywhere. Without a TTY, omitting the ID prints the
+available project/run list and does not attach; `start` still leaves its daemon
+running and safely falls back to that listing.
 
 Events are replayed from a durable cursor. The client acknowledges an event
 cursor only after it has rendered the prior batch, so an interrupted attach
 session can safely replay events.
+
+`controller.attach` keeps its controller fields and `execution` snapshot, and
+now supplies a reconnect context in that snapshot: `contract`, `run`, `tasks`,
+`agentExecutions`, replayed `events` and `lastEventId`, all `interactions`,
+`blockers` (blocked tasks plus queued or claimed interactions), `handoff` (or
+`null`) and `handoffAvailable`, and `agentLogs`. Each `agentLogs` entry is
+either `{ agentId, status: "available", tail }` or `{ agentId, status:
+"unavailable", reason }`. The tail is read with the same bounded,
+daemon-recorded-path checks as `execution.agent_log`; attach accepts no path
+parameter.
 
 The daemon exposes `execution.agent_log` for controlled log fallback. It accepts
 only `runId`, `agentId`, optional `maxLines` (1-200), and optional `maxBytes`

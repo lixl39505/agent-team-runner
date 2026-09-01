@@ -23,6 +23,10 @@ import { parseAgentJson } from '../parse.js';
 // 上游破坏性变更在 `npm run check` 时直接变成编译错误——升级流程见 gen:codex。
 import type { ThreadStartParams } from './protocol/v2/ThreadStartParams.js';
 import type { ThreadStartResponse } from './protocol/v2/ThreadStartResponse.js';
+import type { ThreadResumeParams } from './protocol/v2/ThreadResumeParams.js';
+import type { ThreadResumeResponse } from './protocol/v2/ThreadResumeResponse.js';
+import type { ThreadStatusChangedNotification } from './protocol/v2/ThreadStatusChangedNotification.js';
+import type { ThreadStatus } from './protocol/v2/ThreadStatus.js';
 import type { TurnStartParams } from './protocol/v2/TurnStartParams.js';
 import type { Turn } from './protocol/v2/Turn.js';
 import type { TurnCompletedNotification } from './protocol/v2/TurnCompletedNotification.js';
@@ -77,7 +81,7 @@ interface TurnRecord {
  */
 export class CodexBackend implements AgentBackend {
   readonly id: BackendId = 'codex';
-  readonly capabilities = { maxTurns: false, resumeSession: false };
+  readonly capabilities = { maxTurns: false, resumeSession: true };
   private connection: JsonRpcConnection | null = null;
   private initialized = false;
   private initPromise: Promise<void> | null = null;
@@ -188,13 +192,20 @@ export class CodexBackend implements AgentBackend {
     if (!platform.ok) throw new Error(platform.detail);
     await this.ensureServer();
     const compiled = compileCodex(spec.access, spec.cwd);
-    const params: ThreadStartParams = {
-      cwd: spec.cwd,
-      ...(spec.model !== undefined ? { model: spec.model } : {}),
-      approvalPolicy: compiled.approvalPolicy,
-      sandbox: compiled.sandboxPolicy.type === 'readOnly' ? 'read-only' : 'workspace-write'
-    };
-    const response = await this.connection!.request('thread/start', params, 30_000) as ThreadStartResponse;
+    const response = spec.resumeSessionId === undefined
+      ? await this.connection!.request('thread/start', {
+        cwd: spec.cwd,
+        ...(spec.model !== undefined ? { model: spec.model } : {}),
+        approvalPolicy: compiled.approvalPolicy,
+        sandbox: compiled.sandboxPolicy.type === 'readOnly' ? 'read-only' : 'workspace-write'
+      } satisfies ThreadStartParams, 30_000) as ThreadStartResponse
+      : await this.connection!.request('thread/resume', {
+        threadId: spec.resumeSessionId,
+        cwd: spec.cwd,
+        ...(spec.model !== undefined ? { model: spec.model } : {}),
+        approvalPolicy: compiled.approvalPolicy,
+        sandbox: compiled.sandboxPolicy.type === 'readOnly' ? 'read-only' : 'workspace-write'
+      } satisfies ThreadResumeParams, 30_000) as ThreadResumeResponse;
     const threadId = response.thread.id;
     const session = new CodexAgentSession(
       this.connection!, threadId, spec, compiled,
@@ -217,6 +228,11 @@ export class CodexBackend implements AgentBackend {
   }
 
   handleNotification(method: string, params: unknown): void {
+    if (method === 'thread/status/changed') {
+      const record = params as ThreadStatusChangedNotification;
+      this.sessions.get(record.threadId)?.onSessionStatus(mapCodexThreadStatus(record.status));
+      return;
+    }
     if (method === 'turn/completed') {
       const record = params as TurnCompletedNotification;
       this.sessions.get(record.threadId)?.onTurnCompleted(record.turn);
@@ -527,6 +543,10 @@ class CodexAgentSession implements AgentSession {
     this.spec.onEvent?.({ type: 'activity' });
   }
 
+  onSessionStatus(status: 'idle' | 'busy' | 'error'): void {
+    this.spec.onEvent?.({ type: 'session-status', status });
+  }
+
   onUsage(usage: { inputTokens?: number | undefined; outputTokens?: number | undefined }): void {
     this.state.tokenUsage = usage;
     this.spec.onEvent?.({
@@ -633,6 +653,11 @@ class CodexAgentSession implements AgentSession {
       return 'deny';
     }
   }
+}
+
+export function mapCodexThreadStatus(status: ThreadStatus): 'idle' | 'busy' | 'error' {
+  if (status.type === 'idle') return 'idle';
+  return status.type === 'active' ? 'busy' : 'error';
 }
 
 export function codexDecision(decision: ApprovalDecision): 'accept' | 'acceptForSession' | 'decline' {

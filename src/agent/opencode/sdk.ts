@@ -65,7 +65,7 @@ interface OpenCodeMessage {
  */
 export class OpenCodeBackend implements AgentBackend {
   readonly id: BackendId = 'opencode';
-  readonly capabilities = { maxTurns: false, resumeSession: false };
+  readonly capabilities = { maxTurns: false, resumeSession: true };
   private clientPromise: Promise<OpencodeClient> | null = null;
   private questionClient: OpencodeV2Client | null = null;
   private serverChild: ChildProcess | null = null;
@@ -176,12 +176,9 @@ export class OpenCodeBackend implements AgentBackend {
     if (!platform.ok) throw new Error(platform.detail);
     const client = await this.ensureClient();
     await this.ensureSubscribed(client);
-    const created = await client.session.create({
-      query: { directory: spec.cwd },
-      body: { title: `agent-team ${spec.role}` }
-    });
-    const sessionId = created.data?.id;
-    if (!sessionId) throw new Error('opencode session creation returned no id');
+    const sessionId = spec.resumeSessionId === undefined
+      ? await this.createSession(client, spec)
+      : await this.resumeSession(client, spec);
     const session = new OpenCodeAgentSession(
       client, this.questionClient!, sessionId, spec, compileOpenCode(spec.access),
       () => this.sessions.delete(sessionId)
@@ -197,6 +194,40 @@ export class OpenCodeBackend implements AgentBackend {
     }
     spec.onEvent?.({ type: 'session', sessionId });
     return session;
+  }
+
+  private async createSession(client: OpencodeClient, spec: SessionSpec): Promise<string> {
+    const created = await client.session.create({
+      query: { directory: spec.cwd },
+      body: { title: `agent-team ${spec.role}` }
+    });
+    const sessionId = created.data?.id;
+    if (!sessionId) throw new Error('opencode session creation returned no id');
+    return sessionId;
+  }
+
+  private async resumeSession(client: OpencodeClient, spec: SessionSpec): Promise<string> {
+    const sessionId = spec.resumeSessionId!;
+    let existing: Awaited<ReturnType<typeof client.session.get>>;
+    try {
+      existing = await client.session.get({ path: { id: sessionId }, query: { directory: spec.cwd } });
+    } catch (error) {
+      throw new Error(`opencode resume session "${sessionId}" could not be read: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!existing.data) throw new Error(`opencode resume session "${sessionId}" was not found or is unreadable`);
+    if (existing.data.directory !== spec.cwd) {
+      throw new Error(`opencode resume session "${sessionId}" directory does not match requested cwd`);
+    }
+    let statuses: Awaited<ReturnType<typeof client.session.status>>;
+    try {
+      statuses = await client.session.status({ query: { directory: spec.cwd } });
+    } catch (error) {
+      throw new Error(`opencode resume session "${sessionId}" status could not be read: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const status = statuses.data?.[sessionId];
+    if (!status) throw new Error(`opencode resume session "${sessionId}" status is unavailable`);
+    if (status.type !== 'idle') throw new Error(`opencode resume session "${sessionId}" is not idle (${status.type})`);
+    return sessionId;
   }
 
   handleEvent(event: { type?: string; properties?: Record<string, unknown> }): void {
@@ -225,6 +256,14 @@ export class OpenCodeBackend implements AgentBackend {
     }
     if (!sessionId) return;
     const session = this.sessions.get(sessionId);
+    if (event.type === 'session.idle') {
+      session?.onSessionStatus('idle');
+      return;
+    }
+    if (event.type === 'session.status') {
+      session?.onSessionStatus(mapOpenCodeSessionStatus(properties.status));
+      return;
+    }
     if (event.type === 'message.updated' || event.type === 'message.part.updated') {
       const part = eventPart(properties);
       if (part.text) session?.onMessage(part.text);
@@ -525,6 +564,10 @@ ${JSON.stringify(this.spec.schema)}`;
     this.spec.onEvent?.({ type: 'activity' });
   }
 
+  onSessionStatus(status: 'idle' | 'busy' | 'error'): void {
+    this.spec.onEvent?.({ type: 'session-status', status });
+  }
+
   onMessage(text: string): void {
     this.spec.onEvent?.({ type: 'message', text });
   }
@@ -639,6 +682,13 @@ function eventPart(properties: Record<string, unknown>): OpenCodeMessagePart {
   return candidate && typeof candidate === 'object'
     ? candidate as OpenCodeMessagePart
     : properties as OpenCodeMessagePart;
+}
+
+export function mapOpenCodeSessionStatus(status: unknown): 'idle' | 'busy' | 'error' {
+  if (!status || typeof status !== 'object') return 'error';
+  const type = (status as { type?: unknown }).type;
+  if (type === 'idle') return 'idle';
+  return type === 'busy' || type === 'retry' ? 'busy' : 'error';
 }
 
 function openCodeApprovalKind(type: string): 'command' | 'file-change' | 'network' | 'external-directory' | 'tool' {

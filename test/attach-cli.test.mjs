@@ -203,6 +203,103 @@ test('attach rejects session approval when it is not allowed and refreshes after
   assert.equal(calls.some(([name]) => name === 'interaction.requeue_client'), true);
 });
 
+test('attach maps Enter to Inbox answers, d to approval denial, and f to repeated log tails', async () => {
+  const interaction = { id: 'approval', status: 'queued', kind: 'approval', request: { allowSession: true } };
+  const { client, calls } = clientFor([interaction]);
+  client.request = async (method, params) => {
+    calls.push([method, params]);
+    if (method === 'execution.events') return { events: [], lastEventId: 0 };
+    if (method === 'execution.get') {
+      return { run: { status: 'running' }, tasks: [], agentExecutions: [{ agentId: 'agent-1', role: 'worker', backend: 'codex', status: 'running' }] };
+    }
+    if (method === 'interaction.list') return [interaction];
+    if (method === 'interaction.claim') return {};
+    if (method === 'execution.agent_log') return { agentId: 'agent-1', content: 'tail' };
+    return {};
+  };
+  const keyboard = input();
+  let sleeps = 0;
+  await runAttachCli(['run-1'], {
+    resolveHome: () => home,
+    createClient: () => client,
+    input: keyboard,
+    output: output(true),
+    randomUUID: () => 'client-1',
+    ask: async () => 'o',
+    registerSignal: (_signal, listener) => { client.stop = listener; },
+    sleep: async () => {
+      sleeps += 1;
+      if (sleeps === 1) keyboard.write('\r');
+      else if (sleeps === 2) keyboard.write('d');
+      else if (sleeps === 3) keyboard.write('f');
+      else if (sleeps === 5) client.stop();
+    }
+  });
+  assert.equal(calls.filter(([name]) => name === 'interaction.answer').some(([, params]) => params.response === 'once'), true);
+  assert.equal(calls.filter(([name]) => name === 'interaction.answer').some(([, params]) => params.response === 'deny'), true);
+  assert.equal(calls.filter(([name]) => name === 'execution.agent_log').length >= 2, true);
+});
+
+test('attach accepts SGR mouse clicks for run and agent selection when the terminal advertises support', async () => {
+  const previousTerm = process.env.TERM;
+  process.env.TERM = 'xterm-256color';
+  try {
+    const calls = [];
+    const keyboard = input();
+    let stop;
+    let sleeps = 0;
+    const client = {
+      connect: async () => {
+        setImmediate(() => {
+          keyboard.write('\x1b[<0;10;5M');
+          keyboard.write('\r');
+        });
+      },
+      close: () => {},
+      request: async (method, params) => {
+        calls.push([method, params]);
+        if (method === 'project.list') return [{ id: 'project-1', displayName: 'Project One' }];
+        if (method === 'execution.list') return [
+          { id: 'run-1', projectId: 'project-1', status: 'running' },
+          { id: 'run-2', projectId: 'project-1', status: 'running' }
+        ];
+        if (method === 'execution.events') return { events: [], lastEventId: 0 };
+        if (method === 'execution.get') {
+          return {
+            run: { status: 'running' }, tasks: [],
+            agentExecutions: [
+              { agentId: 'agent-1', role: 'worker', backend: 'codex', status: 'running' },
+              { agentId: 'agent-2', role: 'reviewer', backend: 'codex', status: 'running' }
+            ]
+          };
+        }
+        if (method === 'interaction.list') return [];
+        if (method === 'execution.agent_log') return { agentId: params.agentId, content: 'tail' };
+        return {};
+      }
+    };
+    await runAttachCli([], {
+      resolveHome: () => home,
+      createClient: () => client,
+      input: keyboard,
+      output: output(true),
+      randomUUID: () => 'client-1',
+      registerSignal: (_signal, listener) => { stop = listener; },
+      sleep: async () => {
+        sleeps += 1;
+        if (sleeps === 1) keyboard.write('\x1b[<0;100;5M');
+        else if (sleeps === 2) keyboard.write('l');
+        else stop();
+      }
+    });
+    assert.deepEqual(calls.find(([name]) => name === 'controller.attach')?.[1].runId, 'run-2');
+    assert.deepEqual(calls.find(([name]) => name === 'execution.agent_log')?.[1], { runId: 'run-2', agentId: 'agent-2' });
+  } finally {
+    if (previousTerm === undefined) delete process.env.TERM;
+    else process.env.TERM = previousTerm;
+  }
+});
+
 test('attach parses optional run IDs and validates options', async () => {
   assert.deepEqual(attachArguments([], () => home), { home });
   assert.deepEqual(attachArguments(['run-1'], () => home), { runId: 'run-1', home });

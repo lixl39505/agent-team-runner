@@ -505,7 +505,10 @@ async function integrateRun(input: {
   db.addEvent(runId, null, 'INTEGRATION_STARTED');
   const repoName = safeSegment(basename(config.workspace.repoRoot));
   const worktree = join(config.workspace.worktreesDir, repoName, safeSegment(runId), 'integration');
-  const branch = `${config.workspace.branchPrefix}/${safeSegment(runId)}/integration`;
+  const contractBranch = typeof run.executionContractJson === 'string'
+    ? (JSON.parse(run.executionContractJson) as { target?: { integrationBranch?: string } }).target?.integrationBranch
+    : undefined;
+  const branch = contractBranch ?? `${config.workspace.branchPrefix}/${safeSegment(runId)}/integration`;
   await resetWorktree({ repoRoot: config.workspace.repoRoot, path: worktree, branch, baseSha: run.baseSha });
   db.updateRun(runId, { integrationBranch: branch, integrationWorktree: worktree });
   const runDir = join(config.workspace.stateDir, 'runs', runId);

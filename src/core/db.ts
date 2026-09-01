@@ -468,6 +468,22 @@ export class StateDatabase {
     `).all(runId, afterEventId, limit) as Record<string, unknown>[]).map(mapEvent);
   }
 
+  /** Reads the daemon-wide durable event stream without advancing any controller cursor. */
+  listEventsSince(afterEventId = 0, limit = 100): RunEventRecord[] {
+    if (!Number.isSafeInteger(afterEventId) || afterEventId < 0) {
+      throw new Error('afterEventId must be a non-negative integer');
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      throw new Error('limit must be an integer between 1 and 1000');
+    }
+    return (this.db.prepare(`
+      SELECT * FROM events
+      WHERE id > ?
+      ORDER BY id ASC
+      LIMIT ?
+    `).all(afterEventId, limit) as Record<string, unknown>[]).map(mapEvent);
+  }
+
   startAgentExecution(input: {
     runId: string; agentId: string; taskId?: string | undefined; role: string; backend: string; model?: string | undefined; logPath: string;
   }): void {

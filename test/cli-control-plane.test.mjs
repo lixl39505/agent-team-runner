@@ -4,14 +4,15 @@ import { test, vi } from 'vitest';
 vi.mock('../src/daemon-cli.ts', () => ({ runDaemonCli: vi.fn() }));
 vi.mock('../src/mcp-cli.ts', () => ({ runMcpCli: vi.fn() }));
 vi.mock('../src/attach-cli.ts', () => ({ runAttachCli: vi.fn() }));
+vi.mock('../src/start-cli.ts', () => ({ runStartCli: vi.fn() }));
 
-const { runDaemonCli } = await import('../src/daemon-cli.ts');
 const { runMcpCli } = await import('../src/mcp-cli.ts');
 const { runAttachCli } = await import('../src/attach-cli.ts');
+const { runStartCli } = await import('../src/start-cli.ts');
 const { runCli } = await import('../src/cli.ts');
 
 test('runCli delegates control-plane commands without parsing their arguments', async () => {
-  runDaemonCli.mockClear();
+  runStartCli.mockClear();
   runMcpCli.mockClear();
   runAttachCli.mockClear();
 
@@ -19,7 +20,7 @@ test('runCli delegates control-plane commands without parsing their arguments', 
   await runCli(['mcp', '--home', '/tmp/mcp', '--unknown']);
   await runCli(['attach', 'run-1', '--home', '/tmp/attach']);
 
-  assert.deepEqual(runDaemonCli.mock.calls, [[['--home', '/tmp/daemon', '-c', 'roles.worker=codex']]]);
+  assert.deepEqual(runStartCli.mock.calls, [[['--home', '/tmp/daemon', '-c', 'roles.worker=codex']]]);
   assert.deepEqual(runMcpCli.mock.calls, [[['--home', '/tmp/mcp', '--unknown']]]);
   assert.deepEqual(runAttachCli.mock.calls, [[['run-1', '--home', '/tmp/attach']]]);
 });

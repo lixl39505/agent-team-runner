@@ -194,7 +194,8 @@ test('AgentTeamDaemon exposes control-plane operations through LocalIpcClient', 
     });
     for (const id of ['run-1', 'run-2']) {
       daemon.stateDatabase.createRun({
-        id, repoRoot: '/repo', goalFile: '<test>', baseRef: 'HEAD', baseSha: 'base', adapter: 'test'
+        id, repoRoot: '/repo', goalFile: '<test>', baseRef: 'HEAD', baseSha: 'base', adapter: 'test',
+        projectId: id === 'run-1' ? 'project-a' : 'project-b'
       });
     }
     await daemon.start();
@@ -253,6 +254,8 @@ test('AgentTeamDaemon exposes control-plane operations through LocalIpcClient', 
       const disconnected = await client.request('controller.disconnect', { runId: 'run-1', clientId: 'client-a' });
       assert.equal(disconnected.status, 'disconnected');
       assert.deepEqual(await client.request('controller.reconnectable'), [disconnected]);
+      assert.deepEqual(await client.request('controller.reconnectable', { projectId: 'project-a' }), [disconnected]);
+      assert.deepEqual(await client.request('controller.reconnectable', { projectId: 'project-b' }), []);
 
       await assert.rejects(client.request('interaction.list', null), /params must be an object/);
       await assert.rejects(client.request('interaction.list', []), /params must be an object/);
@@ -271,6 +274,95 @@ test('AgentTeamDaemon exposes control-plane operations through LocalIpcClient', 
         interaction.id, foreignInteraction.id
       ].sort());
       store.close();
+    }
+  });
+});
+
+test('AgentTeamDaemon attach returns a complete safe reconnect context', async () => {
+  await withHome(async (home) => {
+    const daemon = new AgentTeamDaemon(home);
+    const runId = 'reconnect-run';
+    const contract = executionContract({ id: 'project-a' }, '/repo');
+    const logPath = join(home.runsDir, runId, 'logs', 'worker.log');
+    const missingLogPath = join(home.runsDir, runId, 'logs', 'missing.log');
+    const escapedLogPath = join(home.runsDir, runId, 'logs', 'escaped.log');
+    const outsidePath = join(home.root, 'outside.log');
+    daemon.stateDatabase.createRun({
+      id: runId,
+      repoRoot: '/repo',
+      goalFile: 'goal.md',
+      baseRef: 'HEAD',
+      baseSha: 'base',
+      projectId: 'project-a',
+      executionContractJson: JSON.stringify(contract),
+      adapter: 'external'
+    });
+    daemon.stateDatabase.insertTask(runId, contract.tasks[0]);
+    daemon.stateDatabase.updateTask(runId, 'T001', { status: 'blocked_on_contract' });
+    daemon.stateDatabase.updateRun(runId, { status: 'needs_attention', runtimeState: 'waiting_interaction' });
+    daemon.stateDatabase.addEvent(runId, 'T001', 'TASK_BLOCKED', { reason: 'Needs a decision.' });
+    await mkdir(dirname(logPath), { recursive: true });
+    await writeFile(logPath, 'first line\nlast line\n', 'utf8');
+    await writeFile(outsidePath, 'must not be read\n', 'utf8');
+    await symlink(outsidePath, escapedLogPath);
+    daemon.stateDatabase.startAgentExecution({
+      runId, agentId: 'worker', taskId: 'T001', role: 'worker', backend: 'codex', logPath
+    });
+    daemon.stateDatabase.startAgentExecution({
+      runId, agentId: 'missing', taskId: 'T001', role: 'worker', backend: 'codex', logPath: missingLogPath
+    });
+    daemon.stateDatabase.startAgentExecution({
+      runId, agentId: 'escaped', taskId: 'T001', role: 'worker', backend: 'codex', logPath: escapedLogPath
+    });
+    const queued = daemon.controlPlaneStore.queueInteraction({
+      runId, taskId: 'T001', agentId: 'worker', kind: 'contract_block', request: { reason: 'Need scope.' }
+    });
+    const claimed = daemon.controlPlaneStore.queueInteraction({
+      runId, taskId: 'T001', agentId: 'worker', kind: 'approval', request: { command: 'npm test' }
+    });
+    daemon.controlPlaneStore.claimInteraction(claimed.id, 'other-client');
+    await writeFile(join(home.runsDir, runId, 'handoff.json'), JSON.stringify({ version: 1, summary: 'Continue from this state.' }), 'utf8');
+    await daemon.start();
+    const client = new LocalIpcClient(home.socket);
+    try {
+      await client.connect();
+      const attached = await client.request('controller.attach', {
+        runId, host: 'host-a', externalThreadId: 'thread-a', clientId: 'client-a', lastAckEventId: 0
+      });
+
+      assert.deepEqual(attached.execution.contract, contract);
+      assert.equal(attached.execution.run.status, 'needs_attention');
+      assert.equal(attached.execution.run.runtimeState, 'waiting_interaction');
+      assert.deepEqual(attached.execution.tasks.map((task) => [task.taskId, task.status]), [['T001', 'blocked_on_contract']]);
+      assert.deepEqual(attached.execution.agentExecutions.map((agent) => [agent.agentId, agent.status]).sort(), [
+        ['escaped', 'running'], ['missing', 'running'], ['worker', 'running']
+      ]);
+      assert.deepEqual(attached.execution.events.map((event) => event.eventType), ['RUN_CREATED', 'TASK_CREATED', 'TASK_BLOCKED']);
+      assert.equal(attached.execution.lastEventId, attached.execution.events.at(-1).id);
+      assert.deepEqual(attached.execution.blockers.tasks.map((task) => task.taskId), ['T001']);
+      assert.deepEqual(attached.execution.blockers.interactions.map((interaction) => interaction.id).sort(), [queued.id, claimed.id].sort());
+      assert.deepEqual(attached.execution.interactions.map((interaction) => interaction.status).sort(), ['claimed', 'queued']);
+      assert.equal(attached.execution.handoffAvailable, true);
+      assert.deepEqual(attached.execution.handoff, { version: 1, summary: 'Continue from this state.' });
+
+      const logs = new Map(attached.execution.agentLogs.map((entry) => [entry.agentId, entry]));
+      assert.deepEqual(logs.get('worker'), {
+        agentId: 'worker',
+        status: 'available',
+        tail: { runId, agentId: 'worker', content: 'first line\nlast line', lineCount: 2, byteCount: 21, truncated: false }
+      });
+      assert.equal(logs.get('missing').status, 'unavailable');
+      assert.match(logs.get('missing').reason, /does not exist: reconnect-run\/missing/);
+      assert.equal(logs.get('escaped').status, 'unavailable');
+      assert.match(logs.get('escaped').reason, /outside the managed run directory/);
+      assert.equal(logs.get('escaped').reason.includes('must not be read'), false);
+
+      await assert.rejects(client.request('controller.attach', {
+        runId, host: 'host-a', clientId: 'client-a', path: outsidePath
+      }), /unknown field/);
+    } finally {
+      client.close();
+      await daemon.stop();
     }
   });
 });

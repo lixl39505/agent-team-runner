@@ -1,15 +1,25 @@
 import assert from 'node:assert/strict';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { ElicitRequestSchema, LoggingMessageNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import { test } from 'vitest';
 import { createMcpServer, runMcpServer } from '../src/mcp/server.ts';
 
-async function createConnectedServer(request) {
-  const server = createMcpServer({ request });
-  const client = new Client({ name: 'test-client', version: '1.0.0' });
+async function createConnectedServer(request, options = {}, clientOptions = {}, configureClient) {
+  const server = createMcpServer({ request }, options);
+  const client = new Client({ name: 'test-client', version: '1.0.0' }, clientOptions);
+  configureClient?.(client);
   const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
   return { server, client };
+}
+
+async function waitFor(check) {
+  for (let attempts = 0; attempts < 100; attempts += 1) {
+    if (check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error('timed out waiting for MCP gateway');
 }
 
 async function closeConnectedServer({ server, client }) {
@@ -299,4 +309,116 @@ test('runMcpServer closes its IPC client when daemon connection fails', async ()
     worktreesDir: '/tmp/agent-team-missing/worktrees',
     preflightDir: '/tmp/agent-team-missing/preflight'
   }), /IPC connection error/);
+});
+
+test('MCP gateway sends standard logging notifications from durable run events', async () => {
+  const messages = [];
+  const events = [
+    { id: 4, runId: 'run-1', eventType: 'RUN_STARTED', createdAt: '2026-01-01T00:00:00.000Z' },
+    { id: 5, runId: 'run-1', eventType: 'RUN_HANDOFF_CREATED', createdAt: '2026-01-01T00:00:01.000Z' }
+  ];
+  const connected = await createConnectedServer(async (method, params) => {
+    if (method !== 'execution.events_since') throw new Error(`unexpected IPC method: ${method}`);
+    const afterEventId = params.afterEventId;
+    const pending = events.filter((event) => event.id > afterEventId);
+    return { events: pending, lastEventId: pending.at(-1)?.id ?? afterEventId };
+  }, { pollIntervalMs: 5 }, {}, (client) => {
+    client.setNotificationHandler(LoggingMessageNotificationSchema, (notification) => {
+      messages.push(notification.params.data);
+    });
+  });
+
+  try {
+    await waitFor(() => messages.length === 2);
+    assert.deepEqual(messages, [
+      {
+        type: 'run.status', runId: 'run-1', status: 'running', eventId: 4,
+        eventType: 'RUN_STARTED', createdAt: '2026-01-01T00:00:00.000Z'
+      },
+      { type: 'run.completed', handoff: { runId: 'run-1', available: true } }
+    ]);
+  } finally {
+    await closeConnectedServer(connected);
+  }
+});
+
+test('MCP gateway elicits approvals and agent questions, but leaves contract blocks queued', async () => {
+  const calls = [];
+  const approval = {
+    id: 'approval-1', status: 'queued', kind: 'approval',
+    request: { tool: 'npm', description: 'Run npm test', allowSession: true }
+  };
+  const question = {
+    id: 'question-1', status: 'queued', kind: 'agent_question',
+    request: { backend: 'codex', questions: [{ id: 'choice', question: 'Continue?', options: [{ label: 'yes' }, { label: 'no' }] }] }
+  };
+  const contractBlock = {
+    id: 'contract-1', status: 'queued', kind: 'contract_block', request: { reason: 'Needs scope revision' }
+  };
+  const answered = new Set();
+  const elicitationRequests = [];
+  const connected = await createConnectedServer(async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'execution.events_since') return { events: [], lastEventId: params.afterEventId };
+    if (method === 'controller.attach') return {};
+    if (method === 'interaction.list') {
+      return [approval, question, contractBlock].filter((item) => !answered.has(item.id));
+    }
+    if (method === 'interaction.claim') return { ...[approval, question, contractBlock].find((item) => item.id === params.id), status: 'claimed' };
+    if (method === 'interaction.answer') {
+      answered.add(params.id);
+      return { id: params.id, status: 'answered' };
+    }
+    if (method === 'interaction.requeue_client') return 0;
+    throw new Error(`unexpected IPC method: ${method}`);
+  }, { pollIntervalMs: 5 }, { capabilities: { elicitation: { form: {} } } }, (client) => {
+    client.setRequestHandler(ElicitRequestSchema, (request) => {
+      elicitationRequests.push(request.params);
+      return request.params.requestedSchema.properties.decision
+        ? { action: 'accept', content: { decision: 'session' } }
+        : { action: 'accept', content: { answer_1: 'yes' } };
+    });
+  });
+
+  try {
+    await connected.client.callTool({
+      name: 'agent_team_attach_controller',
+      arguments: { runId: 'run-1', host: 'test', clientId: 'mcp-client' }
+    });
+    await waitFor(() => answered.size === 2);
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    assert.equal(elicitationRequests.length, 2);
+    assert.deepEqual(calls.filter((call) => call.method === 'interaction.answer').map((call) => call.params.response), [
+      'session', { choice: ['yes'] }
+    ]);
+    assert.equal(calls.some((call) => call.method === 'interaction.claim' && call.params.id === 'contract-1'), false);
+  } finally {
+    await closeConnectedServer(connected);
+  }
+});
+
+test('MCP gateway requeues an interaction when elicitation is cancelled', async () => {
+  const calls = [];
+  const queued = { id: 'approval-1', status: 'queued', kind: 'approval', request: { tool: 'npm', allowSession: false } };
+  const connected = await createConnectedServer(async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'execution.events_since') return { events: [], lastEventId: params.afterEventId };
+    if (method === 'controller.attach' || method === 'interaction.claim') return {};
+    if (method === 'interaction.list') return [queued];
+    if (method === 'interaction.requeue_client') return 1;
+    throw new Error(`unexpected IPC method: ${method}`);
+  }, { pollIntervalMs: 5 }, { capabilities: { elicitation: { form: {} } } }, (client) => {
+    client.setRequestHandler(ElicitRequestSchema, () => ({ action: 'cancel' }));
+  });
+
+  try {
+    await connected.client.callTool({
+      name: 'agent_team_attach_controller',
+      arguments: { runId: 'run-1', host: 'test', clientId: 'mcp-client' }
+    });
+    await waitFor(() => calls.some((call) => call.method === 'interaction.requeue_client'));
+    assert.equal(calls.filter((call) => call.method === 'interaction.claim').length, 1);
+  } finally {
+    await closeConnectedServer(connected);
+  }
 });

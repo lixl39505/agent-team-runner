@@ -1,6 +1,6 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { OpenCodeBackend } from '../src/agent/opencode/sdk.ts';
+import { OpenCodeBackend, mapOpenCodeSessionStatus } from '../src/agent/opencode/sdk.ts';
 
 function sessionSpec(overrides = {}) {
   return {
@@ -10,13 +10,15 @@ function sessionSpec(overrides = {}) {
   };
 }
 
-async function open(response, overrides = {}) {
+async function open(response, overrides = {}, transport = {}) {
   const backend = new OpenCodeBackend();
-  const calls = { permissions: [], replies: [], rejects: [], events: [] };
+  const calls = { creates: [], gets: [], statuses: [], prompts: [], permissions: [], replies: [], rejects: [], events: [] };
   const client = {
     session: {
-      async create() { return { data: { id: 'session-1' } }; },
-      async prompt() { return response instanceof Error ? Promise.reject(response) : response; },
+      async create(request) { calls.creates.push(request); return transport.create ? transport.create(request) : { data: { id: 'session-1' } }; },
+      async get(request) { calls.gets.push(request); return transport.get ? transport.get(request) : { data: undefined }; },
+      async status(request) { calls.statuses.push(request); return transport.status ? transport.status(request) : { data: undefined }; },
+      async prompt(request) { calls.prompts.push(request); return response instanceof Error ? Promise.reject(response) : response; },
       async abort() {},
     },
     async postSessionIdPermissionsPermissionId(request) { calls.permissions.push(request); }
@@ -32,6 +34,76 @@ async function open(response, overrides = {}) {
   const session = await backend.openSession(sessionSpec({ onEvent: (event) => calls.events.push(event), ...overrides }));
   return { backend, calls, client, session };
 }
+
+test('OpenCode resumes only an existing idle session in the requested directory', async () => {
+  const resumed = await open(
+    { data: { info: { structured: { status: 'completed' } } } },
+    { resumeSessionId: 'saved-session' },
+    {
+      get: async () => ({ data: { id: 'saved-session', directory: '/workspace' } }),
+      status: async () => ({ data: { 'saved-session': { type: 'idle' } } })
+    }
+  );
+  assert.equal(resumed.session.sessionId, 'saved-session');
+  assert.deepEqual(resumed.calls.creates, []);
+  assert.deepEqual(resumed.calls.gets, [{ path: { id: 'saved-session' }, query: { directory: '/workspace' } }]);
+  assert.deepEqual(resumed.calls.statuses, [{ query: { directory: '/workspace' } }]);
+  assert.equal(resumed.calls.prompts[0].path.id, 'saved-session');
+  assert.equal((await resumed.session.completion()).ok, true);
+
+  resumed.backend.handleEvent({ type: 'session.status', properties: { sessionID: 'saved-session', status: { type: 'busy' } } });
+  resumed.backend.handleEvent({ type: 'session.idle', properties: { sessionID: 'saved-session' } });
+  assert.deepEqual(resumed.calls.events.filter((event) => event.type === 'session-status'), [
+    { type: 'session-status', status: 'busy' },
+    { type: 'session-status', status: 'idle' }
+  ]);
+});
+
+test('OpenCode fails closed rather than creating a session when continuation cannot be verified', async () => {
+  const cases = [
+    {
+      transport: { get: async () => ({ data: undefined }) },
+      error: /not found or is unreadable/
+    },
+    {
+      transport: {
+        get: async () => ({ data: { id: 'saved-session', directory: '/other' } })
+      },
+      error: /directory does not match/
+    },
+    {
+      transport: {
+        get: async () => ({ data: { id: 'saved-session', directory: '/workspace' } }),
+        status: async () => ({ data: { 'saved-session': { type: 'busy' } } })
+      },
+      error: /is not idle \(busy\)/
+    },
+    {
+      transport: {
+        get: async () => ({ data: { id: 'saved-session', directory: '/workspace' } }),
+        status: async () => ({ data: {} })
+      },
+      error: /status is unavailable/
+    }
+  ];
+  for (const { transport, error } of cases) {
+    const backend = new OpenCodeBackend();
+    const calls = { creates: 0 };
+    const client = {
+      session: {
+        async create() { calls.creates += 1; return { data: { id: 'new-session' } }; },
+        ...transport
+      }
+    };
+    backend.ensureClient = async () => client;
+    backend.ensureSubscribed = async () => {};
+    backend.questionClient = { question: { async reply() {}, async reject() {} } };
+    await assert.rejects(backend.openSession(sessionSpec({ resumeSessionId: 'saved-session' })), error);
+    assert.equal(calls.creates, 0);
+  }
+  assert.equal(mapOpenCodeSessionStatus({ type: 'retry' }), 'busy');
+  assert.equal(mapOpenCodeSessionStatus({ type: 'unknown' }), 'error');
+});
 
 test('OpenCode session maps structured, text, empty, provider, and transport results', async () => {
   const structured = await open({ data: { info: { structured: { status: 'completed' }, tokens: { input: 2, output: 3 } } } });

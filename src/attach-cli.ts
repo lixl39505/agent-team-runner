@@ -12,6 +12,8 @@ type IpcClient = Pick<LocalIpcClient, 'connect' | 'request' | 'close'>;
 type SignalRegister = (signal: NodeJS.Signals, listener: () => void) => void;
 type Ask = (prompt: string) => Promise<string>;
 type RawInput = Readable & { isTTY?: boolean; setRawMode?: (enabled: boolean) => void; resume(): void };
+type TerminalOutput = Writable & { isTTY?: boolean };
+type MouseEvent = { button: number; column: number; row: number; released: boolean };
 
 interface AttachUi {
   readonly isInteractive: boolean;
@@ -19,7 +21,9 @@ interface AttachUi {
   update(state: AttachRunUiState): void;
   addEvents(events: unknown[]): void;
   moveAgent?(delta: number): void;
+  selectAgentAt?(column: number, row: number): void;
   requestAgentLog?(): string | undefined;
+  setAgentLogFollowing?(following: boolean): void;
   showAgentLog?(value: unknown): void;
   showAgentLogFallback?(agentId: string, error: unknown): void;
   pause(): void;
@@ -62,6 +66,7 @@ export async function runAttachCli(
   let readline: Interface | undefined;
   let cancelSelection: (() => void) | undefined;
   let removeKeys: (() => void) | undefined;
+  let followAgentId: string | undefined;
   const ask: Ask = deps.ask ?? (async (prompt) => {
     if (!readline) readline = createInterface({
       input,
@@ -107,8 +112,16 @@ export async function runAttachCli(
     attached = true;
     ui.start();
     let answerRequested = false;
+    let denyRequested = false;
     let logAgentId: string | undefined;
-    removeKeys = attachKeys(input, ui, () => { answerRequested = true; }, () => { logAgentId = ui?.requestAgentLog?.(); }, stop);
+    removeKeys = attachKeys(input, output, ui, () => { answerRequested = true; }, () => { denyRequested = true; }, () => {
+      logAgentId = ui?.requestAgentLog?.();
+    }, () => {
+      const agentId = ui?.requestAgentLog?.();
+      if (!agentId) return;
+      followAgentId = followAgentId === agentId ? undefined : agentId;
+      ui?.setAgentLogFollowing?.(followAgentId !== undefined);
+    }, stop);
 
     do {
       const response = await client.request('execution.events', eventParams(runId, clientId));
@@ -123,8 +136,8 @@ export async function runAttachCli(
         client.request('execution.list')
       ]);
       ui.update({ ...executionState(execution), interactions, projects, runs });
-      if (ui.isInteractive && logAgentId) {
-        const agentId = logAgentId;
+      if (ui.isInteractive && (logAgentId || followAgentId)) {
+        const agentId = logAgentId ?? followAgentId!;
         logAgentId = undefined;
         try {
           ui.showAgentLog?.(await client.request('execution.agent_log', { runId, agentId }));
@@ -139,6 +152,10 @@ export async function runAttachCli(
         } catch (error) {
           if (!stopped) throw error;
         }
+      }
+      if (ui.isInteractive && denyRequested) {
+        denyRequested = false;
+        await denyQueuedApproval(interactions, client, clientId);
       }
       if (stopped || !ui.isInteractive) break;
       await sleep(pollIntervalMs);
@@ -197,6 +214,7 @@ async function selectRun(
       if (complete) return;
       complete = true;
       terminal.off('data', onData);
+      disableMouse();
       terminal.setRawMode?.(false);
       selector.stop();
       resolve(runId);
@@ -207,17 +225,34 @@ async function selectRun(
       if (keys.includes('up')) selector.move(-1);
       if (keys.includes('down')) selector.move(1);
       if (keys.includes('enter')) finish(selector.selectedRunId);
+      for (const event of mouse.events(data.toString())) {
+        if (event.button === 0 && !event.released) selector.selectAt(event.row);
+        if (event.button === 64) selector.move(-1);
+        if (event.button === 65) selector.move(1);
+      }
     };
     setCancel(() => finish());
+    const mouse = terminalMouse(terminal, output);
+    const disableMouse = mouse.disable;
     terminal.setRawMode!(true);
     terminal.on('data', onData);
     terminal.resume();
   });
 }
 
-function attachKeys(input: Readable, ui: AttachUi, answer: () => void, log: () => void, stop: () => void): () => void {
+function attachKeys(
+  input: Readable,
+  output: Writable,
+  ui: AttachUi,
+  answer: () => void,
+  deny: () => void,
+  log: () => void,
+  follow: () => void,
+  stop: () => void
+): () => void {
   const terminal = input as RawInput;
   if (!ui.isInteractive || !terminal.isTTY || !terminal.setRawMode) return () => {};
+  const mouse = terminalMouse(terminal, output);
   const onData = (data: Buffer | string): void => {
     const keys = terminalKeys(data.toString());
     if (keys.includes('quit')) {
@@ -226,8 +261,15 @@ function attachKeys(input: Readable, ui: AttachUi, answer: () => void, log: () =
     }
     if (keys.includes('up')) ui.moveAgent?.(-1);
     if (keys.includes('down')) ui.moveAgent?.(1);
-    if (keys.includes('answer')) answer();
+    if (keys.includes('enter') || keys.includes('answer')) answer();
+    if (keys.includes('deny')) deny();
     if (keys.includes('log')) log();
+    if (keys.includes('follow')) follow();
+    for (const event of mouse.events(data.toString())) {
+      if (event.button === 0 && !event.released) ui.selectAgentAt?.(event.column, event.row);
+      if (event.button === 64) ui.moveAgent?.(-1);
+      if (event.button === 65) ui.moveAgent?.(1);
+    }
   };
   terminal.setRawMode(true);
   terminal.on('data', onData);
@@ -235,6 +277,7 @@ function attachKeys(input: Readable, ui: AttachUi, answer: () => void, log: () =
   return () => {
     terminal.off('data', onData);
     terminal.setRawMode?.(false);
+    mouse.disable();
   };
 }
 
@@ -249,15 +292,31 @@ async function askWithCookedInput(input: Readable, ask: Ask, prompt: string): Pr
   }
 }
 
-function terminalKeys(value: string): Array<'up' | 'down' | 'enter' | 'answer' | 'log' | 'quit'> {
+function terminalKeys(value: string): Array<'up' | 'down' | 'enter' | 'answer' | 'deny' | 'log' | 'follow' | 'quit'> {
   if (value.includes('\u0003') || value.toLowerCase().includes('q')) return ['quit'];
-  const keys: Array<'up' | 'down' | 'enter' | 'answer' | 'log' | 'quit'> = [];
+  const keys: Array<'up' | 'down' | 'enter' | 'answer' | 'deny' | 'log' | 'follow' | 'quit'> = [];
   if (value.includes('\x1b[A')) keys.push('up');
   if (value.includes('\x1b[B')) keys.push('down');
   if (value.includes('\r') || value.includes('\n')) keys.push('enter');
   if (value.toLowerCase().includes('a')) keys.push('answer');
+  if (value.toLowerCase().includes('d')) keys.push('deny');
   if (value.toLowerCase().includes('l')) keys.push('log');
+  if (value.toLowerCase().includes('f')) keys.push('follow');
   return keys;
+}
+
+function terminalMouse(input: RawInput, output: Writable): { events: (value: string) => MouseEvent[]; disable: () => void } {
+  const terminal = process.env.TERM ?? '';
+  const supported = Boolean(input.isTTY && input.setRawMode && (output as TerminalOutput).isTTY)
+    && /(?:xterm|screen|tmux|rxvt|vt[12]00|kitty|wezterm|alacritty|foot|iterm)/i.test(terminal);
+  if (!supported) return { events: () => [], disable: () => {} };
+  output.write('\x1b[?1000h\x1b[?1006h');
+  return {
+    events: (value) => [...value.matchAll(/\x1b\[<(\d+);(\d+);(\d+)([Mm])/g)].map((match) => ({
+      button: Number(match[1]), column: Number(match[2]), row: Number(match[3]), released: match[4] === 'm'
+    })),
+    disable: () => output.write('\x1b[?1000l\x1b[?1006l')
+  };
 }
 
 function list(value: unknown): unknown[] {
@@ -305,6 +364,21 @@ async function answerQueuedInteraction(
     await client.request('interaction.answer', { id, clientId, response });
   } finally {
     ui.resume();
+  }
+}
+
+async function denyQueuedApproval(value: unknown, client: IpcClient, clientId: string): Promise<void> {
+  const queued = Array.isArray(value) ? value.find((item) => {
+    const interaction = object(item);
+    return interaction.status === 'queued' && interaction.kind === 'approval';
+  }) : undefined;
+  const id = object(queued).id;
+  if (typeof id !== 'string') return;
+  try {
+    await client.request('interaction.claim', { id, clientId });
+    await client.request('interaction.answer', { id, clientId, response: 'deny' });
+  } catch {
+    // A competing controller can claim it between refresh and this keypress.
   }
 }
 

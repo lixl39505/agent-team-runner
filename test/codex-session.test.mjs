@@ -1,6 +1,6 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { CodexBackend, codexDecision, codexWindowsSandboxCapability, legacyReviewDecision } from '../src/agent/codex/app-server.ts';
+import { CodexBackend, codexDecision, codexWindowsSandboxCapability, legacyReviewDecision, mapCodexThreadStatus } from '../src/agent/codex/app-server.ts';
 
 function spec(overrides = {}) {
   return {
@@ -17,7 +17,7 @@ async function open(overrides = {}) {
     exited: false,
     async request(method, params) {
       requests.push({ method, params });
-      if (method === 'thread/start') return { thread: { id: 'thread-1' } };
+      if (method === 'thread/start' || method === 'thread/resume') return { thread: { id: method === 'thread/resume' ? 'resumed-thread' : 'thread-1' } };
       return {};
     },
     close() {}
@@ -34,6 +34,8 @@ test('Codex session maps notifications to events and a structured turn result', 
   assert.equal(value.session.sessionId, 'thread-1');
   assert.equal(value.events[0].type, 'session');
   value.backend.handleNotification('thread/tokenUsage/updated', { threadId: 'thread-1', tokenUsage: { total: { inputTokens: 2, outputTokens: 3 } } });
+  value.backend.handleNotification('thread/status/changed', { threadId: 'thread-1', status: { type: 'active', activeFlags: [] } });
+  value.backend.handleNotification('thread/status/changed', { threadId: 'thread-1', status: { type: 'idle' } });
   value.backend.handleNotification('item/agentMessage/delta', { threadId: 'thread-1' });
   value.backend.handleNotification('item/fileChange/patchUpdated', { threadId: 'thread-1', itemId: 'patch', changes: [{ path: 'src/a.ts' }] });
   value.backend.handleNotification('item/completed', { threadId: 'thread-1', item: { type: 'agentMessage', text: '{"status":"completed"}' } });
@@ -44,6 +46,32 @@ test('Codex session maps notifications to events and a structured turn result', 
     usage: { inputTokens: 2, outputTokens: 3 }
   });
   assert.equal(value.events.some((event) => event.type === 'tool-result' && event.ok), true);
+  assert.deepEqual(value.events.filter((event) => event.type === 'session-status'), [
+    { type: 'session-status', status: 'busy' },
+    { type: 'session-status', status: 'idle' }
+  ]);
+});
+
+test('Codex resumes a thread before starting its continuation turn', async () => {
+  const value = await open({ resumeSessionId: 'saved-thread' });
+  assert.equal(value.session.sessionId, 'resumed-thread');
+  assert.deepEqual(value.requests.slice(0, 2), [
+    {
+      method: 'thread/resume',
+      params: {
+        threadId: 'saved-thread', cwd: '/workspace', approvalPolicy: 'untrusted', sandbox: 'workspace-write'
+      }
+    },
+    {
+      method: 'turn/start',
+      params: {
+        threadId: 'resumed-thread', input: [{ type: 'text', text: 'Return JSON', text_elements: [] }],
+        cwd: '/workspace', approvalPolicy: 'untrusted',
+        sandboxPolicy: { type: 'workspaceWrite', writableRoots: ['/workspace'], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true },
+        outputSchema: { type: 'object' }
+      }
+    }
+  ]);
 });
 
 test('Codex sessions return parse and failed-turn errors and settle on close', async () => {
@@ -92,4 +120,6 @@ test('Codex policy helpers map decisions and Windows capability consistently', (
   assert.equal(codexWindowsSandboxCapability('ready', 'require', 'win32').ok, true);
   assert.equal(codexWindowsSandboxCapability('notInstalled', 'require', 'win32').ok, false);
   assert.equal(codexWindowsSandboxCapability('unavailable', 'allow-degraded', 'win32', 'missing').degraded, true);
+  assert.equal(mapCodexThreadStatus({ type: 'systemError' }), 'error');
+  assert.equal(mapCodexThreadStatus({ type: 'notLoaded' }), 'error');
 });

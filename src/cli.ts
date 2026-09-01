@@ -6,9 +6,9 @@ import { ensureGitRepo } from './core/git.js';
 import { isBackendId, isValidAgentName } from './core/agent-config.js';
 import { createCredentialStore } from './core/credentials.js';
 import { promptMaskedSecret } from './core/terminal-input.js';
-import { runDaemonCli } from './daemon-cli.js';
 import { runMcpCli } from './mcp-cli.js';
 import { runAttachCli } from './attach-cli.js';
+import { runStartCli } from './start-cli.js';
 import { migrateLegacyProjectState } from './core/migration.js';
 import { resolveAgentTeamHome } from './core/home.js';
 
@@ -140,7 +140,7 @@ export async function runCli(args: string[] = process.argv.slice(2)): Promise<vo
       const controlPlaneArgs = argv;
       argv = [];
       command = undefined;
-      if (controlPlaneCommand === 'start') await runDaemonCli(controlPlaneArgs);
+      if (controlPlaneCommand === 'start') await runStartCli(controlPlaneArgs);
       else if (controlPlaneCommand === 'mcp') await runMcpCli(controlPlaneArgs);
       else await runAttachCli(controlPlaneArgs);
       return;
@@ -157,9 +157,9 @@ function printHelp(): void {
 
 Commands:
   init [repo]                         Sync host skills without modifying repository config
-  start [--home PATH]                 Start the local daemon
+  start [--home PATH]                 Start or connect to the daemon, then open the Inbox
   mcp [--home PATH]                   Run the MCP server
-   attach [run-id] [--home PATH]       Select or attach an interactive daemon run dashboard
+  attach [run-id] [--home PATH]       Select or attach an interactive daemon run dashboard
   migrate [repo] [--repo PATH]        Safely migrate terminal legacy state to AGENT_TEAM_HOME
           [--home PATH] [--dry-run]   Never merges or overwrites state.sqlite or run artifacts
   skills sync [--repo PATH]          Mirror portable skills for Codex/OpenCode/Claude

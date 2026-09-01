@@ -5,7 +5,7 @@ import {
   type DaemonBootstrapConfig
 } from '../core/daemon-config.js';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { open, realpath } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { StateDatabase } from '../core/db.js';
@@ -13,12 +13,11 @@ import { createExecutionRun } from '../core/execution-run.js';
 import { runOrchestrator } from '../core/orchestrator.js';
 import { agentList } from '../core/agent-config.js';
 import type { AgentEventSink } from '../core/agent-execution.js';
-import type { ContractBlockReport } from '../core/types.js';
+import type { AgentExecutionRecord, ContractBlockReport, ExecutionContract, RunManifest } from '../core/types.js';
 import { validateExecutionContract } from '../core/validation.js';
 import { assertAllowedCommand } from '../core/shell.js';
 import { writeJson, writeTaskMarkdown } from '../core/files.js';
 import { listProjectSkills, localSkillRoots, snapshotTaskSkills } from '../core/skill-handoff.js';
-import type { ExecutionContract, RunManifest } from '../core/types.js';
 import { ProjectRegistry, type JsonValue as ProjectJsonValue, type ProjectPolicyInput } from '../core/project-registry.js';
 import { runnerConfigFromProjectPolicy } from '../core/project-runtime.js';
 import type { ApprovalDecision, ApprovalHandler, UserInputAnswers, UserInputHandler } from '../agent/approval.js';
@@ -352,16 +351,28 @@ export class AgentTeamDaemon {
       });
       const run = this.stateDatabase.getRun(runId);
       const afterEventId = lastAckEventId ?? controller.lastAckEventId ?? 0;
-      const handoffPath = join(this.home.runsDir, runId, 'handoff.json');
+      const tasks = this.stateDatabase.listTasks(runId);
+      const agentExecutions = this.stateDatabase.listAgentExecutions(runId);
+      const interactions = this.controlPlaneStore.listInteractions(runId);
+      const handoff = this.readHandoff(runId);
+      const events = this.stateDatabase.listEvents(runId, afterEventId, 1000);
       return {
         ...controller,
         execution: {
+          contract: run.executionContractJson === null ? null : JSON.parse(run.executionContractJson) as ExecutionContract,
           run,
-          tasks: this.stateDatabase.listTasks(runId),
-          agentExecutions: this.stateDatabase.listAgentExecutions(runId),
-          events: this.stateDatabase.listEvents(runId, afterEventId),
-          interactions: this.controlPlaneStore.listInteractions(runId),
-          handoffAvailable: existsSync(handoffPath)
+          tasks,
+          agentExecutions,
+          events,
+          lastEventId: events.at(-1)?.id ?? afterEventId,
+          interactions,
+          blockers: {
+            tasks: tasks.filter((task) => task.status === 'blocked' || task.status === 'blocked_on_contract'),
+            interactions: interactions.filter((interaction) => interaction.status === 'queued' || interaction.status === 'claimed')
+          },
+          handoffAvailable: handoff !== undefined,
+          handoff: handoff ?? null,
+          agentLogs: await this.reconnectAgentLogs(runId, agentExecutions)
         }
       };
     });
@@ -600,15 +611,11 @@ export class AgentTeamDaemon {
     this.server.register('execution.handoff', async (params) => {
       const input = objectParams(params, 'execution.handoff', ['runId']);
       const runId = requiredString(input, 'runId', 'execution.handoff');
-      const path = join(this.home.runsDir, runId, 'handoff.json');
-      try {
-        return JSON.parse(readFileSync(path, 'utf8')) as unknown;
-      } catch (error) {
-        if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') {
-          throw new Error(`Run ${runId} has no handoff; it must complete before handoff is available`);
-        }
-        throw error;
+      const handoff = this.readHandoff(runId);
+      if (handoff === undefined) {
+        throw new Error(`Run ${runId} has no handoff; it must complete before handoff is available`);
       }
+      return handoff;
     });
     this.server.register('execution.events', async (params) => {
       const input = objectParams(params, 'execution.events', ['runId', 'clientId', 'afterEventId', 'limit']);
@@ -622,6 +629,13 @@ export class AgentTeamDaemon {
       // Returning an event is not an acknowledgement; only afterEventId advances the durable cursor.
       this.controlPlaneStore.acknowledgeController(runId, clientId, afterEventId);
       const events = this.stateDatabase.listEvents(runId, afterEventId, limit);
+      return { events, lastEventId: events.at(-1)?.id ?? afterEventId };
+    });
+    this.server.register('execution.events_since', async (params) => {
+      const input = objectParams(params, 'execution.events_since', ['afterEventId', 'limit']);
+      const afterEventId = optionalNonNegativeInteger(input, 'afterEventId', 'execution.events_since') ?? 0;
+      const limit = optionalEventLimit(input, 'execution.events_since') ?? 1000;
+      const events = this.stateDatabase.listEventsSince(afterEventId, limit);
       return { events, lastEventId: events.at(-1)?.id ?? afterEventId };
     });
   }
@@ -754,6 +768,42 @@ export class AgentTeamDaemon {
       throw this.agentLogReadError(runId, agentId, error);
     } finally {
       await handle?.close();
+    }
+  }
+
+  private async reconnectAgentLogs(runId: string, agentExecutions: readonly AgentExecutionRecord[]): Promise<Array<{
+    agentId: string;
+    status: 'available';
+    tail: Awaited<ReturnType<AgentTeamDaemon['readAgentLog']>>;
+  } | {
+    agentId: string;
+    status: 'unavailable';
+    reason: string;
+  }>> {
+    return await Promise.all(agentExecutions.map(async (agent) => {
+      try {
+        // Reuse the recorded-path and symlink checks used by execution.agent_log.
+        return {
+          agentId: agent.agentId,
+          status: 'available' as const,
+          tail: await this.readAgentLog(runId, agent.agentId, DEFAULT_AGENT_LOG_LINES, DEFAULT_AGENT_LOG_BYTES)
+        };
+      } catch (error) {
+        return {
+          agentId: agent.agentId,
+          status: 'unavailable' as const,
+          reason: error instanceof Error ? error.message : `Agent log is unavailable: ${runId}/${agent.agentId}`
+        };
+      }
+    }));
+  }
+
+  private readHandoff(runId: string): unknown | undefined {
+    try {
+      return JSON.parse(readFileSync(join(this.home.runsDir, runId, 'handoff.json'), 'utf8')) as unknown;
+    } catch (error) {
+      if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') return undefined;
+      throw error;
     }
   }
 

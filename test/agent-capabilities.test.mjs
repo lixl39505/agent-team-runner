@@ -21,9 +21,9 @@ test('Claude advertises the session controls it consumes', () => {
   assert.deepEqual(new ClaudeBackend().capabilities, { maxTurns: true, resumeSession: true });
 });
 
-test('Codex and OpenCode reject unsupported session controls before startup', async () => {
+test('Codex and OpenCode advertise supported continuation controls', async () => {
   await assert.rejects(new CodexBackend().openSession(spec({ maxTurns: 10 })), /codex.*maxTurns/);
-  await assert.rejects(new CodexBackend().openSession(spec({ resumeSessionId: 'thread' })), /codex.*resumeSessionId/);
   await assert.rejects(new OpenCodeBackend().openSession(spec({ maxTurns: 10 })), /opencode.*maxTurns/);
-  await assert.rejects(new OpenCodeBackend().openSession(spec({ resumeSessionId: 'session' })), /opencode.*resumeSessionId/);
+  assert.deepEqual(new CodexBackend().capabilities, { maxTurns: false, resumeSession: true });
+  assert.deepEqual(new OpenCodeBackend().capabilities, { maxTurns: false, resumeSession: true });
 });

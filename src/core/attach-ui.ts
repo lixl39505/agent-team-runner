@@ -24,7 +24,7 @@ export class AttachRunUi {
   private paused = false;
   private plainRendered = false;
   private selectedAgent = 0;
-  private agentLog: { agentId: string; lines: string[]; fallback: boolean } | undefined;
+  private agentLog: { agentId: string; lines: string[]; fallback: boolean; following: boolean } | undefined;
 
   constructor(
     private readonly runId: string,
@@ -64,11 +64,21 @@ export class AttachRunUi {
     this.render();
   }
 
+  selectAgentAt(column: number, row: number): void {
+    const columns = Math.max(60, this.output.columns ?? 120);
+    const projectWidth = Math.max(22, Math.floor((columns - 6) * 0.28));
+    const eventWidth = Math.max(28, Math.floor((columns - 6) * 0.43));
+    const index = row - 4;
+    if (column < projectWidth + eventWidth + 7 || index < 0 || index >= array(this.state.agentExecutions).length) return;
+    this.selectedAgent = index;
+    this.render();
+  }
+
   requestAgentLog(): string | undefined {
     const selected = object(array(this.state.agentExecutions)[this.selectedAgent]);
     const agentId = text(selected.agentId);
     if (!agentId) return undefined;
-    this.agentLog = { agentId, lines: ['Loading tail...'], fallback: false };
+    this.agentLog = { agentId, lines: ['Loading tail...'], fallback: false, following: false };
     this.render();
     return agentId;
   }
@@ -81,7 +91,8 @@ export class AttachRunUi {
     this.agentLog = {
       agentId,
       lines: content ? content.split('\n').map((line) => text(line)) : ['Log is empty.'],
-      fallback: false
+      fallback: false,
+      following: this.agentLog?.agentId === agentId && this.agentLog.following
     };
     this.render();
   }
@@ -92,8 +103,15 @@ export class AttachRunUi {
     this.agentLog = {
       agentId,
       lines: [text(message, 'Agent log is unavailable.'), 'Durable event fallback:', ...(eventLines.length > 0 ? eventLines : ['No agent events recorded.'])],
-      fallback: true
+      fallback: true,
+      following: false
     };
+    this.render();
+  }
+
+  setAgentLogFollowing(following: boolean): void {
+    if (!this.agentLog) return;
+    this.agentLog.following = following;
     this.render();
   }
 
@@ -149,7 +167,7 @@ export class AttachRunUi {
       'AGENTS',
       ...executions.map((entry, index) => clip(`${index === this.selectedAgent ? '>' : ' '} ${executionText(object(entry), agentWidth - 2)}`, agentWidth)),
       ...(this.agentLog
-        ? ['', `${this.agentLog.fallback ? 'EVENT FALLBACK' : 'AGENT LOG'} ${this.agentLog.agentId}`,
+        ? ['', `${this.agentLog.fallback ? 'EVENT FALLBACK' : this.agentLog.following ? 'FOLLOWING LOG' : 'AGENT LOG'} ${this.agentLog.agentId}`,
           ...this.agentLog.lines.slice(-Math.max(2, rows - executions.length - 6)).map((line) => clip(line, agentWidth))]
         : [])
     ];
@@ -161,7 +179,7 @@ export class AttachRunUi {
       return `${projectLine.padEnd(projectWidth)} │ ${eventLine.padEnd(eventWidth)} │ ${agentLine}`;
     });
     const title = clip(` Agent Team Attach  ${this.runId} `, columns);
-    const hint = 'arrows select agent  a answer Inbox  l tail agent log  q/Ctrl-C detach';
+    const hint = 'arrows select agent  Enter/a answer  d deny approval  l tail  f follow log  q/Ctrl-C detach';
     const styledTitle = this.color === 'never' ? title : `\x1b[1m${title}\x1b[0m`;
     const styledHint = this.color === 'never' ? hint : `\x1b[2m${hint}\x1b[0m`;
     this.output.write(`\x1b[H\x1b[2J${styledTitle}\n${rendered.join('\n')}\n${styledHint}`);
@@ -217,6 +235,15 @@ export class AttachRunSelectorUi {
   move(delta: number): void {
     if (this.choices.length === 0) return;
     this.selected = (this.selected + delta + this.choices.length) % this.choices.length;
+    this.render();
+  }
+
+  selectAt(row: number): void {
+    const choice = runAtLine(this.projects, this.choices, row - 2);
+    if (!choice) return;
+    const index = this.choices.indexOf(choice);
+    if (index < 0) return;
+    this.selected = index;
     this.render();
   }
 
@@ -344,6 +371,36 @@ function orderedRuns(projects: unknown[], runs: unknown[]): unknown[] {
   return ordered;
 }
 
+function runAtLine(projects: unknown[], runs: unknown[], target: number): unknown | undefined {
+  const byProject = new Map<string, unknown[]>();
+  for (const run of runs) {
+    const projectId = text(object(run).projectId, 'unassigned');
+    const entries = byProject.get(projectId) ?? [];
+    entries.push(run);
+    byProject.set(projectId, entries);
+  }
+  let line = 1; // Skip the PROJECTS / RUNS header.
+  const listed = new Set<string>();
+  for (const project of projects) {
+    const projectId = text(object(project).id);
+    listed.add(projectId);
+    line += 1;
+    for (const run of byProject.get(projectId) ?? []) {
+      if (line === target) return run;
+      line += 1;
+    }
+  }
+  for (const [projectId, projectRuns] of byProject) {
+    if (listed.has(projectId)) continue;
+    line += 1;
+    for (const run of projectRuns) {
+      if (line === target) return run;
+      line += 1;
+    }
+  }
+  return undefined;
+}
+
 function runLine(run: Record<string, unknown>, currentRunId: string, width: number): string {
   const id = text(run.id, 'unknown');
   return clip(`${id === currentRunId ? '>' : ' '} ${id} ${text(run.status, 'unknown')}`, width);
@@ -352,6 +409,7 @@ function runLine(run: Record<string, unknown>, currentRunId: string, width: numb
 function formatEvent(event: AgentEvent): string | null {
   if (event.type === 'activity') return null;
   if (event.type === 'session') return `session ${event.sessionId}`;
+  if (event.type === 'session-status') return null;
   if (event.type === 'message') return event.text.replace(/\s+/g, ' ').trim();
   if (event.type === 'tool-call') return `> ${event.tool} ${clip(stringify(event.input), 160)}`;
   if (event.type === 'tool-result') return `< ${event.tool}: ${event.ok ? 'ok' : 'failed'}${event.summary ? ` ${event.summary.replace(/\s+/g, ' ')}` : ''}`;
