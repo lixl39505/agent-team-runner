@@ -55,8 +55,7 @@ export const DEFAULT_CONFIG: RunnerConfig = {
     globalCommands: []
   },
   integration: {
-    allowedPaths: ['specs/**'],
-    runAgentAfterCherryPick: true
+    allowedPaths: ['specs/**']
   }
 };
 
@@ -174,7 +173,6 @@ verification:
 integration:
   allowedPaths:
     - specs/**
-  runAgentAfterCherryPick: true
 `;
 }
 

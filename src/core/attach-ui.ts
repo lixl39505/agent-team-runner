@@ -1,6 +1,7 @@
 /* istanbul ignore file */
 import type { Writable } from 'node:stream';
 import type { AgentEvent } from '../agent/types.js';
+import type { TuiColorPreference } from './daemon-config.js';
 
 const MAX_EVENTS = 200;
 
@@ -9,6 +10,8 @@ export interface AttachRunUiState {
   tasks: unknown;
   agentExecutions: unknown;
   interactions: unknown;
+  projects?: unknown;
+  runs?: unknown;
 }
 
 type TerminalOutput = Writable & { isTTY?: boolean; columns?: number; rows?: number };
@@ -20,8 +23,14 @@ export class AttachRunUi {
   private active = false;
   private paused = false;
   private plainRendered = false;
+  private selectedAgent = 0;
+  private agentLog: { agentId: string; lines: string[]; fallback: boolean } | undefined;
 
-  constructor(private readonly runId: string, private readonly output: TerminalOutput = process.stdout) {}
+  constructor(
+    private readonly runId: string,
+    private readonly output: TerminalOutput = process.stdout,
+    private readonly color: TuiColorPreference = 'auto'
+  ) {}
 
   get isInteractive(): boolean {
     return Boolean(this.output.isTTY && this.output.columns && this.output.rows);
@@ -46,6 +55,46 @@ export class AttachRunUi {
     }
     if (this.lines.length > MAX_EVENTS) this.lines.splice(0, this.lines.length - MAX_EVENTS);
     if (this.isInteractive) this.render();
+  }
+
+  moveAgent(delta: number): void {
+    const executions = array(this.state.agentExecutions);
+    if (executions.length === 0) return;
+    this.selectedAgent = (this.selectedAgent + delta + executions.length) % executions.length;
+    this.render();
+  }
+
+  requestAgentLog(): string | undefined {
+    const selected = object(array(this.state.agentExecutions)[this.selectedAgent]);
+    const agentId = text(selected.agentId);
+    if (!agentId) return undefined;
+    this.agentLog = { agentId, lines: ['Loading tail...'], fallback: false };
+    this.render();
+    return agentId;
+  }
+
+  showAgentLog(value: unknown): void {
+    const result = object(value);
+    const agentId = text(result.agentId);
+    if (!agentId) return;
+    const content = typeof result.content === 'string' ? result.content : '';
+    this.agentLog = {
+      agentId,
+      lines: content ? content.split('\n').map((line) => text(line)) : ['Log is empty.'],
+      fallback: false
+    };
+    this.render();
+  }
+
+  showAgentLogFallback(agentId: string, error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error);
+    const eventLines = this.lines.filter((line) => line.startsWith(`[${agentId}]`)).slice(-20);
+    this.agentLog = {
+      agentId,
+      lines: [text(message, 'Agent log is unavailable.'), 'Durable event fallback:', ...(eventLines.length > 0 ? eventLines : ['No agent events recorded.'])],
+      fallback: true
+    };
+    this.render();
   }
 
   pause = (): void => {
@@ -78,45 +127,53 @@ export class AttachRunUi {
     if (!this.active || this.paused) return;
     const columns = Math.max(60, this.output.columns ?? 120);
     const rows = Math.max(12, this.output.rows ?? 30);
-    const logsWidth = Math.max(28, Math.floor(columns * 0.48));
-    const taskWidth = Math.max(16, Math.floor((columns - logsWidth - 6) * 0.52));
-    const inboxWidth = columns - logsWidth - taskWidth - 6;
+    const projectWidth = Math.max(22, Math.floor((columns - 6) * 0.28));
+    const eventWidth = Math.max(28, Math.floor((columns - 6) * 0.43));
+    const agentWidth = columns - projectWidth - eventWidth - 6;
     const run = object(this.state.run);
-    const tasks = array(this.state.tasks);
     const executions = array(this.state.agentExecutions);
     const interactions = array(this.state.interactions).filter((item) => object(item).status === 'queued');
-    const logs = this.lines.slice(-(rows - 3)).map((line) => clip(line, logsWidth));
-    const taskPane = [
-      `RUN ${text(run.status, 'unknown')}`,
-      'TASKS',
-      ...tasks.map((task) => clip(`${text(object(task).taskId, 'unknown')} ${text(object(task).status, 'unknown')} ${text(object(task).title)}`, taskWidth)),
+    const currentRunId = text(run.id, this.runId);
+    const projectPane = projectRunLines(array(this.state.projects), array(this.state.runs), currentRunId, projectWidth);
+    const eventRows = Math.max(2, Math.floor((rows - 5) * 0.62));
+    const eventPane = [
+      'EVENTS',
+      ...this.lines.slice(-eventRows).map((line) => clip(line, eventWidth)),
       '',
-      'AGENTS',
-      ...executions.map((entry) => executionText(object(entry), taskWidth))
-    ];
-    const inbox = [
       `INBOX ${interactions.length}`,
-      '',
-      ...interactions.map((entry) => clip(`${text(object(entry).kind, 'unknown')} ${text(object(entry).taskId, '')} ${text(object(entry).agentId, 'unknown')}`, inboxWidth))
+      ...interactions.map((entry) => interactionText(object(entry), eventWidth))
+    ];
+    if (this.selectedAgent >= executions.length) this.selectedAgent = Math.max(0, executions.length - 1);
+    const agentPane = [
+      `RUN ${text(run.status, 'unknown')}`,
+      'AGENTS',
+      ...executions.map((entry, index) => clip(`${index === this.selectedAgent ? '>' : ' '} ${executionText(object(entry), agentWidth - 2)}`, agentWidth)),
+      ...(this.agentLog
+        ? ['', `${this.agentLog.fallback ? 'EVENT FALLBACK' : 'AGENT LOG'} ${this.agentLog.agentId}`,
+          ...this.agentLog.lines.slice(-Math.max(2, rows - executions.length - 6)).map((line) => clip(line, agentWidth))]
+        : [])
     ];
     const contentRows = rows - 2;
     const rendered = Array.from({ length: contentRows }, (_value, index) => {
-      const logLine = logs[index] ?? '';
-      const taskLine = taskPane[index] ?? '';
-      const inboxLine = inbox[index] ?? '';
-      return `${logLine.padEnd(logsWidth)} │ ${taskLine.padEnd(taskWidth)} │ ${inboxLine}`;
+      const projectLine = projectPane[index] ?? '';
+      const eventLine = eventPane[index] ?? '';
+      const agentLine = agentPane[index] ?? '';
+      return `${projectLine.padEnd(projectWidth)} │ ${eventLine.padEnd(eventWidth)} │ ${agentLine}`;
     });
-    this.output.write(`\x1b[H\x1b[2J\x1b[1m${clip(` Agent Team Attach  ${this.runId} `, columns)}\x1b[0m\n${rendered.join('\n')}\n\x1b[2mCtrl-C exits and requeues unanswered interactions.\x1b[0m`);
+    const title = clip(` Agent Team Attach  ${this.runId} `, columns);
+    const hint = 'arrows select agent  a answer Inbox  l tail agent log  q/Ctrl-C detach';
+    const styledTitle = this.color === 'never' ? title : `\x1b[1m${title}\x1b[0m`;
+    const styledHint = this.color === 'never' ? hint : `\x1b[2m${hint}\x1b[0m`;
+    this.output.write(`\x1b[H\x1b[2J${styledTitle}\n${rendered.join('\n')}\n${styledHint}`);
   }
 
   private text(): string {
     const run = object(this.state.run);
-    const tasks = array(this.state.tasks);
     const executions = array(this.state.agentExecutions);
     const interactions = array(this.state.interactions).filter((item) => object(item).status === 'queued');
     return [
       `Run ${this.runId}: ${text(run.status, 'unknown')}`,
-      `Tasks: ${tasks.length}`,
+      `Tasks: ${array(this.state.tasks).length}`,
       `Agents: ${executions.map((entry) => executionText(object(entry), 160)).join('; ') || 'none'}`,
       `Pending interactions: ${interactions.length}`,
       ...this.lines
@@ -124,16 +181,84 @@ export class AttachRunUi {
   }
 }
 
+/** Keyboard-only run picker used before a controller lease is acquired. */
+export class AttachRunSelectorUi {
+  private selected = 0;
+  private active = false;
+  private readonly choices: unknown[];
+
+  constructor(
+    private readonly projects: unknown[],
+    runs: unknown[],
+    private readonly output: TerminalOutput = process.stdout,
+    private readonly color: TuiColorPreference = 'auto'
+  ) {
+    this.choices = orderedRuns(projects, runs);
+  }
+
+  get isInteractive(): boolean {
+    return Boolean(this.output.isTTY && this.output.columns && this.output.rows);
+  }
+
+  get selectedRunId(): string | undefined {
+    return text(object(this.choices[this.selected]).id) || undefined;
+  }
+
+  start(): void {
+    if (!this.isInteractive) {
+      this.output.write(`${this.text()}\n`);
+      return;
+    }
+    this.active = true;
+    this.output.write('\x1b[?1049h\x1b[?25l');
+    this.render();
+  }
+
+  move(delta: number): void {
+    if (this.choices.length === 0) return;
+    this.selected = (this.selected + delta + this.choices.length) % this.choices.length;
+    this.render();
+  }
+
+  stop(): void {
+    if (!this.active) return;
+    this.active = false;
+    this.output.write('\x1b[?1049l\x1b[?25h');
+  }
+
+  private render(): void {
+    if (!this.active) return;
+    const columns = Math.max(60, this.output.columns ?? 120);
+    const rows = Math.max(12, this.output.rows ?? 30);
+    const selectedRunId = this.selectedRunId ?? '';
+    const lines = projectRunLines(this.projects, this.choices, selectedRunId, columns - 2);
+    const title = this.color === 'never'
+      ? ' Agent Team Runs '
+      : '\x1b[1m Agent Team Runs \x1b[0m';
+    const body = lines.slice(0, rows - 2).join('\n');
+    this.output.write(`\x1b[H\x1b[2J${title}\n${body}\nUp/Down select  Enter attach  q/Ctrl-C detach`);
+  }
+
+  private text(): string {
+    const lines = projectRunLines(this.projects, this.choices, '', 160);
+    return [`Available projects and runs:`, ...lines.slice(1)].join('\n');
+  }
+}
+
 /** Safely formats the durable AGENT_EVENT payload without treating it as trusted input. */
 export function formatAttachEvent(value: unknown): string | null {
   const record = object(value);
-  if (text(record.eventType) !== 'AGENT_EVENT') return null;
+  const eventType = text(record.eventType);
+  if (!eventType) return null;
   const payload = object(record.payload);
   const execution = object(payload.execution);
   const event = agentEvent(payload.event);
-  if (!event) return `[${text(execution.agentId, 'unknown')}] invalid AGENT_EVENT`;
-  const formatted = formatEvent(event);
-  return formatted ? `[${text(execution.agentId, 'unknown')}] ${formatted}` : null;
+  if (eventType === 'AGENT_EVENT') {
+    if (!event) return `[${text(execution.agentId, 'unknown')}] invalid AGENT_EVENT`;
+    const formatted = formatEvent(event);
+    return formatted ? `[${text(execution.agentId, 'unknown')}] ${formatted}` : null;
+  }
+  return `${eventType}${record.taskId ? ` ${text(record.taskId)}` : ''}${Object.keys(payload).length > 0 ? ` ${clip(stringify(payload), 120)}` : ''}`;
 }
 
 function agentEvent(value: unknown): AgentEvent | undefined {
@@ -169,6 +294,61 @@ function executionText(entry: Record<string, unknown>, width: number): string {
   return clip(`${text(entry.agentId, 'unknown')} ${text(entry.role, 'unknown')}${task ? `/${task}` : ''} ${text(entry.backend, 'unknown')}${model ? `/${model}` : ''} ${text(entry.status, 'unknown')}`, width);
 }
 
+function interactionText(entry: Record<string, unknown>, width: number): string {
+  return clip(`${text(entry.kind, 'unknown')} ${text(entry.taskId)} ${text(entry.agentId, 'unknown')}`, width);
+}
+
+function projectRunLines(projects: unknown[], runs: unknown[], currentRunId: string, width: number): string[] {
+  const byProject = new Map<string, unknown[]>();
+  for (const run of runs) {
+    const projectId = text(object(run).projectId, 'unassigned');
+    const entries = byProject.get(projectId) ?? [];
+    entries.push(run);
+    byProject.set(projectId, entries);
+  }
+  const lines = ['PROJECTS / RUNS'];
+  const listed = new Set<string>();
+  for (const project of projects) {
+    const entry = object(project);
+    const projectId = text(entry.id);
+    listed.add(projectId);
+    lines.push(clip(text(entry.displayName, projectId || 'unknown project'), width));
+    for (const run of byProject.get(projectId) ?? []) lines.push(runLine(object(run), currentRunId, width));
+  }
+  for (const [projectId, projectRuns] of byProject) {
+    if (listed.has(projectId)) continue;
+    lines.push(clip(projectId === 'unassigned' ? 'Unassigned runs' : projectId, width));
+    for (const run of projectRuns) lines.push(runLine(object(run), currentRunId, width));
+  }
+  return lines;
+}
+
+function orderedRuns(projects: unknown[], runs: unknown[]): unknown[] {
+  const byProject = new Map<string, unknown[]>();
+  for (const run of runs) {
+    const projectId = text(object(run).projectId, 'unassigned');
+    const entries = byProject.get(projectId) ?? [];
+    entries.push(run);
+    byProject.set(projectId, entries);
+  }
+  const ordered: unknown[] = [];
+  const listed = new Set<string>();
+  for (const project of projects) {
+    const projectId = text(object(project).id);
+    listed.add(projectId);
+    ordered.push(...(byProject.get(projectId) ?? []));
+  }
+  for (const [projectId, projectRuns] of byProject) {
+    if (!listed.has(projectId)) ordered.push(...projectRuns);
+  }
+  return ordered;
+}
+
+function runLine(run: Record<string, unknown>, currentRunId: string, width: number): string {
+  const id = text(run.id, 'unknown');
+  return clip(`${id === currentRunId ? '>' : ' '} ${id} ${text(run.status, 'unknown')}`, width);
+}
+
 function formatEvent(event: AgentEvent): string | null {
   if (event.type === 'activity') return null;
   if (event.type === 'session') return `session ${event.sessionId}`;
@@ -192,7 +372,7 @@ function array(value: unknown): unknown[] {
 }
 
 function text(value: unknown, fallback = ''): string {
-  return typeof value === 'string' ? value.replace(/[\r\n\t]+/g, ' ').trim() : fallback;
+  return typeof value === 'string' ? value.replace(/[\x00-\x1f\x7f]+/g, ' ').trim() : fallback;
 }
 
 function clip(value: string, width: number): string {

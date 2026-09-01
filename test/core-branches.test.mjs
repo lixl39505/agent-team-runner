@@ -119,7 +119,7 @@ test('validation rejects malformed manifests and result payloads', () => {
   assert.throws(() => validateWorkerResult({ status: 'unknown' }), /Invalid worker status/);
   assert.throws(() => validateWorkerResult({ status: 'completed', testsRun: 'no' }), /testsRun must be a string array/);
   assert.throws(() => validateReviewResult({ decision: 'approved', findings: [{ severity: 'urgent' }] }), /Invalid finding severity/);
-  assert.throws(() => validateIntegrationResult({ status: 'blocked', documentationUpdated: [1] }), /documentationUpdated must be a string array/);
+  assert.throws(() => validateIntegrationResult({ status: 'blocked', knownRisks: 'no' }), /knownRisks must be a string array/);
   assert.deepEqual(validateReviewResult({ decision: 'approved', findings: [], requiredChanges: [] }), {
     decision: 'approved', summary: '', findings: [], requiredChanges: []
   });

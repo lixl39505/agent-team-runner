@@ -88,20 +88,14 @@ ${input.candidateFiles?.length ? `# Complete changed-file manifest\n\n${input.ca
 
 export function integrationPrompt(input: {
   manifest: RunManifest;
-  integrationAllowedPaths: string[];
-  mode: 'resolve_conflict' | 'finalize';
   worktreePath?: string;
   conflictFiles?: string[];
 }): string {
-  const modeText = input.mode === 'resolve_conflict'
-    ? `A cherry-pick conflict is active. Resolve only these files: ${(input.conflictFiles ?? []).join(', ')}. Do not run cherry-pick --continue and do not commit.`
-    : `Inspect the integrated result. Update architecture/progress documentation only when warranted. You may modify only: ${input.integrationAllowedPaths.join(', ')}. Do not stage or commit.`;
   return `${loadSkill('integrator')}
 
 # Runtime contract
 
-Mode: ${input.mode}
-${modeText}
+A cherry-pick conflict is active. Resolve only these files: ${(input.conflictFiles ?? []).join(', ')}. Do not run cherry-pick --continue and do not commit.
 ${input.worktreePath ? `\nYour working directory (the integration worktree): ${input.worktreePath}\nRun all commands in this directory — do NOT cd anywhere else.\n` : ''}
 Run manifest:
 ${JSON.stringify(input.manifest, null, 2)}

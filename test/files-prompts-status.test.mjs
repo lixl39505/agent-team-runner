@@ -177,13 +177,10 @@ test('reviewerPrompt and integrationPrompt render their conditional contexts', (
   assert.equal(bareReview.includes('Staged candidate diff'), false);
   assert.match(reviewerPrompt({ task, startSha: 'start', workerResult: null, candidateDiff: 'small diff' }), /# Staged candidate diff\n\nsmall diff/);
 
-  const conflict = integrationPrompt({ manifest: { version: 1, title: 'Run', summary: 'Summary', tasks: [task] }, integrationAllowedPaths: ['docs/**'], mode: 'resolve_conflict', worktreePath: '/tmp/integration', conflictFiles: ['src/a.ts'] });
+  const conflict = integrationPrompt({ manifest: { version: 1, title: 'Run', summary: 'Summary', tasks: [task] }, worktreePath: '/tmp/integration', conflictFiles: ['src/a.ts'] });
   assert.match(conflict, /A cherry-pick conflict is active\. Resolve only these files: src\/a\.ts\./);
   assert.match(conflict, /Your working directory \(the integration worktree\): \/tmp\/integration/);
-  const finalize = integrationPrompt({ manifest: { version: 1, title: 'Run', summary: 'Summary', tasks: [] }, integrationAllowedPaths: ['docs/**'], mode: 'finalize' });
-  assert.match(finalize, /Inspect the integrated result\. Update architecture\/progress documentation only when warranted\. You may modify only: docs\/\*\*\./);
-  assert.equal(finalize.includes('integration worktree'), false);
-  assert.match(integrationPrompt({ manifest: { version: 1, title: 'Run', summary: 'Summary', tasks: [] }, integrationAllowedPaths: [], mode: 'resolve_conflict' }), /Resolve only these files: \./);
+  assert.match(integrationPrompt({ manifest: { version: 1, title: 'Run', summary: 'Summary', tasks: [] } }), /Resolve only these files: \./);
 });
 
 test('reviewFeedback formats summaries, required changes, and findings', () => {

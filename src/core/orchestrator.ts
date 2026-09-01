@@ -5,6 +5,7 @@ import type {
   ContractBlockReport,
   IntegrationResult,
   ReviewResult,
+  ResolvedSkill,
   RunManifest,
   RunnerConfig,
   TaskRecord,
@@ -49,6 +50,10 @@ function safeSegment(input: string): string {
 
 function taskSpec(record: TaskRecord): TaskSpec {
   return JSON.parse(record.specJson) as TaskSpec;
+}
+
+function taskSkills(record: TaskRecord): readonly ResolvedSkill[] {
+  return JSON.parse(record.resolvedSkillsJson ?? '[]') as ResolvedSkill[];
 }
 
 function parseManifest(json: string | null): RunManifest {
@@ -247,7 +252,7 @@ async function executeTask(input: {
     spec: {
       role: 'worker', cwd: worktreeInfo.path,
       label: `${runId} ${task.id} worker`,
-      prompt: workerPrompt({ task, startSha: worktreeInfo.startSha, runId, worktreePath: worktreeInfo.path, priorFeedback: record.lastError, retry }),
+      prompt: workerPrompt({ task, startSha: worktreeInfo.startSha, runId, worktreePath: worktreeInfo.path, priorFeedback: record.lastError, retry, skills: taskSkills(record) }),
       schema: WORKER_SCHEMA,
       ...(workerBinding.model !== undefined ? { model: workerBinding.model } : {}),
       ...(workerBinding.maxTurns !== undefined ? { maxTurns: workerBinding.maxTurns } : {}),
@@ -504,8 +509,6 @@ async function integrateRun(input: {
   await resetWorktree({ repoRoot: config.workspace.repoRoot, path: worktree, branch, baseSha: run.baseSha });
   db.updateRun(runId, { integrationBranch: branch, integrationWorktree: worktree });
   const runDir = join(config.workspace.stateDir, 'runs', runId);
-  const integratorBinding = resolveAgentWithSnapshot('integrator', config, run.rolesJson);
-  const integratorBackend = await getBackend(input.backends, integratorBinding);
 
   for (const task of topologicalTasks(manifest.tasks)) {
     if (input.isInterrupted()) return;
@@ -515,6 +518,8 @@ async function integrateRun(input: {
     if (picked.code === 0) continue;
     const conflicts = await conflictedFiles(worktree);
     if (conflicts.length === 0) throw new Error(`Cherry-pick failed for ${task.id}: ${picked.stderr}`);
+    const integratorBinding = resolveAgentWithSnapshot('integrator', config, run.rolesJson);
+    const integratorBackend = await getBackend(input.backends, integratorBinding);
     const conflictLogPath = join(runDir, 'logs', `integration-conflict-${task.id}.log`);
     const conflictResult = await runTrackedAgent<IntegrationResult>({
       db,
@@ -525,7 +530,7 @@ async function integrateRun(input: {
       spec: {
         role: 'integrator', cwd: worktree,
         label: `${runId} integrator conflict ${task.id}`,
-        prompt: integrationPrompt({ manifest, integrationAllowedPaths: config.integration.allowedPaths, mode: 'resolve_conflict', worktreePath: worktree, conflictFiles: conflicts }),
+        prompt: integrationPrompt({ manifest, worktreePath: worktree, conflictFiles: conflicts }),
         schema: INTEGRATION_SCHEMA,
         ...(integratorBinding.model !== undefined ? { model: integratorBinding.model } : {}),
         ...(integratorBinding.maxTurns !== undefined ? { maxTurns: integratorBinding.maxTurns } : {}),
@@ -563,44 +568,6 @@ async function integrateRun(input: {
   }
 
   await runGlobalVerification({ worktree, config, logPath: join(runDir, 'logs', 'integration-verification.log') });
-  if (input.isInterrupted()) return;
-  if (config.integration.runAgentAfterCherryPick) {
-    const integrationLogPath = join(runDir, 'logs', 'integrator.log');
-    const integrationRun = await runTrackedAgent<IntegrationResult>({
-      db,
-      execution: executionInfo(runId, 'integrator-finalize', 'integrator', integratorBinding.backend, integrationLogPath, integratorBinding.model),
-      signal: input.signal,
-      ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {}),
-      backend: integratorBackend,
-      spec: {
-        role: 'integrator', cwd: worktree,
-        label: `${runId} integrator finalize`,
-        prompt: integrationPrompt({ manifest, integrationAllowedPaths: config.integration.allowedPaths, mode: 'finalize', worktreePath: worktree }),
-        schema: INTEGRATION_SCHEMA,
-        ...(integratorBinding.model !== undefined ? { model: integratorBinding.model } : {}),
-        ...(integratorBinding.maxTurns !== undefined ? { maxTurns: integratorBinding.maxTurns } : {}),
-        access: 'workspace-write',
-        requestApproval: input.requestApproval,
-        requestUserInput: input.requestUserInput,
-        timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs
-      },
-      logPath: integrationLogPath,
-      outputPath: join(runDir, 'results', 'integrator.json')
-    });
-    if (input.isInterrupted()) return;
-    if (!integrationRun.ok || !integrationRun.output) throw new Error(`Integrator finalization failed: ${integrationRun.error ?? 'no structured output'}`);
-    const integrationResult = validateIntegrationResult(integrationRun.output);
-    if (integrationResult.status !== 'completed') throw new Error(integrationResult.blockedReason ?? integrationResult.summary);
-    const files = await changedFiles(worktree);
-    if (files.length > 0) {
-      const policy = checkPaths(files, config.integration.allowedPaths, []);
-      if (!policy.ok) throw new Error(`Integrator modified paths outside policy: ${policy.invalid.join(', ')}`);
-      await runGlobalVerification({ worktree, config, logPath: join(runDir, 'logs', 'integration-verification-after-docs.log') });
-      if (input.isInterrupted()) return;
-      await stageAll(worktree);
-      await commit(worktree, '[integration] update architecture and progress documentation');
-    }
-  }
   if (input.isInterrupted()) return;
   const integrationCommit = await currentHead(worktree);
   db.updateRun(runId, { status: 'done', integrationCommit, error: null, finishedAt: new Date().toISOString() });

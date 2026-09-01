@@ -95,9 +95,6 @@ ${list(task.verificationCommands)}
 - [ ] 所有逻辑可测试
 - [ ] 指定验证命令全部通过
 
-## 后续动作
-
-Worker 只报告对 \`specs/architecture.md\` 与 \`specs/progress.md\` 的影响，由 Integrator 统一更新。
 `;
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, body, 'utf8');

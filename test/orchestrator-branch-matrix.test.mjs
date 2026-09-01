@@ -102,7 +102,7 @@ function config() {
     retry: { maxPlanAttempts: 2, maxWorkerAttempts: 1, maxReviewCycles: 2 },
     status: { pollIntervalMs: 2000 },
     concurrency: 1, taskTimeoutMs: 1, staleAfterMs: 1,
-    integration: { allowedPaths: ['docs/**'], runAgentAfterCherryPick: false }, verification: { globalCommands: [] }
+    integration: { allowedPaths: ['docs/**'] }, verification: { globalCommands: [] }
   };
 }
 
@@ -353,49 +353,6 @@ test('orchestrator covers integration failures, resolver outcomes, and interrupt
     const afterVerification = new Database([record(spec('T1'), { status: 'approved', commitSha: 'one' })]);
     control.global = async () => { process.emit('SIGINT'); };
     await run(afterVerification);
-  } finally {
-    process.exitCode = exitCode;
-  }
-});
-
-test('orchestrator covers finalizer fallback and post-finalization interruption paths', async () => {
-  reset();
-  const finalizeFailure = new Database([record(spec('T1'), { status: 'approved', commitSha: 'one' })]);
-  const finalConfig = config();
-  finalConfig.integration.runAgentAfterCherryPick = true;
-  control.resolve = (role) => ({ agent: role, backend: 'claude', model: 'model', maxTurns: 3 });
-  control.runAgent = async () => ({ ok: false, output: null, timedOut: false, stalled: false });
-  await assert.rejects(run(finalizeFailure, finalConfig), /Integrator finalization failed: no structured output/);
-
-  reset();
-  const blocked = new Database([record(spec('T1'), { status: 'approved', commitSha: 'one' })]);
-  const blockedConfig = config();
-  blockedConfig.integration.runAgentAfterCherryPick = true;
-  control.runAgent = async () => ({ ok: true, output: { status: 'blocked', summary: 'finalizer summary' }, timedOut: false, stalled: false });
-  await assert.rejects(run(blocked, blockedConfig), /finalizer summary/);
-
-  reset();
-  const exitCode = process.exitCode;
-  try {
-    const afterDocs = new Database([record(spec('T1'), { status: 'approved', commitSha: 'one' })]);
-    const docsConfig = config();
-    docsConfig.integration.runAgentAfterCherryPick = true;
-    control.runAgent = async () => ({ ok: true, output: { status: 'completed', summary: 'done' }, timedOut: false, stalled: false });
-    control.changed = async () => ['docs/progress.md'];
-    let verificationCalls = 0;
-    control.global = async () => { if (++verificationCalls === 2) process.emit('SIGINT'); };
-    await run(afterDocs, docsConfig);
-
-    reset();
-    const terminalInterrupt = new Database([record(spec('T1'), { status: 'approved', commitSha: 'one' })]);
-    const terminalConfig = config();
-    terminalConfig.integration.runAgentAfterCherryPick = true;
-    control.runAgent = async () => ({ ok: true, output: { status: 'completed', summary: 'done' }, timedOut: false, stalled: false });
-    control.changed = async () => {
-      process.emit('SIGINT');
-      return [];
-    };
-    await run(terminalInterrupt, terminalConfig);
   } finally {
     process.exitCode = exitCode;
   }

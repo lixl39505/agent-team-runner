@@ -3,10 +3,10 @@
 .agent-team/
 
 # 编译产物
-dist
-.local
-node_modules
+dist/
+tmp/
+.local/
+node_modules/
 
 # 测试产物
-
 coverage/

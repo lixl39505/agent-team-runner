@@ -31,7 +31,7 @@ function configFor(repoRoot, overrides = {}) {
     concurrency: 1,
     retry: { ...DEFAULT_CONFIG.retry, maxWorkerAttempts: 2, ...retry },
     status: { ...DEFAULT_CONFIG.status, ...status },
-    integration: { ...DEFAULT_CONFIG.integration, runAgentAfterCherryPick: false },
+    integration: { ...DEFAULT_CONFIG.integration },
     verification: { ...DEFAULT_CONFIG.verification, globalCommands: [] },
     ...rest
   };
@@ -56,14 +56,12 @@ function workerResult(status, summary) {
     status,
     summary,
     testsRun: [],
-    knownRisks: [],
-    architectureImpact: 'none',
-    progressImpact: 'none'
+    knownRisks: []
   };
 }
 
 function integrationResult(status = 'completed') {
-  return { status, summary: 'handled conflict', testsRun: [], documentationUpdated: [], knownRisks: [] };
+  return { status, summary: 'handled conflict', testsRun: [], knownRisks: [] };
 }
 
 class ScriptBackend {

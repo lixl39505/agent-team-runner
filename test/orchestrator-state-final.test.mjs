@@ -30,17 +30,16 @@ function configFor(repoRoot) {
     concurrency: 1,
     agents: {
       'task-worker': { backend: 'codex', model: 'worker-model' },
-      'review-agent': { backend: 'opencode', model: 'review-model' },
-      'integration-agent': { backend: 'claude', model: 'integration-model' }
+      'review-agent': { backend: 'opencode', model: 'review-model' }
     },
     defaultAgent: 'task-worker',
-    roles: { reviewer: 'review-agent', integrator: 'integration-agent' },
+    roles: { reviewer: 'review-agent' },
     verification: {
       ...DEFAULT_CONFIG.verification,
       allowedCommandPrefixes: [...DEFAULT_CONFIG.verification.allowedCommandPrefixes, 'git status'],
       globalCommands: []
     },
-    integration: { ...DEFAULT_CONFIG.integration, runAgentAfterCherryPick: true }
+    integration: { ...DEFAULT_CONFIG.integration }
   };
 }
 
@@ -63,18 +62,12 @@ function workerResult() {
     status: 'completed',
     summary: 'implemented leaf task',
     testsRun: [],
-    knownRisks: [],
-    architectureImpact: 'none',
-    progressImpact: 'none'
+    knownRisks: []
   };
 }
 
 function approvedReview() {
   return { decision: 'approved', summary: 'reviewed', findings: [], requiredChanges: [] };
-}
-
-function integrationResult() {
-  return { status: 'completed', summary: 'finalized', testsRun: [], documentationUpdated: [], knownRisks: [] };
 }
 
 class ScriptBackend {
@@ -110,7 +103,7 @@ async function approvedCommit(repoRoot, baseSha, branch, file, content) {
   return currentHead(worktree);
 }
 
-test('orchestrator preserves bound state through verification, review, recursive dependencies, and finalization', async () => {
+test('orchestrator preserves bound state through verification, review, and recursive dependencies', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
   const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
@@ -126,10 +119,6 @@ test('orchestrator preserves bound state through verification, review, recursive
   const reviewer = new ScriptBackend('opencode', (spec) => {
     assert.equal(spec.role, 'reviewer');
     return approvedReview();
-  });
-  const integrator = new ScriptBackend('claude', (spec) => {
-    assert.equal(spec.role, 'integrator');
-    return integrationResult();
   });
   try {
     const baseSha = await currentHead(repoRoot);
@@ -149,7 +138,7 @@ test('orchestrator preserves bound state through verification, review, recursive
       config,
       db,
       runId: 'run',
-      backends: { claude: integrator, codex: worker, opencode: reviewer },
+      backends: { claude: worker, codex: worker, opencode: reviewer },
       requestApproval: approval,
       requestUserInput: userInput
     });
@@ -164,13 +153,12 @@ test('orchestrator preserves bound state through verification, review, recursive
     assert.equal(existsSync(join(runDir, 'logs', 'T003-verification-1.log')), true);
     assert.equal(existsSync(join(runDir, 'logs', 'T003-review-1.log')), true);
     assert.deepEqual(JSON.parse(readFileSync(join(runDir, 'reviews', 'T003-review-1.json'), 'utf8')), approvedReview());
-    for (const backend of [worker, reviewer, integrator]) {
+    for (const backend of [worker, reviewer]) {
       assert.equal(await backend.specs[0].requestApproval({ backend: 'test', tool: 'test', kind: 'read' }), 'once');
       assert.deepEqual(await backend.specs[0].requestUserInput({ backend: 'test', questions: [] }), {});
     }
     assert.equal(worker.specs[0].model, 'worker-model');
     assert.equal(reviewer.specs[0].model, 'review-model');
-    assert.equal(integrator.specs[0].model, 'integration-model');
   } finally {
     db.close();
   }

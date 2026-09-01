@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { ControlPlaneStore } from '../src/daemon/control-plane-store.ts';
 
 function withStore(run) {
@@ -55,7 +56,11 @@ test('queues persistent JSON interactions, filters them, and lists oldest first'
       claimedByClientId: null,
       response: null,
       claimedAt: null,
-      resolvedAt: null
+      answeredAt: null,
+      cancelledAt: null,
+      expiredAt: null,
+      expiresAt: null,
+      idempotencyKey: null
     });
     assert.deepEqual(
       store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all().map((row) => row.name),
@@ -80,9 +85,9 @@ test('claims, answers, and requeues interactions with ownership and idempotency 
     assert.throws(() => store.answerInteraction(interaction.id, 'client-b', { approved: true }), /cannot be answered/);
 
     const answered = store.answerInteraction(interaction.id, 'client-a', { approved: true, notes: ['safe'] });
-    assert.equal(answered.status, 'resolved');
+    assert.equal(answered.status, 'answered');
     assert.deepEqual(answered.response, { approved: true, notes: ['safe'] });
-    assert.ok(answered.resolvedAt);
+    assert.ok(answered.answeredAt);
     assert.deepEqual(store.answerInteraction(interaction.id, 'client-a', { approved: true, notes: ['safe'] }), answered);
     assert.throws(() => store.answerInteraction(interaction.id, 'client-b', { approved: true, notes: ['safe'] }), /cannot be answered/);
     assert.throws(() => store.answerInteraction(interaction.id, 'client-a', { approved: false }), /cannot be answered/);
@@ -115,7 +120,7 @@ test('gets interactions and waits for persistent answers without changing their 
     store.answerInteraction(resolved.id, 'client-a', { approved: true });
     assert.deepEqual(store.getInteraction(resolved.id).response, { approved: true });
     assert.deepEqual(await store.waitForInteractionAnswer(resolved.id, {
-      sleep: () => assert.fail('resolved interactions must not sleep')
+      sleep: () => assert.fail('answered interactions must not sleep')
     }), { approved: true });
 
     const queued = store.queueInteraction(interactionInput({ request: { delayed: true } }));
@@ -129,12 +134,87 @@ test('gets interactions and waits for persistent answers without changing their 
       }
     }), ['approved']);
     assert.deepEqual(sleepCalls, [7]);
-    assert.equal(store.getInteraction(queued.id).status, 'resolved');
+    assert.equal(store.getInteraction(queued.id).status, 'answered');
     assert.throws(() => store.getInteraction('missing'), /not found/);
   } finally {
     store.close();
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test('migrates resolved interactions to answered without losing their response', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'agent-team-control-plane-store-'));
+  const path = join(directory, 'state.sqlite');
+  const database = new DatabaseSync(path);
+  try {
+    database.exec(`
+      CREATE TABLE interactions (
+        id TEXT PRIMARY KEY, run_id TEXT NOT NULL, task_id TEXT, agent_id TEXT NOT NULL, session_id TEXT,
+        kind TEXT NOT NULL, request_json TEXT NOT NULL, status TEXT NOT NULL, claimed_by_client_id TEXT,
+        response_json TEXT, created_at TEXT NOT NULL, claimed_at TEXT, resolved_at TEXT
+      ) STRICT;
+    `);
+    database.prepare(`
+      INSERT INTO interactions VALUES (?, ?, NULL, ?, NULL, ?, ?, 'resolved', ?, ?, ?, ?, ?)
+    `).run(
+      'legacy', 'run-1', 'agent-1', 'approval', JSON.stringify({ command: 'npm test' }), 'client-a',
+      JSON.stringify({ approved: true }), '2026-01-01T00:00:00.000Z', '2026-01-01T00:01:00.000Z', '2026-01-01T00:02:00.000Z'
+    );
+  } finally {
+    database.close();
+  }
+
+  const store = new ControlPlaneStore(path);
+  try {
+    assert.deepEqual(store.getInteraction('legacy'), {
+      id: 'legacy', runId: 'run-1', taskId: null, agentId: 'agent-1', sessionId: null, kind: 'approval',
+      request: { command: 'npm test' }, status: 'answered', claimedByClientId: 'client-a',
+      response: { approved: true }, createdAt: '2026-01-01T00:00:00.000Z',
+      claimedAt: '2026-01-01T00:01:00.000Z', answeredAt: '2026-01-01T00:02:00.000Z',
+      cancelledAt: null, expiredAt: null, expiresAt: null, idempotencyKey: null
+    });
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('keeps answers idempotent and preserves cancelled and expired terminal interactions', () => {
+  withStore((store) => {
+    const answered = store.queueInteraction(interactionInput());
+    store.claimInteraction(answered.id, 'client-a');
+    const firstAnswer = store.answerInteraction(answered.id, 'client-a', { approved: true }, 'answer-1');
+    assert.equal(firstAnswer.idempotencyKey, 'answer-1');
+    assert.deepEqual(
+      store.answerInteraction(answered.id, 'client-a', { approved: false }, 'answer-1'),
+      firstAnswer
+    );
+    assert.throws(
+      () => store.answerInteraction(answered.id, 'client-a', { approved: true }, 'answer-2'),
+      /cannot be answered/
+    );
+
+    const cancelled = store.cancelInteraction(store.queueInteraction(interactionInput()).id);
+    assert.equal(cancelled.status, 'cancelled');
+    assert.ok(cancelled.cancelledAt);
+    assert.deepEqual(store.cancelInteraction(cancelled.id), cancelled);
+
+    const explicitlyExpired = store.expireInteraction(store.queueInteraction(interactionInput()).id);
+    assert.equal(explicitlyExpired.status, 'expired');
+    assert.ok(explicitlyExpired.expiredAt);
+    assert.deepEqual(store.expireInteraction(explicitlyExpired.id), explicitlyExpired);
+
+    const due = store.queueInteraction(interactionInput({ expiresAt: '2000-01-01T00:00:00.000Z' }));
+    assert.equal(due.status, 'expired');
+    assert.equal(due.expiresAt, '2000-01-01T00:00:00.000Z');
+    assert.throws(() => store.claimInteraction(due.id, 'client-a'), /not queued/);
+    assert.throws(() => store.queueInteraction(interactionInput({ expiresAt: 'not-a-date' })), /valid timestamp/);
+
+    assert.equal(store.requeueClientInteractions('client-a'), 0);
+    assert.equal(store.getInteraction(answered.id).status, 'answered');
+    assert.equal(store.getInteraction(cancelled.id).status, 'cancelled');
+    assert.equal(store.getInteraction(explicitlyExpired.id).status, 'expired');
+  });
 });
 
 test('rejects invalid interaction waits and honors abort signals', async () => {
@@ -209,6 +289,12 @@ test('rejects invalid interaction waits and honors abort signals', async () => {
       store.answerInteraction(defaultSleep.id, 'client-a', null);
     }, 0);
     assert.equal(await defaultWait, null);
+
+    const cancelled = store.queueInteraction(interactionInput());
+    store.cancelInteraction(cancelled.id);
+    await assert.rejects(store.waitForInteractionAnswer(cancelled.id), /cancelled/);
+    const expired = store.queueInteraction(interactionInput({ expiresAt: '2000-01-01T00:00:00.000Z' }));
+    await assert.rejects(store.waitForInteractionAnswer(expired.id), /expired/);
   } finally {
     store.close();
     rmSync(directory, { recursive: true, force: true });
@@ -307,5 +393,18 @@ test('reclaims expired controller leases and rejects expired ownership operation
     store.db.prepare('UPDATE external_run_controllers SET lease_expires_at = ? WHERE run_id = ?')
       .run('2000-01-01T00:00:00.000Z', 'run-lease');
     assert.throws(() => store.assertControllerOwnership('run-lease', 'client-b'), /not owned/);
+  });
+});
+
+test('rejects invalid terminal interaction transitions and empty idempotency keys', () => {
+  withStore((store) => {
+    const interaction = store.queueInteraction(interactionInput());
+    assert.throws(() => store.answerInteraction(interaction.id, 'client-a', true, ''), /non-empty string/);
+    store.claimInteraction(interaction.id, 'client-a');
+    store.answerInteraction(interaction.id, 'client-a', true);
+    assert.throws(() => store.cancelInteraction(interaction.id), /cannot be cancelled/);
+    assert.throws(() => store.expireInteraction(interaction.id), /cannot be expired/);
+    assert.throws(() => store.cancelInteraction('missing'), /not found/);
+    assert.throws(() => store.expireInteraction('missing'), /not found/);
   });
 });

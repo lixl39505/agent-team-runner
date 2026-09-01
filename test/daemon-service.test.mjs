@@ -2,7 +2,7 @@ import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { StateDatabase } from '../src/core/db.ts';
@@ -192,6 +192,11 @@ test('AgentTeamDaemon exposes control-plane operations through LocalIpcClient', 
       kind: 'agent_question',
       request: { question: 'Continue?' }
     });
+    for (const id of ['run-1', 'run-2']) {
+      daemon.stateDatabase.createRun({
+        id, repoRoot: '/repo', goalFile: '<test>', baseRef: 'HEAD', baseSha: 'base', adapter: 'test'
+      });
+    }
     await daemon.start();
     const client = new LocalIpcClient(home.socket);
     let foreignInteraction;
@@ -205,11 +210,15 @@ test('AgentTeamDaemon exposes control-plane operations through LocalIpcClient', 
       await client.request('controller.attach', { runId: 'run-1', host: 'host-a', clientId: 'client-a' });
       assert.equal((await client.request('interaction.claim', { id: interaction.id, clientId: 'client-a' })).status, 'claimed');
       const answered = await client.request('interaction.answer', {
-        id: interaction.id, clientId: 'client-a', response: { approved: true }
+        id: interaction.id, clientId: 'client-a', response: { approved: true }, idempotencyKey: 'answer-1'
       });
-      assert.equal(answered.status, 'resolved');
+      assert.equal(answered.status, 'answered');
       assert.deepEqual(answered.response, { approved: true });
       assert.equal(answered.claimedByClientId, 'client-a');
+      assert.equal(answered.idempotencyKey, 'answer-1');
+      assert.deepEqual(await client.request('interaction.answer', {
+        id: interaction.id, clientId: 'client-a', response: { approved: false }, idempotencyKey: 'answer-1'
+      }), answered);
 
       foreignInteraction = store.queueInteraction({
         runId: 'run-1', agentId: 'agent-foreign', kind: 'approval', request: { command: 'npm test' }
@@ -254,7 +263,7 @@ test('AgentTeamDaemon exposes control-plane operations through LocalIpcClient', 
       await assert.rejects(client.request('interaction.answer', { id: interaction.id, clientId: 'client-a' }), /response/);
       await assert.rejects(client.request('controller.heartbeat', { runId: 'run-1', clientId: 'client-b' }), /not owned/);
       await assert.rejects(client.request('controller.attach', { runId: 'run-2', host: 'host-a', clientId: 'client-a', lastAckEventId: -1 }), /lastAckEventId/);
-      await assert.rejects(client.request('controller.reconnectable', {}), /does not accept params/);
+      await assert.rejects(client.request('controller.reconnectable', { unexpected: true }), /unknown field/);
     } finally {
       client.close();
       await daemon.stop();
@@ -341,6 +350,59 @@ test('AgentTeamDaemon reads durable events with explicit controller acknowledgem
   });
 });
 
+test('AgentTeamDaemon reads bounded agent log tails only from managed recorded paths', async () => {
+  await withHome(async (home) => {
+    const daemon = new AgentTeamDaemon(home);
+    const runId = 'log-run';
+    const logPath = join(home.runsDir, runId, 'logs', 'agent.log');
+    const missingPath = join(home.runsDir, runId, 'logs', 'missing.log');
+    const directoryPath = join(home.runsDir, runId, 'logs', 'directory');
+    const outsidePath = join(home.root, 'outside.log');
+    const escapedPath = join(home.runsDir, runId, 'logs', 'escaped.log');
+    daemon.stateDatabase.createRun({
+      id: runId, repoRoot: '/repo', goalFile: 'goal.md', baseRef: 'HEAD', baseSha: 'base', adapter: 'test'
+    });
+    await mkdir(dirname(logPath), { recursive: true });
+    await mkdir(directoryPath);
+    await writeFile(logPath, 'one\ntwo\nthree\n', 'utf8');
+    await writeFile(outsidePath, 'outside\n', 'utf8');
+    await symlink(outsidePath, escapedPath);
+    for (const [agentId, recordedPath] of [
+      ['agent', logPath],
+      ['missing', missingPath],
+      ['directory', directoryPath],
+      ['escaped', escapedPath],
+      ['outside', outsidePath]
+    ]) {
+      daemon.stateDatabase.startAgentExecution({ runId, agentId, role: 'worker', backend: 'codex', logPath: recordedPath });
+    }
+    await daemon.start();
+    const client = new LocalIpcClient(home.socket);
+    try {
+      await client.connect();
+      assert.deepEqual(await client.request('execution.agent_log', { runId, agentId: 'agent', maxLines: 2, maxBytes: 1024 }), {
+        runId, agentId: 'agent', content: 'two\nthree', lineCount: 2, byteCount: 14, truncated: true
+      });
+      const byteLimited = await client.request('execution.agent_log', { runId, agentId: 'agent', maxBytes: 8 });
+      assert.equal(byteLimited.byteCount, 8);
+      assert.equal(byteLimited.truncated, true);
+      assert.match(byteLimited.content, /three$/);
+
+      await assert.rejects(client.request('execution.agent_log', { runId, agentId: 'missing' }), /does not exist: log-run\/missing/);
+      await assert.rejects(client.request('execution.agent_log', { runId, agentId: 'directory' }), /not readable: log-run\/directory.*regular file/);
+      await assert.rejects(client.request('execution.agent_log', { runId, agentId: 'escaped' }), /outside the managed run directory/);
+      await assert.rejects(client.request('execution.agent_log', { runId, agentId: 'outside' }), /outside the managed run directory/);
+      await assert.rejects(client.request('execution.agent_log', { runId, agentId: 'unknown' }), /not recorded: log-run\/unknown/);
+      await assert.rejects(client.request('execution.agent_log', { runId, agentId: 'agent', maxLines: 0 }), /maxLines/);
+      await assert.rejects(client.request('execution.agent_log', { runId, agentId: 'agent', maxBytes: 65_537 }), /maxBytes/);
+      await assert.rejects(client.request('execution.agent_log', { runId, agentId: 'agent', path: outsidePath }), /unknown field/);
+    } finally {
+      client.close();
+      await daemon.stop();
+    }
+  });
+});
+
 test('AgentTeamDaemon registers projects and materializes execution contracts through IPC', async () => {
   await withHome(async (home) => {
     const { repoRoot, gitCommonDir } = await repository(dirname(home.root));
@@ -360,6 +422,10 @@ test('AgentTeamDaemon registers projects and materializes execution contracts th
       });
       assert.match(project.id, /^project-/);
       assert.deepEqual((await client.request('project.list')).map((entry) => entry.id), [project.id]);
+      const archived = await client.request('project.archive', { projectId: project.id });
+      assert.match(archived.archivedAt, /^\d{4}-\d{2}-\d{2}T/);
+      assert.deepEqual(await client.request('project.list'), []);
+      assert.deepEqual((await client.request('project.list', { includeArchived: true })).map((entry) => entry.id), [project.id]);
 
       const submitted = await client.request('execution.submit', {
         contract: executionContract(project, repoRoot),
@@ -390,7 +456,9 @@ test('AgentTeamDaemon registers projects and materializes execution contracts th
         gitCommonDir, repoRoot, displayName: 'Bad policy', gitIdentity: {},
         policy: { ...projectPolicy(), unexpected: true }
       }), /policy contains unknown field/);
-      await assert.rejects(client.request('project.list', {}), /does not accept params/);
+      await assert.rejects(client.request('project.list', { unexpected: true }), /unknown field/);
+      await assert.rejects(client.request('project.list', { includeArchived: 'yes' }), /includeArchived/);
+      await assert.rejects(client.request('project.archive', { projectId: '' }), /projectId/);
       await assert.rejects(client.request('execution.submit', { contract: executionContract({ id: 'missing' }, repoRoot) }), /Project not found: missing/);
       await assert.rejects(client.request('execution.submit', { contract: executionContract(project, repoRoot), runId: 1 }), /runId/);
       await assert.rejects(client.request('execution.submit', {
@@ -437,6 +505,62 @@ test('AgentTeamDaemon execution.start does not schedule an already active run', 
   });
 });
 
+test('AgentTeamDaemon limits active runs globally and starts queued runs after a slot opens', async () => {
+  await withHome(async (home) => {
+    await mkdir(home.root, { recursive: true });
+    await writeFile(join(home.root, 'config.yml'), `version: 1
+concurrency:
+  maxActiveRuns: 1
+logs:
+  retentionDays: 30
+tui:
+  color: auto
+`, 'utf8');
+    const { repoRoot, gitCommonDir } = await repository(dirname(home.root));
+    const releases = new Map([['queued-first', deferred()], ['queued-second', deferred()]]);
+    const started = [];
+    let active = 0;
+    let peakActive = 0;
+    const daemon = new AgentTeamDaemon(home, {
+      runExecutor: async (input) => {
+        started.push(input.runId);
+        active += 1;
+        peakActive = Math.max(peakActive, active);
+        await releases.get(input.runId).promise;
+        active -= 1;
+        input.db.updateRun(input.runId, { status: 'done' });
+      }
+    });
+    await daemon.start();
+    const client = new LocalIpcClient(home.socket);
+    try {
+      await client.connect();
+      const project = await client.request('project.register', {
+        gitCommonDir, repoRoot, displayName: 'Globally limited execution', gitIdentity: {}, policy: projectPolicy()
+      });
+      assert.deepEqual(await client.request('execution.submit', {
+        contract: executionContract(project, repoRoot), runId: 'queued-first'
+      }), { runId: 'queued-first', scheduled: true });
+      await waitFor(() => started.length === 1);
+      assert.deepEqual(await client.request('execution.submit', {
+        contract: executionContract(project, repoRoot), runId: 'queued-second'
+      }), { runId: 'queued-second', scheduled: false });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.deepEqual(started, ['queued-first']);
+
+      releases.get('queued-first').resolve();
+      await waitFor(() => started.length === 2);
+      assert.deepEqual(started, ['queued-first', 'queued-second']);
+      assert.equal(peakActive, 1);
+    } finally {
+      releases.get('queued-first').resolve();
+      releases.get('queued-second').resolve();
+      client.close();
+      await daemon.stop();
+    }
+  });
+});
+
 test('AgentTeamDaemon cancels active and planned runs through IPC', async () => {
   await withHome(async (home) => {
     const { repoRoot, gitCommonDir } = await repository(dirname(home.root));
@@ -447,6 +571,7 @@ test('AgentTeamDaemon cancels active and planned runs through IPC', async () => 
         executorStarted = true;
         await new Promise((resolve) => input.signal.addEventListener('abort', resolve, { once: true }));
         aborted.resolve();
+        throw new Error('executor cancelled');
       }
     });
     await daemon.start();
@@ -464,9 +589,14 @@ test('AgentTeamDaemon cancels active and planned runs through IPC', async () => 
         runId: 'active-cancellation', cancelled: true
       });
       await aborted.promise;
-      assert.equal(daemon.stateDatabase.getRun('active-cancellation').status, 'needs_attention');
-      assert.equal(daemon.stateDatabase.getRun('active-cancellation').error, 'Cancelled by controller; run again to resume.');
+      await waitFor(() => daemon.stateDatabase.getRun('active-cancellation').runtimeState === 'paused');
+      const activeCancellation = daemon.stateDatabase.getRun('active-cancellation');
+      assert.equal(activeCancellation.status, 'cancelled');
+      assert.equal(activeCancellation.desiredState, 'cancel_requested');
+      assert.equal(activeCancellation.runtimeState, 'paused');
+      assert.equal(activeCancellation.error, 'Cancelled by controller; run again to resume.');
       assert.equal(eventTypes(daemon.stateDatabase, 'active-cancellation').filter((type) => type === 'RUN_CANCELLED').length, 1);
+      assert.equal(eventTypes(daemon.stateDatabase, 'active-cancellation').includes('RUN_DAEMON_FAILED'), false);
 
       daemon.stateDatabase.createRun({
         id: 'planned-cancellation', repoRoot, goalFile: 'goal.md', baseRef: 'HEAD', baseSha: 'base', adapter: 'external'
@@ -475,8 +605,10 @@ test('AgentTeamDaemon cancels active and planned runs through IPC', async () => 
       assert.deepEqual(await client.request('execution.cancel', { runId: 'planned-cancellation' }), {
         runId: 'planned-cancellation', cancelled: true
       });
-      assert.equal(daemon.stateDatabase.getRun('planned-cancellation').status, 'needs_attention');
-      assert.equal(daemon.stateDatabase.getRun('planned-cancellation').error, 'Cancelled by controller; run again to resume.');
+      const plannedCancellation = daemon.stateDatabase.getRun('planned-cancellation');
+      assert.equal(plannedCancellation.status, 'cancelled');
+      assert.equal(plannedCancellation.desiredState, 'cancel_requested');
+      assert.equal(plannedCancellation.error, 'Cancelled by controller; run again to resume.');
       assert.equal(eventTypes(daemon.stateDatabase, 'planned-cancellation').filter((type) => type === 'RUN_CANCELLED').length, 1);
       await client.request('execution.cancel', { runId: 'planned-cancellation' });
       assert.equal(eventTypes(daemon.stateDatabase, 'planned-cancellation').filter((type) => type === 'RUN_CANCELLED').length, 1);
@@ -569,6 +701,24 @@ test('AgentTeamDaemon recovers persisted planned external runs when restarted', 
       runId: 'recover-running'
     });
     database.updateRun('recover-running', { status: 'running' });
+    await createExecutionRun({
+      config: runnerConfigFromProjectPolicy(policy, project, home),
+      db: database,
+      contract: executionContract(project, repoRoot),
+      projectPolicyRevisionId: policy.id,
+      runId: 'paused-planned'
+    });
+    database.updateRun('paused-planned', { desiredState: 'paused', runtimeState: 'paused' });
+    await createExecutionRun({
+      config: runnerConfigFromProjectPolicy(policy, project, home),
+      db: database,
+      contract: executionContract(project, repoRoot),
+      projectPolicyRevisionId: policy.id,
+      runId: 'cancel-requested-running'
+    });
+    database.updateRun('cancel-requested-running', {
+      status: 'running', desiredState: 'cancel_requested', runtimeState: 'cancelling'
+    });
     database.close();
     registry.close();
 
@@ -579,8 +729,69 @@ test('AgentTeamDaemon recovers persisted planned external runs when restarted', 
       await waitFor(() => executorInputs.length === 2);
       assert.deepEqual(executorInputs.map((input) => input.runId).sort(), ['recover-planned', 'recover-running']);
       assert.equal(executorInputs[0].config.workspace.repoRoot, repoRoot);
+      assert.equal(daemon.stateDatabase.getRun('paused-planned').runtimeState, 'paused');
+      assert.equal(daemon.stateDatabase.getRun('cancel-requested-running').runtimeState, 'cancelling');
     } finally {
       await daemon.stop();
+    }
+  });
+});
+
+test('AgentTeamDaemon keeps paused runs unscheduled until execution.start restores desired running', async () => {
+  await withHome(async (home) => {
+    const { repoRoot, gitCommonDir } = await repository(dirname(home.root));
+    const paused = deferred();
+    let firstExecutionStarted = false;
+    const firstDaemon = new AgentTeamDaemon(home, {
+      runExecutor: async (input) => {
+        firstExecutionStarted = true;
+        await new Promise((resolve) => input.signal.addEventListener('abort', resolve, { once: true }));
+        paused.resolve();
+      }
+    });
+    await firstDaemon.start();
+    const firstClient = new LocalIpcClient(home.socket);
+    try {
+      await firstClient.connect();
+      const project = await firstClient.request('project.register', {
+        gitCommonDir, repoRoot, displayName: 'Pausable execution', gitIdentity: {}, policy: projectPolicy()
+      });
+      await firstClient.request('execution.submit', {
+        contract: executionContract(project, repoRoot), runId: 'pause-recovery'
+      });
+      await waitFor(() => firstExecutionStarted);
+      assert.deepEqual(await firstClient.request('execution.pause', { runId: 'pause-recovery' }), {
+        runId: 'pause-recovery', paused: true
+      });
+      await paused.promise;
+      await waitFor(() => firstDaemon.stateDatabase.getRun('pause-recovery').runtimeState === 'paused');
+      assert.equal(firstDaemon.stateDatabase.getRun('pause-recovery').desiredState, 'paused');
+    } finally {
+      firstClient.close();
+      await firstDaemon.stop();
+    }
+
+    const resumedExecutions = [];
+    const secondDaemon = new AgentTeamDaemon(home, {
+      runExecutor: async (input) => { resumedExecutions.push(input.runId); }
+    });
+    const secondClient = new LocalIpcClient(home.socket);
+    try {
+      await secondDaemon.start();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.deepEqual(resumedExecutions, []);
+      assert.equal(secondDaemon.stateDatabase.getRun('pause-recovery').desiredState, 'paused');
+
+      await secondClient.connect();
+      assert.deepEqual(await secondClient.request('execution.start', { runId: 'pause-recovery' }), {
+        runId: 'pause-recovery', scheduled: true
+      });
+      await waitFor(() => resumedExecutions.length === 1);
+      assert.deepEqual(resumedExecutions, ['pause-recovery']);
+      assert.equal(secondDaemon.stateDatabase.getRun('pause-recovery').desiredState, 'running');
+    } finally {
+      secondClient.close();
+      await secondDaemon.stop();
     }
   });
 });
@@ -721,7 +932,11 @@ test('AgentTeamDaemon persists contract blocks and non-activity agent events saf
         claimedByClientId: null,
         response: null,
         claimedAt: null,
-        resolvedAt: null
+        answeredAt: null,
+        cancelledAt: null,
+        expiredAt: null,
+        expiresAt: null,
+        idempotencyKey: null
       });
       const events = daemon.stateDatabase.listEvents('contract-block-execution');
       assert.equal(events.filter((event) => event.eventType === 'AGENT_EVENT').length, 3);
@@ -831,6 +1046,8 @@ test('AgentTeamDaemon marks executor failures in the run database', async () => 
 test('AgentTeamDaemon revises a blocked execution contract and resets its downstream tasks', async () => {
   await withHome(async (home) => {
     const { repoRoot, gitCommonDir } = await repository(dirname(home.root));
+    await mkdir(join(repoRoot, '.agents', 'skills', 'test-skill'), { recursive: true });
+    await writeFile(join(repoRoot, '.agents', 'skills', 'test-skill', 'SKILL.md'), 'first snapshot', 'utf8');
     let executions = 0;
     const daemon = new AgentTeamDaemon(home, {
       runExecutor: async (input) => {
@@ -854,6 +1071,8 @@ test('AgentTeamDaemon revises a blocked execution contract and resets its downst
       const contract = executionContract(project, repoRoot);
       await client.request('execution.submit', { contract, runId: 'revision-execution' });
       await waitFor(() => daemon.stateDatabase.getTask('revision-execution', 'T001').status === 'blocked_on_contract');
+      assert.equal(JSON.parse(daemon.stateDatabase.getTask('revision-execution', 'T001').resolvedSkillsJson)[0].content, 'first snapshot');
+      await writeFile(join(repoRoot, '.agents', 'skills', 'test-skill', 'SKILL.md'), 'revised snapshot', 'utf8');
       const revised = {
         ...contract,
         tasks: [
@@ -874,6 +1093,10 @@ test('AgentTeamDaemon revises a blocked execution contract and resets its downst
       assert.deepEqual(daemon.stateDatabase.listTasks('revision-execution').map((task) => [task.taskId, task.status]), [
         ['T001', 'pending'], ['T002', 'pending']
       ]);
+      for (const taskId of ['T001', 'T002']) {
+        const [skill] = JSON.parse(daemon.stateDatabase.getTask('revision-execution', taskId).resolvedSkillsJson);
+        assert.equal(skill.content, 'revised snapshot');
+      }
     } finally {
       client.close();
       await daemon.stop();

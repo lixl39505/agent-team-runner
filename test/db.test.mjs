@@ -144,3 +144,27 @@ test('lists durable events as ordered JSON records with bounded cursor paginatio
     db.close();
   }
 });
+
+test('coordinates execution leases across acquisition, renewal, release, and expiry', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-team-db-leases-'));
+  const db = new StateDatabase(join(dir, 'state.sqlite'));
+  try {
+    db.createRun({ id: 'leased-run', repoRoot: dir, goalFile: 'goal.md', baseRef: 'HEAD', baseSha: 'abc', adapter: 'external' });
+
+    assert.equal(db.acquireExecutionLease('leased-run', 'epoch-a', 'daemon-a', 30_000), true);
+    assert.equal(db.acquireExecutionLease('leased-run', 'epoch-b', 'daemon-b', 30_000), false);
+    assert.equal(db.renewExecutionLease('leased-run', 'epoch-a', 'daemon-a', 30_000), true);
+    assert.equal(db.renewExecutionLease('leased-run', 'epoch-b', 'daemon-b', 30_000), false);
+
+    db.releaseExecutionLease('leased-run', 'epoch-b', 'daemon-b');
+    assert.equal(db.acquireExecutionLease('leased-run', 'epoch-b', 'daemon-b', 30_000), false);
+    db.releaseExecutionLease('leased-run', 'epoch-a', 'daemon-a');
+    assert.equal(db.acquireExecutionLease('leased-run', 'epoch-b', 'daemon-b', 30_000), true);
+
+    db.db.prepare("UPDATE execution_leases SET expires_at = '1970-01-01T00:00:00.000Z' WHERE run_id = ?").run('leased-run');
+    assert.equal(db.releaseExpiredExecutionLeases(), 1);
+    assert.equal(db.acquireExecutionLease('leased-run', 'epoch-c', 'daemon-c', 30_000), true);
+  } finally {
+    db.close();
+  }
+});

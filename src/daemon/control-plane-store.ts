@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 export type JsonValue = boolean | null | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 export type InteractionKind = 'approval' | 'agent_question' | 'contract_block';
-export type InteractionStatus = 'queued' | 'claimed' | 'resolved';
+export type InteractionStatus = 'queued' | 'claimed' | 'answered' | 'cancelled' | 'expired';
 export type ControllerStatus = 'connected' | 'disconnected';
 
 export interface InteractionRecord {
@@ -22,7 +22,11 @@ export interface InteractionRecord {
   response: JsonValue | null;
   createdAt: string;
   claimedAt: string | null;
-  resolvedAt: string | null;
+  answeredAt: string | null;
+  cancelledAt: string | null;
+  expiredAt: string | null;
+  expiresAt: string | null;
+  idempotencyKey: string | null;
 }
 
 export interface ControllerRecord {
@@ -45,6 +49,7 @@ export interface QueueInteractionInput {
   sessionId?: string | null;
   kind: InteractionKind;
   request: JsonValue;
+  expiresAt?: string | null;
 }
 
 export interface AttachControllerInput {
@@ -67,6 +72,12 @@ function now(): string {
   return new Date().toISOString();
 }
 
+function normalizeTimestamp(value: string, label: string): string {
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) throw new Error(`${label} must be a valid timestamp`);
+  return timestamp.toISOString();
+}
+
 function assertNonNegativeEventId(value: number, label: string): void {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new Error(`${label} must be a non-negative integer`);
@@ -87,7 +98,11 @@ function mapInteraction(row: Record<string, unknown>): InteractionRecord {
     response: row.response_json === null ? null : JSON.parse(String(row.response_json)) as JsonValue,
     createdAt: String(row.created_at),
     claimedAt: row.claimed_at === null ? null : String(row.claimed_at),
-    resolvedAt: row.resolved_at === null ? null : String(row.resolved_at)
+    answeredAt: row.answered_at === null ? null : String(row.answered_at),
+    cancelledAt: row.cancelled_at === null ? null : String(row.cancelled_at),
+    expiredAt: row.expired_at === null ? null : String(row.expired_at),
+    expiresAt: row.expires_at === null ? null : String(row.expires_at),
+    idempotencyKey: row.idempotency_key === null ? null : String(row.idempotency_key)
   };
 }
 
@@ -161,7 +176,12 @@ export class ControlPlaneStore {
         response_json TEXT,
         created_at TEXT NOT NULL,
         claimed_at TEXT,
-        resolved_at TEXT
+        resolved_at TEXT,
+        answered_at TEXT,
+        cancelled_at TEXT,
+        expired_at TEXT,
+        expires_at TEXT,
+        idempotency_key TEXT
       ) STRICT;
 
       CREATE TABLE IF NOT EXISTS external_run_controllers (
@@ -175,6 +195,16 @@ export class ControlPlaneStore {
         released_at TEXT
       ) STRICT;
     `);
+    this.addColumnIfMissing('interactions', 'answered_at', 'TEXT');
+    this.addColumnIfMissing('interactions', 'cancelled_at', 'TEXT');
+    this.addColumnIfMissing('interactions', 'expired_at', 'TEXT');
+    this.addColumnIfMissing('interactions', 'expires_at', 'TEXT');
+    this.addColumnIfMissing('interactions', 'idempotency_key', 'TEXT');
+    this.db.exec(`
+      UPDATE interactions
+      SET status = 'answered', answered_at = COALESCE(answered_at, resolved_at)
+      WHERE status = 'resolved'
+    `);
     this.addColumnIfMissing('external_run_controllers', 'last_heartbeat_at', 'TEXT');
     this.addColumnIfMissing('external_run_controllers', 'lease_expires_at', 'TEXT');
   }
@@ -182,11 +212,16 @@ export class ControlPlaneStore {
   queueInteraction(input: QueueInteractionInput): InteractionRecord {
     const timestamp = now();
     const id = randomUUID();
+    const expiresAt = input.expiresAt === undefined || input.expiresAt === null
+      ? null
+      : normalizeTimestamp(input.expiresAt, 'expiresAt');
+    const expired = expiresAt !== null && expiresAt <= timestamp;
     this.db.prepare(`
       INSERT INTO interactions (
         id, run_id, task_id, agent_id, session_id, kind, request_json, status,
-        claimed_by_client_id, response_json, created_at, claimed_at, resolved_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', NULL, NULL, ?, NULL, NULL)
+        claimed_by_client_id, response_json, created_at, claimed_at, resolved_at,
+        answered_at, cancelled_at, expired_at, expires_at, idempotency_key
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?, ?, NULL)
     `).run(
       id,
       input.runId,
@@ -195,12 +230,16 @@ export class ControlPlaneStore {
       input.sessionId ?? null,
       input.kind,
       JSON.stringify(input.request),
-      timestamp
+      expired ? 'expired' : 'queued',
+      timestamp,
+      expired ? timestamp : null,
+      expiresAt
     );
     return mapInteraction(this.findInteraction(id) as Record<string, unknown>);
   }
 
   listInteractions(runId?: string): InteractionRecord[] {
+    this.expireExpiredInteractions();
     const rows = runId === undefined
       ? this.db.prepare('SELECT * FROM interactions ORDER BY created_at, id').all()
       : this.db.prepare('SELECT * FROM interactions WHERE run_id = ? ORDER BY created_at, id').all(runId);
@@ -208,6 +247,7 @@ export class ControlPlaneStore {
   }
 
   getInteraction(id: string): InteractionRecord {
+    this.expireExpiredInteractions();
     const row = this.findInteraction(id);
     if (!row) throw new Error(`Interaction not found: ${id}`);
     return mapInteraction(row);
@@ -229,12 +269,16 @@ export class ControlPlaneStore {
     while (true) {
       throwIfAborted(options.signal);
       const interaction = this.getInteraction(id);
-      if (interaction.status === 'resolved') return interaction.response;
+      if (interaction.status === 'answered') return interaction.response;
+      if (interaction.status === 'cancelled' || interaction.status === 'expired') {
+        throw new Error(`Interaction is ${interaction.status}: ${id}`);
+      }
       await sleepUntilAbort(sleep, pollIntervalMs, options.signal);
     }
   }
 
   claimInteraction(id: string, clientId: string): InteractionRecord {
+    this.expireExpiredInteractions();
     const row = this.db.prepare(`
       UPDATE interactions
       SET status = 'claimed', claimed_by_client_id = ?, claimed_at = ?
@@ -245,32 +289,49 @@ export class ControlPlaneStore {
     return mapInteraction(row);
   }
 
-  answerInteraction(id: string, clientId: string, response: JsonValue): InteractionRecord {
+  answerInteraction(id: string, clientId: string, response: JsonValue, idempotencyKey?: string): InteractionRecord {
+    this.expireExpiredInteractions();
+    if (idempotencyKey !== undefined && idempotencyKey.length === 0) {
+      throw new Error('idempotencyKey must be a non-empty string');
+    }
     const responseJson = JSON.stringify(response);
     const row = this.db.prepare(`
       UPDATE interactions
-      SET status = 'resolved', response_json = ?, resolved_at = ?
+      SET status = 'answered', response_json = ?, answered_at = ?, idempotency_key = ?
       WHERE id = ? AND status = 'claimed' AND claimed_by_client_id = ?
       RETURNING *
-    `).get(responseJson, now(), id, clientId) as Record<string, unknown> | undefined;
+    `).get(responseJson, now(), idempotencyKey ?? null, id, clientId) as Record<string, unknown> | undefined;
     if (row) return mapInteraction(row);
 
     const existing = this.findInteraction(id);
     if (!existing) throw new Error(`Interaction not found: ${id}`);
-    if (existing.status === 'resolved'
+    if (existing.status === 'answered'
       && existing.claimed_by_client_id === clientId
-      && existing.response_json === responseJson) {
+      && ((idempotencyKey !== undefined && existing.idempotency_key === idempotencyKey)
+        || (idempotencyKey === undefined && existing.response_json === responseJson))) {
       return mapInteraction(existing);
     }
     throw new Error(`Interaction cannot be answered by client: ${clientId}`);
   }
 
   requeueClientInteractions(clientId: string): number {
+    this.expireExpiredInteractions();
     return Number(this.db.prepare(`
       UPDATE interactions
       SET status = 'queued', claimed_by_client_id = NULL, claimed_at = NULL
       WHERE status = 'claimed' AND claimed_by_client_id = ?
     `).run(clientId).changes);
+  }
+
+  requeueDisconnectedControllerInteractions(): number {
+    this.expireExpiredInteractions();
+    return Number(this.db.prepare(`
+      UPDATE interactions
+      SET status = 'queued', claimed_by_client_id = NULL, claimed_at = NULL
+      WHERE status = 'claimed' AND run_id IN (
+        SELECT run_id FROM external_run_controllers WHERE status = 'disconnected'
+      )
+    `).run().changes);
   }
 
   attachController(input: AttachControllerInput): ControllerRecord {
@@ -407,6 +468,54 @@ export class ControlPlaneStore {
       WHERE status = 'disconnected'
       ORDER BY run_id
     `).all() as Record<string, unknown>[]).map(mapController);
+  }
+
+  releaseExpiredControllerLeases(): number {
+    return Number(this.db.prepare(`
+      UPDATE external_run_controllers
+      SET status = 'disconnected', released_at = ?
+      WHERE status = 'connected' AND lease_expires_at < ?
+    `).run(now(), now()).changes);
+  }
+
+  cancelInteraction(id: string): InteractionRecord {
+    this.expireExpiredInteractions();
+    const row = this.db.prepare(`
+      UPDATE interactions
+      SET status = 'cancelled', cancelled_at = ?
+      WHERE id = ? AND status IN ('queued', 'claimed')
+      RETURNING *
+    `).get(now(), id) as Record<string, unknown> | undefined;
+    if (row) return mapInteraction(row);
+
+    const existing = this.findInteraction(id);
+    if (!existing) throw new Error(`Interaction not found: ${id}`);
+    if (existing.status === 'cancelled') return mapInteraction(existing);
+    throw new Error(`Interaction cannot be cancelled: ${id}`);
+  }
+
+  expireInteraction(id: string): InteractionRecord {
+    const row = this.db.prepare(`
+      UPDATE interactions
+      SET status = 'expired', expired_at = ?
+      WHERE id = ? AND status IN ('queued', 'claimed')
+      RETURNING *
+    `).get(now(), id) as Record<string, unknown> | undefined;
+    if (row) return mapInteraction(row);
+
+    const existing = this.findInteraction(id);
+    if (!existing) throw new Error(`Interaction not found: ${id}`);
+    if (existing.status === 'expired') return mapInteraction(existing);
+    throw new Error(`Interaction cannot be expired: ${id}`);
+  }
+
+  expireExpiredInteractions(): number {
+    const timestamp = now();
+    return Number(this.db.prepare(`
+      UPDATE interactions
+      SET status = 'expired', expired_at = ?
+      WHERE status IN ('queued', 'claimed') AND expires_at IS NOT NULL AND expires_at <= ?
+    `).run(timestamp, timestamp).changes);
   }
 
   close(): void {

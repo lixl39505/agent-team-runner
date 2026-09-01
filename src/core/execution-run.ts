@@ -7,6 +7,7 @@ import { writeJson, writeTaskMarkdown } from './files.js';
 import { ensureGitRepo, revParse } from './git.js';
 import { assertAllowedCommand } from './shell.js';
 import type { ExecutionContract, RunManifest, RunnerConfig } from './types.js';
+import { localSkillRoots, snapshotTaskSkills } from './skill-handoff.js';
 import { validateExecutionContract } from './validation.js';
 
 function createRunId(now: Date): string {
@@ -30,6 +31,8 @@ export async function createExecutionRun(input: {
   contract: unknown;
   projectPolicyRevisionId?: string;
   runId?: string;
+  /** Test seam for the fixed user-local Skill root. */
+  userHome?: string;
   /** Test seam for deterministic generated run ids. */
   now?: () => Date;
 }): Promise<string> {
@@ -45,6 +48,8 @@ export async function createExecutionRun(input: {
   if (contractRepoRoot !== repoRoot) {
     throw new Error(`Execution contract repository does not match configured workspace: ${contractRepoRoot} !== ${repoRoot}`);
   }
+  const skillRoots = localSkillRoots(repoRoot, input.userHome);
+  const taskSkills = new Map(contract.tasks.map((task) => [task.id, snapshotTaskSkills(task, skillRoots)]));
 
   const runId = input.runId ?? createRunId((input.now ?? (() => new Date()))());
   assertSafeRunId(runId);
@@ -73,7 +78,7 @@ export async function createExecutionRun(input: {
     };
     writeJson(join(runDir, 'contract.json'), contract);
     for (const task of contract.tasks) {
-      input.db.insertTask(runId, task);
+      input.db.insertTask(runId, task, taskSkills.get(task.id));
       writeTaskMarkdown(join(runDir, 'tasks', `${task.id}.md`), task, baseSha);
     }
     input.db.updateRun(runId, {

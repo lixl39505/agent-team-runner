@@ -1,6 +1,6 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile, access } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, access, stat } from 'node:fs/promises';
 import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -51,6 +51,7 @@ test('LocalIpcServer and LocalIpcClient exchange requests and clean socket files
     const server = new LocalIpcServer();
     server.register('echo', async (params) => ({ params }));
     await server.start(path);
+    assert.equal((await stat(path)).mode & 0o777, 0o600);
     await assert.rejects(server.start(path), /already running/);
 
     const client = new LocalIpcClient(path);

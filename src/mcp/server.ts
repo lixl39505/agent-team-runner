@@ -23,7 +23,9 @@ const projectRegistrationInput = z.object({
   repoRoot: nonEmptyString,
   displayName: nonEmptyString,
   gitIdentity: jsonValue,
-  policy: projectPolicyInput
+  policy: projectPolicyInput,
+  createdBy: nonEmptyString.optional(),
+  note: nonEmptyString.optional()
 }).strict();
 
 function errorMessage(error: unknown): string {
@@ -61,7 +63,7 @@ export function createMcpServer(ipc: IpcRequester): McpServer {
   }, () => requestTool(ipc, 'health'));
 
   server.registerTool('agent_team_list_interactions', {
-    description: 'List queued, claimed, and resolved interactions, optionally for one run.',
+    description: 'List queued, claimed, answered, cancelled, and expired interactions, optionally for one run.',
     inputSchema: z.object({ runId: nonEmptyString.optional() }).strict()
   }, (input) => requestTool(
     ipc,
@@ -79,7 +81,8 @@ export function createMcpServer(ipc: IpcRequester): McpServer {
     inputSchema: z.object({
       id: nonEmptyString,
       clientId: nonEmptyString,
-      response: z.json()
+      response: z.json(),
+      idempotencyKey: nonEmptyString.optional()
     }).strict()
   }, (input) => requestTool(ipc, 'interaction.answer', input));
 
@@ -111,8 +114,12 @@ export function createMcpServer(ipc: IpcRequester): McpServer {
 
   server.registerTool('agent_team_list_reconnectable_runs', {
     description: 'List runs whose controllers can reconnect.',
-    inputSchema: emptyInput
-  }, () => requestTool(ipc, 'controller.reconnectable'));
+    inputSchema: z.object({ projectId: nonEmptyString.optional() }).strict()
+  }, (input) => requestTool(
+    ipc,
+    'controller.reconnectable',
+    input.projectId === undefined ? undefined : { projectId: input.projectId }
+ ));
 
   server.registerTool('agent_team_register_project', {
     description: 'Register a repository and its execution policy.',
@@ -120,9 +127,23 @@ export function createMcpServer(ipc: IpcRequester): McpServer {
   }, (input) => requestTool(ipc, 'project.register', input));
 
   server.registerTool('agent_team_list_projects', {
-    description: 'List registered projects.',
-    inputSchema: emptyInput
-  }, () => requestTool(ipc, 'project.list'));
+    description: 'List registered projects; archived projects are hidden unless requested.',
+    inputSchema: z.object({ includeArchived: z.boolean().optional() }).strict()
+  }, (input) => requestTool(
+    ipc,
+    'project.list',
+    input.includeArchived === undefined ? undefined : { includeArchived: input.includeArchived }
+  ));
+
+  server.registerTool('agent_team_archive_project', {
+    description: 'Archive a registered project so it is hidden from the default project list.',
+    inputSchema: z.object({ projectId: nonEmptyString }).strict()
+  }, (input) => requestTool(ipc, 'project.archive', input));
+
+  server.registerTool('agent_team_list_project_skills', {
+    description: 'List safe project-local implementation Skills available to execution contracts.',
+    inputSchema: z.object({ projectId: nonEmptyString }).strict()
+  }, (input) => requestTool(ipc, 'project.skills', input));
 
   server.registerTool('agent_team_submit_execution_contract', {
     description: 'Submit a validated execution contract for a registered project.',
@@ -156,6 +177,11 @@ export function createMcpServer(ipc: IpcRequester): McpServer {
     inputSchema: z.object({ runId: nonEmptyString }).strict()
   }, (input) => requestTool(ipc, 'execution.start', input));
 
+  server.registerTool('agent_team_pause_run', {
+    description: 'Pause an active execution run without cancelling its contract.',
+    inputSchema: z.object({ runId: nonEmptyString }).strict()
+  }, (input) => requestTool(ipc, 'execution.pause', input));
+
   server.registerTool('agent_team_cancel_run', {
     description: 'Cancel an execution run so it can be resumed later.',
     inputSchema: z.object({ runId: nonEmptyString }).strict()
@@ -165,6 +191,16 @@ export function createMcpServer(ipc: IpcRequester): McpServer {
     description: 'Get a run, its tasks, and its agent executions.',
     inputSchema: z.object({ runId: nonEmptyString }).strict()
   }, (input) => requestTool(ipc, 'execution.get', input));
+
+  server.registerTool('agent_team_read_agent_log', {
+    description: 'Read a bounded tail of an agent log recorded for a run. File paths cannot be supplied.',
+    inputSchema: z.object({
+      runId: nonEmptyString,
+      agentId: nonEmptyString,
+      maxLines: z.number().int().min(1).max(200).optional(),
+      maxBytes: z.number().int().min(1).max(64 * 1024).optional()
+    }).strict()
+  }, (input) => requestTool(ipc, 'execution.agent_log', input));
 
   server.registerTool('agent_team_get_handoff', {
     description: 'Get the durable handoff for a completed execution run.',

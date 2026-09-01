@@ -65,7 +65,7 @@ test('converts a complete project policy into an isolated runner config', () => 
       retry: { maxWorkerAttempts: 4, maxReviewCycles: 5 },
       status: { pollIntervalMs: 300 },
       interactionAlert: { background: '#123456', foreground: '#abcdef' },
-      integration: { allowedPaths: ['src/**'], runAgentAfterCherryPick: false }
+      integration: { allowedPaths: ['src/**'] }
     }
   });
   const config = runnerConfigFromProjectPolicy(input, project, home);
@@ -85,7 +85,7 @@ test('converts a complete project policy into an isolated runner config', () => 
   assert.deepEqual(config.backends.codex.extraArgs, ['--quiet']);
   assert.deepEqual(
     [config.concurrency, config.staleAfterMs, config.taskTimeoutMs, config.retry, config.status, config.interactionAlert, config.integration],
-    [5, 100, 200, { maxWorkerAttempts: 4, maxReviewCycles: 5 }, { pollIntervalMs: 300 }, { background: '#123456', foreground: '#abcdef' }, { allowedPaths: ['src/**'], runAgentAfterCherryPick: false }]
+    [5, 100, 200, { maxWorkerAttempts: 4, maxReviewCycles: 5 }, { pollIntervalMs: 300 }, { background: '#123456', foreground: '#abcdef' }, { allowedPaths: ['src/**'] }]
   );
 
   config.backends.codex.extraArgs.push('--mutated');
@@ -164,7 +164,7 @@ test('rejects invalid agents, backend ids, and non-positive numeric policy value
   assert.throws(() => runnerConfigFromProjectPolicy(policy({ agentProfileMapping: { defaultAgent: 'worker', agents: { worker: { backend: 'codex', authIsolation: 'per-run' } } } }), project, home), /authIsolation/);
   assert.throws(() => runnerConfigFromProjectPolicy(policy({ backendPolicy: { backends: { other: {} } } }), project, home), /unknown backend/);
   assert.throws(() => runnerConfigFromProjectPolicy(policy({ backendPolicy: { backends: { claude: { nativeWindowsSandbox: 'unsafe' } } } }), project, home), /nativeWindowsSandbox/);
-  assert.throws(() => runnerConfigFromProjectPolicy(policy({ backendPolicy: { integration: { runAgentAfterCherryPick: 'no' } } }), project, home), /must be a boolean/);
+  assert.throws(() => runnerConfigFromProjectPolicy(policy({ backendPolicy: { integration: { runAgentAfterCherryPick: false } } }), project, home), /is not allowed/);
   for (const backendPolicy of [
     { concurrency: 0 },
     { staleAfterMs: -1 },

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
 import { test } from 'vitest';
-import { runAttachCli } from '../src/attach-cli.ts';
+import { attachArguments, runAttachCli } from '../src/attach-cli.ts';
 
 const home = {
   root: '/tmp/agent-team',
@@ -21,6 +21,13 @@ function output(tty = false) {
     stream.columns = 120;
     stream.rows = 20;
   }
+  return stream;
+}
+
+function input() {
+  const stream = new PassThrough();
+  stream.isTTY = true;
+  stream.setRawMode = () => {};
   return stream;
 }
 
@@ -87,7 +94,7 @@ test('attach parses --home, uses hostname and UUID, renders before advancing its
   assert.equal(calls.at(-1)[0], 'close');
 });
 
-test('attach answers approval, agent question, and contract block interactions', async () => {
+test('attach answers approval, agent question, and contract block interactions after a keyboard a command', async () => {
   const cases = [
     [{ id: 'approval', status: 'queued', kind: 'approval', request: { tool: 'Bash', allowSession: true } }, ['s'], 'session'],
     [{ id: 'question', status: 'queued', kind: 'agent_question', request: { questions: [{ id: 'choice', question: 'Choose', options: [{ label: 'one' }, { label: 'two' }], multiple: true, allowCustom: true }] } }, ['1, custom'], { choice: ['one', 'custom'] }],
@@ -95,17 +102,73 @@ test('attach answers approval, agent question, and contract block interactions',
   ];
   for (const [interaction, answers, expected] of cases) {
     const { client, calls } = clientFor([interaction]);
+    const keyboard = input();
+    let sleeps = 0;
     await runAttachCli(['run-1'], {
       resolveHome: () => home,
       createClient: () => client,
+      input: keyboard,
       output: output(true),
       randomUUID: () => 'client-1',
       ask: async () => answers.shift(),
       registerSignal: (_signal, listener) => { client.stop = listener; },
-      sleep: async () => client.stop()
+      sleep: async () => {
+        sleeps += 1;
+        if (sleeps === 1) keyboard.write('a');
+        else client.stop();
+      }
     });
     const answer = calls.find(([name]) => name === 'interaction.answer');
     assert.deepEqual(answer[1].response, expected);
+  }
+});
+
+test('attach reads the selected agent log on l and renders durable events when the log is unavailable', async () => {
+  for (const [logResult, expected] of [
+    [{ runId: 'run-1', agentId: 'agent-1', content: 'tail line' }, /tail line/],
+    [new Error('Agent log does not exist: run-1\/agent-1'), /EVENT FALLBACK[\s\S]*Agent log does not exist[\s\S]*durable event/i]
+  ]) {
+    const calls = [];
+    const keyboard = input();
+    const screen = output(true);
+    let stop;
+    let sleeps = 0;
+    const client = {
+      connect: async () => {},
+      close: () => {},
+      request: async (method, params) => {
+        calls.push([method, params]);
+        if (method === 'execution.events') {
+          return { events: [{ eventType: 'AGENT_EVENT', payload: { execution: { agentId: 'agent-1' }, event: { type: 'message', text: 'durable event' } } }], lastEventId: 1 };
+        }
+        if (method === 'execution.get') {
+          return { run: { status: 'running' }, tasks: [], agentExecutions: [{ agentId: 'agent-1', role: 'worker', backend: 'codex', status: 'running' }] };
+        }
+        if (method === 'interaction.list') return [];
+        if (method === 'execution.agent_log') {
+          if (logResult instanceof Error) throw logResult;
+          return logResult;
+        }
+        return {};
+      }
+    };
+    await runAttachCli(['run-1'], {
+      resolveHome: () => home,
+      createClient: () => client,
+      input: keyboard,
+      output: screen,
+      randomUUID: () => 'client-1',
+      registerSignal: (_signal, listener) => { stop = listener; },
+      sleep: async () => {
+        sleeps += 1;
+        if (sleeps === 1) keyboard.write('l');
+        else stop();
+      }
+    });
+    assert.deepEqual(calls.find(([method]) => method === 'execution.agent_log'), [
+      'execution.agent_log', { runId: 'run-1', agentId: 'agent-1' }
+    ]);
+    assert.match(screen.read()?.toString() ?? '', expected);
   }
 });
 
@@ -120,23 +183,51 @@ test('attach rejects session approval when it is not allowed and refreshes after
     if (method === 'interaction.claim') throw new Error('already claimed');
     return {};
   };
+  const keyboard = input();
+  let sleeps = 0;
   await runAttachCli(['run-1'], {
     resolveHome: () => home,
     createClient: () => client,
+    input: keyboard,
     output: output(true),
     randomUUID: () => 'client-1',
     ask: async () => 's',
     registerSignal: (_signal, listener) => { client.stop = listener; },
-    sleep: async () => client.stop()
+    sleep: async () => {
+      sleeps += 1;
+      if (sleeps === 1) keyboard.write('a');
+      else client.stop();
+    }
   });
   assert.equal(calls.some(([name]) => name === 'interaction.answer'), false);
   assert.equal(calls.some(([name]) => name === 'interaction.requeue_client'), true);
 });
 
-test('attach validates arguments and safely cleans up after EOF', async () => {
-  await assert.rejects(runAttachCli([], { resolveHome: () => home }), /Usage: agent-team attach/);
-  await assert.rejects(runAttachCli(['run-1', '--bad'], { resolveHome: () => home }), /Unknown attach option/);
-  await assert.rejects(runAttachCli(['run-1', '--home'], { resolveHome: () => home }), /--home requires a value/);
+test('attach parses optional run IDs and validates options', async () => {
+  assert.deepEqual(attachArguments([], () => home), { home });
+  assert.deepEqual(attachArguments(['run-1'], () => home), { runId: 'run-1', home });
+  assert.throws(() => attachArguments(['run-1', '--bad'], () => home), /Unknown attach option/);
+  assert.throws(() => attachArguments(['run-1', '--home'], () => home), /--home requires a value/);
+});
+
+test('attach prints project and run choices without a TTY and safely cleans up after EOF', async () => {
+  const choices = clientFor();
+  choices.client.request = async (method, params) => {
+    choices.calls.push([method, params]);
+    if (method === 'project.list') return [{ id: 'project-1', displayName: 'Project One' }];
+    if (method === 'execution.list') return [{ id: 'run-1', projectId: 'project-1', status: 'running' }];
+    return {};
+  };
+  const listed = output();
+  await runAttachCli([], {
+    resolveHome: () => home,
+    createClient: () => choices.client,
+    output: listed
+  });
+  assert.match(listed.read()?.toString() ?? '', /Project One/);
+  assert.equal(choices.calls.some(([name]) => name === 'controller.attach'), false);
+  assert.equal(choices.calls.at(-1)[0], 'close');
+
   const { client, calls } = clientFor();
   const input = new PassThrough();
   input.end();

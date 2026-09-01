@@ -31,7 +31,7 @@ function configFor(repoRoot, overrides = {}) {
     concurrency: 1,
     retry: { ...DEFAULT_CONFIG.retry, maxWorkerAttempts: 2, maxReviewCycles: 2, ...retry },
     status: { ...DEFAULT_CONFIG.status, ...status },
-    integration: { ...DEFAULT_CONFIG.integration, runAgentAfterCherryPick: false },
+    integration: { ...DEFAULT_CONFIG.integration },
     verification: { ...DEFAULT_CONFIG.verification, globalCommands: [] },
     ...rest
   };
@@ -56,9 +56,7 @@ function workerResult() {
     status: 'completed',
     summary: 'implemented',
     testsRun: [],
-    knownRisks: [],
-    architectureImpact: 'none',
-    progressImpact: 'none'
+    knownRisks: []
   };
 }
 

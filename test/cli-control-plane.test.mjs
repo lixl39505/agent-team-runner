@@ -36,5 +36,6 @@ test('runCli clears control-plane arguments between invocations and documents th
 
   assert.match(output.join('\n'), /start \[--home PATH\]/);
     assert.match(output.join('\n'), /mcp \[--home PATH\]/);
-    assert.match(output.join('\n'), /attach <run-id> \[--home PATH\]/);
+    assert.match(output.join('\n'), /attach \[run-id\] \[--home PATH\]/);
+    assert.match(output.join('\n'), /migrate \[repo\] \[--repo PATH\]/);
 });

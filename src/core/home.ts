@@ -1,6 +1,7 @@
 import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { ensureDaemonBootstrapConfig } from './daemon-config.js';
 
 export interface AgentTeamHome {
   root: string;
@@ -39,4 +40,5 @@ export function ensureAgentTeamHome(home: AgentTeamHome = resolveAgentTeamHome()
   for (const path of [home.root, home.runsDir, home.worktreesDir, home.preflightDir]) {
     mkdirSync(path, { recursive: true });
   }
+  ensureDaemonBootstrapConfig(home.root);
 }

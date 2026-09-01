@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { test } from 'vitest';
-import { resolveTaskSkills, snapshotTaskSkills } from '../src/core/skill-handoff.ts';
+import { listProjectSkills, localSkillRoots, resolveTaskSkills, snapshotTaskSkills } from '../src/core/skill-handoff.ts';
 import { validateTaskSpec } from '../src/core/validation.ts';
 
 function fixture() {
@@ -60,6 +60,33 @@ test('resolves project and user skills with UTF-8 content and SHA-256 digests', 
     assert.ok(Object.isFrozen(skills));
     assert.ok(Object.isFrozen(skills[0]));
   } finally {
+    state.cleanup();
+  }
+});
+
+test('derives fixed safe local roots and lists project Skill metadata', () => {
+  const state = fixture();
+  const outside = mkdtempSync(join(tmpdir(), 'agent-team-outside-skill-root-'));
+  try {
+    const projectRoot = join(state.directory, '.agents', 'skills');
+    writeSkill(projectRoot, 'tdd', 'Project skill');
+    writeSkill(join(state.user, '.agents', 'skills'), 'personal', 'User skill');
+
+    assert.deepEqual(localSkillRoots(state.directory, state.user), [
+      { source: 'project', path: projectRoot },
+      { source: 'user', path: join(state.user, '.agents', 'skills') }
+    ]);
+    assert.deepEqual(listProjectSkills(state.directory), [{
+      name: 'tdd', source: 'project', path: join(projectRoot, 'tdd', 'SKILL.md'),
+      sha256: createHash('sha256').update('Project skill', 'utf8').digest('hex')
+    }]);
+
+    rmSync(join(state.directory, '.agents'), { recursive: true, force: true });
+    mkdirSync(join(outside, 'skills'));
+    symlinkSync(outside, join(state.directory, '.agents'));
+    assert.deepEqual(localSkillRoots(state.directory, state.user).filter((root) => root.source === 'project'), []);
+  } finally {
+    rmSync(outside, { recursive: true, force: true });
     state.cleanup();
   }
 });
@@ -164,6 +191,20 @@ test('propagates non-missing skill path errors and rejects non-directory roots',
     const fileRoot = join(state.directory, 'not-a-directory');
     writeFileSync(fileRoot, 'not a directory');
     assert.throws(() => resolveTaskSkills([{ name: 'tdd', role: 'worker', required: true, source: 'project' }], [{ source: 'project', path: fileRoot }]), /is not a directory/);
+  } finally {
+    state.cleanup();
+  }
+});
+
+test('lists no skills without a local root and ignores unsafe directory entries', () => {
+  const state = fixture();
+  try {
+    assert.deepEqual(listProjectSkills(state.directory), []);
+    const root = join(state.directory, '.agents', 'skills');
+    mkdirSync(root, { recursive: true });
+    writeFileSync(join(root, 'plain-file'), 'not a skill');
+    mkdirSync(join(root, 'invalid_name'));
+    assert.deepEqual(listProjectSkills(state.directory), []);
   } finally {
     state.cleanup();
   }

@@ -12,7 +12,11 @@ export type RunStatus =
   | 'needs_attention'
   | 'integrating'
   | 'done'
+  | 'cancelled'
   | 'failed';
+
+export type RunRuntimeState = 'active' | 'waiting_interaction' | 'paused' | 'cancelling' | 'recovering';
+export type RunDesiredState = 'running' | 'paused' | 'cancel_requested';
 
 export type TaskStatus =
   | 'pending'
@@ -104,7 +108,6 @@ export interface RunnerConfig {
   };
   integration: {
     allowedPaths: string[];
-    runAgentAfterCherryPick: boolean;
   };
 }
 
@@ -143,6 +146,14 @@ export interface ResolvedSkill {
   path: string;
   sha256: string;
   content: string;
+}
+
+/** 可供外层选择的本地 project Skill 元数据；内容仅在提交 run 时固化。 */
+export interface ProjectSkill {
+  name: string;
+  source: 'project';
+  path: string;
+  sha256: string;
 }
 
 export interface ExecutionProvenanceDocument {
@@ -211,8 +222,6 @@ interface WorkerResultBase {
   summary: string;
   testsRun: string[];
   knownRisks: string[];
-  architectureImpact: string;
-  progressImpact: string;
   blockedReason?: string;
 }
 
@@ -238,7 +247,6 @@ export interface IntegrationResult {
   status: 'completed' | 'blocked' | 'failed';
   summary: string;
   testsRun: string[];
-  documentationUpdated: string[];
   knownRisks: string[];
   blockedReason?: string;
 }
@@ -260,6 +268,8 @@ export interface RunRecord {
   /** 运行来源后端（历史列名，保持 schema 不变）。 */
   adapter: string;
   status: RunStatus;
+  runtimeState: RunRuntimeState;
+  desiredState: RunDesiredState;
   manifestJson: string | null;
   /** 创建运行时固化的 AgentSnapshot，保证后续执行不受配置文件变化影响。 */
   rolesJson: string | null;
@@ -277,6 +287,8 @@ export interface TaskRecord {
   taskId: string;
   title: string;
   specJson: string;
+  /** 提交或契约修订时固化的 ResolvedSkill 数组。 */
+  resolvedSkillsJson: string;
   status: TaskStatus;
   phase: string | null;
   branch: string | null;

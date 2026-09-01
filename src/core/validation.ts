@@ -232,14 +232,12 @@ export function validateWorkerResult(value: unknown): WorkerResult {
   assertObject(value, 'Worker result');
   const status = String(value.status);
   if (!['completed', 'blocked', 'blocked_on_contract', 'failed'].includes(status)) throw new Error('Invalid worker status');
-  const allowedKeys = new Set(['status', 'summary', 'testsRun', 'knownRisks', 'architectureImpact', 'progressImpact', 'blockedReason', 'contractBlock']);
+  const allowedKeys = new Set(['status', 'summary', 'testsRun', 'knownRisks', 'blockedReason', 'contractBlock']);
   if (Object.keys(value).some((key) => !allowedKeys.has(key))) throw new Error('Worker result contains unknown fields');
   const fields = {
     summary: String(value.summary ?? ''),
     testsRun: stringArray(value.testsRun ?? [], 'testsRun'),
     knownRisks: stringArray(value.knownRisks ?? [], 'knownRisks'),
-    architectureImpact: String(value.architectureImpact ?? ''),
-    progressImpact: String(value.progressImpact ?? ''),
     ...(typeof value.blockedReason === 'string' ? { blockedReason: value.blockedReason } : {})
   };
   if (status === 'blocked_on_contract') {
@@ -299,7 +297,6 @@ export function validateIntegrationResult(value: unknown): IntegrationResult {
     status: status as IntegrationResult['status'],
     summary: String(value.summary ?? ''),
     testsRun: stringArray(value.testsRun ?? [], 'testsRun'),
-    documentationUpdated: stringArray(value.documentationUpdated ?? [], 'documentationUpdated'),
     knownRisks: stringArray(value.knownRisks ?? [], 'knownRisks'),
     ...(typeof value.blockedReason === 'string' ? { blockedReason: value.blockedReason } : {})
   };
@@ -307,11 +304,10 @@ export function validateIntegrationResult(value: unknown): IntegrationResult {
 
 export const WORKER_SCHEMA = {
   type: 'object', additionalProperties: false,
-  required: ['status', 'summary', 'testsRun', 'knownRisks', 'architectureImpact', 'progressImpact'],
+  required: ['status', 'summary', 'testsRun', 'knownRisks'],
   properties: {
     status: { enum: ['completed', 'blocked', 'blocked_on_contract', 'failed'] }, summary: { type: 'string' },
-    testsRun: { type: 'array', items: { type: 'string' } }, knownRisks: { type: 'array', items: { type: 'string' } },
-    architectureImpact: { type: 'string' }, progressImpact: { type: 'string' }, blockedReason: { type: 'string' },
+    testsRun: { type: 'array', items: { type: 'string' } }, knownRisks: { type: 'array', items: { type: 'string' } }, blockedReason: { type: 'string' },
     contractBlock: {
       type: 'object', additionalProperties: false,
       required: ['code', 'message', 'requestedContractChanges'],
@@ -342,10 +338,9 @@ export const REVIEW_SCHEMA = {
 
 export const INTEGRATION_SCHEMA = {
   type: 'object', additionalProperties: false,
-  required: ['status', 'summary', 'testsRun', 'documentationUpdated', 'knownRisks'],
+  required: ['status', 'summary', 'testsRun', 'knownRisks'],
   properties: {
     status: { enum: ['completed', 'blocked', 'failed'] }, summary: { type: 'string' },
-    testsRun: { type: 'array', items: { type: 'string' } }, documentationUpdated: { type: 'array', items: { type: 'string' } },
-    knownRisks: { type: 'array', items: { type: 'string' } }, blockedReason: { type: 'string' }
+    testsRun: { type: 'array', items: { type: 'string' } }, knownRisks: { type: 'array', items: { type: 'string' } }, blockedReason: { type: 'string' }
   }
 } as const;

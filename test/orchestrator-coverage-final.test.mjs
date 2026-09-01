@@ -31,7 +31,7 @@ function configFor(repoRoot, overrides = {}) {
     concurrency: 1,
     retry: { ...DEFAULT_CONFIG.retry, maxWorkerAttempts: 1, maxReviewCycles: 2, ...retry },
     status: { ...DEFAULT_CONFIG.status, ...status },
-    integration: { ...DEFAULT_CONFIG.integration, runAgentAfterCherryPick: false },
+    integration: { ...DEFAULT_CONFIG.integration },
     verification: { ...DEFAULT_CONFIG.verification, globalCommands: [] },
     ...rest
   };
@@ -95,7 +95,7 @@ async function planned(db, config, tasks = [task()], manifestTasks = tasks) {
 }
 
 function worker(status = 'blocked', extra = {}) {
-  return { status, summary: 'worker result', testsRun: [], knownRisks: [], architectureImpact: 'none', progressImpact: 'none', ...extra };
+  return { status, summary: 'worker result', testsRun: [], knownRisks: [], ...extra };
 }
 
 test('orchestrator exercises worker fallback paths and retry context persistence', async () => {

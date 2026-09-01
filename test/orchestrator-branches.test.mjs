@@ -31,7 +31,7 @@ function configFor(repoRoot, overrides = {}) {
     concurrency: 1,
     retry: { ...DEFAULT_CONFIG.retry, maxWorkerAttempts: 2, maxReviewCycles: 2, ...retry },
     status: { ...DEFAULT_CONFIG.status, ...status },
-    integration: { ...DEFAULT_CONFIG.integration, runAgentAfterCherryPick: false },
+    integration: { ...DEFAULT_CONFIG.integration },
     verification: { ...DEFAULT_CONFIG.verification, globalCommands: [] },
     ...rest
   };
@@ -47,8 +47,7 @@ function task() {
 
 function workerResult(status, summary) {
   return {
-    status, summary, testsRun: [], knownRisks: [],
-    architectureImpact: 'none', progressImpact: 'none'
+    status, summary, testsRun: [], knownRisks: []
   };
 }
 
@@ -240,7 +239,7 @@ test('orchestrator uses a supplied backend pool and forwards worker and reviewer
     });
 
     assert.equal(db.getRun('run').status, 'done');
-    assert.deepEqual(requested.map((binding) => binding.agent), ['default-claude', 'default-claude', 'default-claude']);
+    assert.deepEqual(requested.map((binding) => binding.agent), ['default-claude', 'default-claude']);
     assert.deepEqual(events, [['worker', 'activity'], ['reviewer', 'activity']]);
   } finally {
     db.close();

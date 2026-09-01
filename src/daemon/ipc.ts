@@ -1,4 +1,4 @@
-import { unlink } from 'node:fs/promises';
+import { chmod, unlink } from 'node:fs/promises';
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
 
 export type LocalIpcHandler = (params: unknown) => Promise<unknown>;
@@ -60,6 +60,8 @@ export class LocalIpcServer {
           resolve();
         });
       });
+      // Unix domain sockets inherit the process umask. Restrict the control plane even when it is permissive.
+      if (!isNamedPipe(path)) await chmod(path, 0o600);
     } catch (error) {
       server.close();
       throw error;

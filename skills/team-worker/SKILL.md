@@ -33,4 +33,4 @@ Implement exactly one assigned task in the current Git worktree.
 
 ## Reporting
 
-Report what changed, checks run, known risks, and any architecture/progress documentation impact. Do not edit final progress documents unless the task explicitly owns them.
+Report what changed, checks run, and known risks.

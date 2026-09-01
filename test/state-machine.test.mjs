@@ -29,15 +29,14 @@ function configFor(repoRoot) {
     workspace: { ...DEFAULT_CONFIG.workspace, repoRoot, stateDir: join(tmpdir(), `${name}-state`), worktreesDir: join(tmpdir(), `${name}-worktrees`) },
     concurrency: 1,
     retry: { ...DEFAULT_CONFIG.retry, maxWorkerAttempts: 2, maxReviewCycles: 2 },
-    integration: { ...DEFAULT_CONFIG.integration, runAgentAfterCherryPick: false },
+    integration: { ...DEFAULT_CONFIG.integration },
     verification: { ...DEFAULT_CONFIG.verification, globalCommands: [] }
   };
 }
 
 function workerResult(summary) {
   return {
-    status: 'completed', summary, testsRun: [], knownRisks: [],
-    architectureImpact: 'none', progressImpact: 'none'
+    status: 'completed', summary, testsRun: [], knownRisks: []
   };
 }
 
@@ -84,10 +83,10 @@ function backendPool(backend) {
   return { claude: backend, codex: backend, opencode: backend };
 }
 
-async function createPlannedRun(db, config, manifest, id = 'run') {
+async function createPlannedRun(db, config, manifest, id = 'run', resolvedSkills = new Map()) {
   const baseSha = await currentHead(config.workspace.repoRoot);
   db.createRun({ id, repoRoot: config.workspace.repoRoot, goalFile: 'goal.md', baseRef: 'HEAD', baseSha, adapter: 'claude' });
-  for (const spec of manifest.tasks) db.insertTask(id, spec);
+  for (const spec of manifest.tasks) db.insertTask(id, spec, resolvedSkills.get(spec.id));
   db.updateRun(id, {
     status: 'planned',
     manifestJson: JSON.stringify(manifest),
@@ -103,7 +102,13 @@ test('orchestrator retries reviewer feedback and integrates the approved task', 
   const repoRoot = await repository();
   const config = configFor(repoRoot);
   const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
-  const manifest = { version: 1, title: 'Run', summary: 'test run', tasks: [task()] };
+  const persistedSkills = [{
+    name: 'tdd', role: 'worker', source: 'project', path: '/stored/tdd/SKILL.md', sha256: 'persisted-sha', content: 'Use the stored snapshot.'
+  }];
+  const manifest = {
+    version: 1, title: 'Run', summary: 'test run',
+    tasks: [task({ implementationSkills: [{ name: 'tdd', role: 'worker', required: true, source: 'project' }] })]
+  };
   let workerAttempts = 0;
   let reviewAttempts = 0;
   const backend = new ScriptBackend((spec) => {
@@ -121,7 +126,7 @@ test('orchestrator retries reviewer feedback and integrates the approved task', 
     throw new Error(`unexpected role: ${spec.role}`);
   });
   try {
-    await createPlannedRun(db, config, manifest);
+    await createPlannedRun(db, config, manifest, 'run', new Map([['T001', persistedSkills]]));
     await runOrchestrator({ config, db, runId: 'run', backends: backendPool(backend) });
 
     const record = db.getTask('run', 'T001');
@@ -135,6 +140,8 @@ test('orchestrator retries reviewer feedback and integrates the approved task', 
     const workerPrompts = backend.specs.filter((spec) => spec.role === 'worker').map((spec) => spec.prompt);
     assert.match(workerPrompts[1], /Reviewer feedback \(verbatim\).*needs fix/s);
     assert.match(workerPrompts[1], /Previous worker summary.*first pass/s);
+    assert.match(workerPrompts[0], /Use the stored snapshot/);
+    assert.match(workerPrompts[0], /sha256:persisted-sha/);
     assert.equal(readFileSync(join(db.getRun('run').integrationWorktree, 'src', 'feature.txt'), 'utf8'), 'fixed\n');
     assert.ok(eventTypes(db, 'run').includes('CHANGES_REQUESTED'));
     assert.ok(eventTypes(db, 'run').includes('INTEGRATION_COMPLETED'));

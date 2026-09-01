@@ -5,7 +5,10 @@ import type {
   AgentExecutionRecord,
   RunEventRecord,
   RunRecord,
+  RunDesiredState,
+  RunRuntimeState,
   RunStatus,
+  ResolvedSkill,
   TaskRecord,
   TaskSpec,
   TaskStatus
@@ -30,6 +33,8 @@ function mapRun(row: Record<string, unknown>): RunRecord {
     contractRevision: Number(row.contract_revision),
     adapter: String(row.adapter),
     status: String(row.status) as RunStatus,
+    runtimeState: String(row.runtime_state) as RunRuntimeState,
+    desiredState: String(row.desired_state) as RunDesiredState,
     manifestJson: row.manifest_json === null ? null : String(row.manifest_json),
     rolesJson: row.roles_json === null || row.roles_json === undefined ? null : String(row.roles_json),
     integrationBranch: row.integration_branch === null ? null : String(row.integration_branch),
@@ -48,6 +53,7 @@ function mapTask(row: Record<string, unknown>): TaskRecord {
     taskId: String(row.task_id),
     title: String(row.title),
     specJson: String(row.spec_json),
+    resolvedSkillsJson: row.resolved_skills_json === null || row.resolved_skills_json === undefined ? '[]' : String(row.resolved_skills_json),
     status: String(row.status) as TaskStatus,
     phase: row.phase === null ? null : String(row.phase),
     branch: row.branch === null ? null : String(row.branch),
@@ -115,6 +121,8 @@ export class StateDatabase {
         contract_revision INTEGER NOT NULL DEFAULT 0,
         adapter TEXT NOT NULL,
         status TEXT NOT NULL,
+        runtime_state TEXT NOT NULL DEFAULT 'recovering',
+        desired_state TEXT NOT NULL DEFAULT 'running',
         manifest_json TEXT,
         roles_json TEXT,
         integration_branch TEXT,
@@ -131,6 +139,7 @@ export class StateDatabase {
         task_id TEXT NOT NULL,
         title TEXT NOT NULL,
         spec_json TEXT NOT NULL,
+        resolved_skills_json TEXT NOT NULL DEFAULT '[]',
         status TEXT NOT NULL,
         phase TEXT,
         branch TEXT,
@@ -184,6 +193,16 @@ export class StateDatabase {
         FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
       ) STRICT;
 
+      CREATE TABLE IF NOT EXISTS execution_leases (
+        run_id TEXT NOT NULL,
+        task_id TEXT NOT NULL DEFAULT '',
+        daemon_epoch TEXT NOT NULL,
+        holder TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        PRIMARY KEY (run_id, task_id),
+        FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+      ) STRICT;
+
       CREATE INDEX IF NOT EXISTS idx_tasks_run_status ON tasks(run_id, status);
       CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, id);
       CREATE INDEX IF NOT EXISTS idx_agent_executions_run ON agent_executions(run_id, started_at);
@@ -193,6 +212,9 @@ export class StateDatabase {
     this.addColumnIfMissing('runs', 'project_policy_revision_id', 'TEXT');
     this.addColumnIfMissing('runs', 'execution_contract_json', 'TEXT');
     this.addColumnIfMissing('runs', 'contract_revision', 'INTEGER NOT NULL DEFAULT 0');
+    this.addColumnIfMissing('runs', 'runtime_state', "TEXT NOT NULL DEFAULT 'recovering'");
+    this.addColumnIfMissing('runs', 'desired_state', "TEXT NOT NULL DEFAULT 'running'");
+    this.addColumnIfMissing('tasks', 'resolved_skills_json', "TEXT NOT NULL DEFAULT '[]'");
   }
 
   private addColumnIfMissing(table: string, column: string, type: string): void {
@@ -217,9 +239,9 @@ export class StateDatabase {
     this.db.prepare(`
       INSERT INTO runs (
         id, repo_root, goal_file, base_ref, base_sha, project_id, project_policy_revision_id,
-        execution_contract_json, contract_revision, adapter, status,
+        execution_contract_json, contract_revision, adapter, status, runtime_state, desired_state,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planning', ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planning', 'recovering', 'running', ?, ?)
     `).run(
       input.id,
       input.repoRoot,
@@ -288,6 +310,8 @@ export class StateDatabase {
 
   updateRun(id: string, patch: Partial<{
     status: RunStatus;
+    runtimeState: RunRuntimeState;
+    desiredState: RunDesiredState;
     manifestJson: string;
     rolesJson: string;
     integrationBranch: string;
@@ -300,6 +324,8 @@ export class StateDatabase {
     if (entries.length === 0) return;
     const columnMap: Record<string, string> = {
       status: 'status',
+      runtimeState: 'runtime_state',
+      desiredState: 'desired_state',
       manifestJson: 'manifest_json',
       rolesJson: 'roles_json',
       integrationBranch: 'integration_branch',
@@ -315,25 +341,62 @@ export class StateDatabase {
     this.db.prepare(`UPDATE runs SET ${sets.join(', ')} WHERE id = ?`).run(...values);
   }
 
-  insertTask(runId: string, spec: TaskSpec): void {
+  acquireExecutionLease(runId: string, daemonEpoch: string, holder: string, leaseMs: number): boolean {
+    const timestamp = now();
+    const expiresAt = new Date(Date.now() + leaseMs).toISOString();
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      this.db.prepare('DELETE FROM execution_leases WHERE expires_at < ?').run(timestamp);
+      const result = this.db.prepare(`
+        INSERT INTO execution_leases (run_id, task_id, daemon_epoch, holder, expires_at)
+        VALUES (?, '', ?, ?, ?)
+        ON CONFLICT(run_id, task_id) DO NOTHING
+      `).run(runId, daemonEpoch, holder, expiresAt);
+      this.db.exec('COMMIT;');
+      return result.changes === 1;
+    } catch (error) {
+      this.db.exec('ROLLBACK;');
+      throw error;
+    }
+  }
+
+  releaseExecutionLease(runId: string, daemonEpoch: string, holder: string): void {
+    this.db.prepare(`
+      DELETE FROM execution_leases WHERE run_id = ? AND task_id = '' AND daemon_epoch = ? AND holder = ?
+    `).run(runId, daemonEpoch, holder);
+  }
+
+  renewExecutionLease(runId: string, daemonEpoch: string, holder: string, leaseMs: number): boolean {
+    const result = this.db.prepare(`
+      UPDATE execution_leases SET expires_at = ?
+      WHERE run_id = ? AND task_id = '' AND daemon_epoch = ? AND holder = ? AND expires_at >= ?
+    `).run(new Date(Date.now() + leaseMs).toISOString(), runId, daemonEpoch, holder, now());
+    return result.changes === 1;
+  }
+
+  releaseExpiredExecutionLeases(): number {
+    return Number(this.db.prepare('DELETE FROM execution_leases WHERE expires_at < ?').run(now()).changes);
+  }
+
+  insertTask(runId: string, spec: TaskSpec, resolvedSkills: readonly ResolvedSkill[] = []): void {
     const timestamp = now();
     this.db.prepare(`
       INSERT INTO tasks (
-        run_id, task_id, title, spec_json, status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, 'pending', ?, ?)
-    `).run(runId, spec.id, spec.title, JSON.stringify(spec), timestamp, timestamp);
+        run_id, task_id, title, spec_json, resolved_skills_json, status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+    `).run(runId, spec.id, spec.title, JSON.stringify(spec), JSON.stringify(resolvedSkills), timestamp, timestamp);
     this.addEvent(runId, spec.id, 'TASK_CREATED', spec);
   }
 
-  replaceTaskSpec(runId: string, spec: TaskSpec): void {
+  replaceTaskSpec(runId: string, spec: TaskSpec, resolvedSkills: readonly ResolvedSkill[] = []): void {
     const timestamp = now();
     this.db.prepare(`
       UPDATE tasks
-      SET title = ?, spec_json = ?, status = 'pending', phase = NULL, branch = NULL, worktree = NULL,
+      SET title = ?, spec_json = ?, resolved_skills_json = ?, status = 'pending', phase = NULL, branch = NULL, worktree = NULL,
           start_sha = NULL, commit_sha = NULL, attempts = 0, review_cycles = 0, last_error = NULL,
           review_json = NULL, finished_at = NULL, updated_at = ?
       WHERE run_id = ? AND task_id = ?
-    `).run(spec.title, JSON.stringify(spec), timestamp, runId, spec.id);
+    `).run(spec.title, JSON.stringify(spec), JSON.stringify(resolvedSkills), timestamp, runId, spec.id);
   }
 
   getTask(runId: string, taskId: string): TaskRecord {

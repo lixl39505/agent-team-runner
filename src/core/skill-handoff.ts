@@ -1,11 +1,36 @@
-import { lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { homedir } from 'node:os';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
-import type { ResolvedSkill, SkillRequirement, TaskSpec } from './types.js';
+import type { ProjectSkill, ResolvedSkill, SkillRequirement, TaskSpec } from './types.js';
 
 export interface SkillRoot {
   source: SkillRequirement['source'];
   path: string;
+}
+
+/** Derive the only local roots accepted for external execution contracts. */
+export function localSkillRoots(repoRoot: string, userHome = homedir()): readonly SkillRoot[] {
+  const candidates: readonly SkillRoot[] = [
+    { source: 'project', path: resolve(repoRoot, '.agents', 'skills') },
+    { source: 'user', path: resolve(userHome, '.agents', 'skills') }
+  ];
+  return Object.freeze(candidates.filter((root) => isSafeLocalRoot(root.path, root.source === 'project' ? repoRoot : userHome)));
+}
+
+/** List safe project-local Skill metadata without exposing a daemon or MCP surface. */
+export function listProjectSkills(repoRoot: string): readonly ProjectSkill[] {
+  const root = localSkillRoots(repoRoot).find((entry) => entry.source === 'project');
+  if (!root) return Object.freeze([]);
+  const skills: ProjectSkill[] = [];
+  for (const entry of readdirSync(root.path, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !SKILL_NAME.test(entry.name)) continue;
+    const [skill] = resolveTaskSkills([
+      { name: entry.name, role: 'worker', required: true, source: 'project' }
+    ], [root]);
+    if (skill) skills.push(Object.freeze({ name: skill.name, source: 'project', path: skill.path, sha256: skill.sha256 }));
+  }
+  return Object.freeze(skills);
 }
 
 interface ResolvedRoot extends SkillRoot {
@@ -45,7 +70,12 @@ export function resolveTaskSkills(
   const skills: ResolvedSkill[] = [];
   for (const requirement of uniqueRequirements.values()) {
     const root = rootsBySource.get(requirement.source);
-    if (!root) throw new Error(`No ${requirement.source} skill root configured for ${requirement.name}`);
+    if (!root) {
+      if (requirement.required) {
+        throw new Error(`Required ${requirement.source} skill is missing: ${requirement.name} (No ${requirement.source} skill root configured)`);
+      }
+      continue;
+    }
 
     const skillPath = resolve(root.path, requirement.name, 'SKILL.md');
 
@@ -120,6 +150,15 @@ function validateRequirement(requirement: SkillRequirement): void {
 function isInsideRoot(root: string, path: string): boolean {
   const pathFromRoot = relative(root, path);
   return pathFromRoot !== '..' && !pathFromRoot.startsWith(`..${sep}`) && !isAbsolute(pathFromRoot);
+}
+
+function isSafeLocalRoot(path: string, container: string): boolean {
+  try {
+    if (!lstatSync(path).isDirectory()) return false;
+    return isInsideRoot(realpathSync(resolve(container)), realpathSync(path));
+  } catch {
+    return false;
+  }
 }
 
 function isMissingPath(error: unknown): boolean {

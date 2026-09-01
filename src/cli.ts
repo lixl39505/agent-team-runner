@@ -9,6 +9,8 @@ import { promptMaskedSecret } from './core/terminal-input.js';
 import { runDaemonCli } from './daemon-cli.js';
 import { runMcpCli } from './mcp-cli.js';
 import { runAttachCli } from './attach-cli.js';
+import { migrateLegacyProjectState } from './core/migration.js';
+import { resolveAgentTeamHome } from './core/home.js';
 
 let argv: string[] = [];
 let command: string | undefined;
@@ -54,7 +56,34 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === 'migrate') {
+    await runMigrateCommand();
+    return;
+  }
+
   throw new Error(`Unknown command: ${command}`);
+}
+
+async function runMigrateCommand(): Promise<void> {
+  const repoFromOption = option('--repo');
+  const homePath = option('--home');
+  const dryRunIndex = argv.indexOf('--dry-run');
+  const dryRun = dryRunIndex >= 0;
+  if (dryRun) argv.splice(dryRunIndex, 1);
+  const repoFromArgument = argv.shift();
+  if (repoFromOption && repoFromArgument) throw new Error('migrate accepts either [repo] or --repo PATH, not both');
+  if (argv.length > 0) throw new Error(`Unknown migrate option: ${argv[0]}`);
+  const home = homePath === undefined
+    ? resolveAgentTeamHome()
+    : resolveAgentTeamHome({ env: { ...process.env, AGENT_TEAM_HOME: homePath } });
+  const plan = await migrateLegacyProjectState(repoFromOption ?? repoFromArgument ?? process.cwd(), home, dryRun);
+  const summary = `${plan.stateRuns} state run(s), ${plan.runArtifacts} run artifact(s)`;
+  if (dryRun) {
+    console.log(`Migration preflight passed (dry run): ${summary}.`);
+  } else {
+    console.log(`Migrated ${summary} to ${home.root}.`);
+  }
+  console.log(`Worktrees were not migrated (${plan.preservedWorktrees} direct legacy entries preserved); only terminal runs are supported.`);
 }
 
 async function runAuthCommand(): Promise<void> {
@@ -130,7 +159,9 @@ Commands:
   init [repo]                         Sync host skills without modifying repository config
   start [--home PATH]                 Start the local daemon
   mcp [--home PATH]                   Run the MCP server
-  attach <run-id> [--home PATH]       Attach an interactive daemon run dashboard
+   attach [run-id] [--home PATH]       Select or attach an interactive daemon run dashboard
+  migrate [repo] [--repo PATH]        Safely migrate terminal legacy state to AGENT_TEAM_HOME
+          [--home PATH] [--dry-run]   Never merges or overwrites state.sqlite or run artifacts
   skills sync [--repo PATH]          Mirror portable skills for Codex/OpenCode/Claude
   auth set --backend ID --profile N  Save an API key in the macOS Keychain
   auth status --backend ID --profile N

@@ -16,6 +16,58 @@ agent-team mcp
 The daemon stores projects, policy revisions, runs, interactions, controller
 ownership, and events below `$AGENT_TEAM_HOME` (or the platform default).
 
+## Daemon Bootstrap Configuration
+
+Starting the daemon creates `$AGENT_TEAM_HOME/config.yml` if it does not already
+exist. It is strict YAML: unknown fields and incorrect value types prevent the
+daemon from starting. The configuration is read at daemon startup, so restart
+the daemon after changing it.
+
+```yaml
+version: 1
+concurrency:
+  maxActiveRuns: 3
+logs:
+  retentionDays: 30
+tui:
+  color: auto
+```
+
+`concurrency.maxActiveRuns` limits active execution runs for this daemon across
+all projects. Queued eligible runs are started when an active run releases a
+slot. `tui.color` controls ANSI styling in `agent-team attach` (`auto`,
+`always`, or `never`). `logs.retentionDays` is currently a persisted preference
+only; this version does not automatically delete run logs or artifacts.
+
+The IPC endpoint remains fixed to `$AGENT_TEAM_HOME/daemon.sock` on Unix-like
+platforms and `\\.\pipe\agent-team` on Windows. Socket path configuration is
+not supported.
+
+## Legacy Migration
+
+Move terminal state from an older project-local `.agent-team` directory into
+the current global home:
+
+```sh
+agent-team migrate                       # source repository is the current directory
+agent-team migrate /path/to/repository --dry-run
+agent-team migrate --repo /path/to/repository --home /path/to/global-home
+```
+
+`migrate` first verifies the source SQLite database with `quick_check`, rejects
+non-terminal runs, and checks every destination run name before writing. It
+creates a SQLite backup rather than copying a live WAL file. Migration is only
+available when `$AGENT_TEAM_HOME/state.sqlite` does not exist: SQLite databases
+are not merged, and neither an existing state database nor an existing run
+directory is ever overwritten. `--dry-run` performs all checks without writing.
+
+The safe migration scope is terminal state and `.agent-team/runs` artifacts.
+Git worktrees, including any `.agent-team/worktrees` directory, are deliberately
+left in place and reported. Moving a registered Git worktree requires updating
+its repository metadata and cannot be made safe by copying files. Complete or
+clean up active legacy runs before migrating; the old source directory is kept
+as an untouched backup after a successful migration.
+
 MCP exposes only fixed control-plane tools. A controller can:
 
 1. Register a Git repository with its execution policy.
@@ -30,19 +82,35 @@ revision, so a restart does not depend on the MCP client's process.
 
 ## Attach
 
-Use a terminal client to monitor one run and handle its interactions:
+Use a terminal client to select and monitor a run, or provide its ID directly:
 
 ```sh
-agent-team attach <run-id> [--home PATH]
+agent-team attach [run-id] [--home PATH]
 ```
 
 Attach obtains the run controller lease, renders durable agent events and
 execution state, and handles approvals, agent questions, and contract blocks.
 It requeues claimed interactions and releases the controller when it exits.
 
+Without a run ID, a TTY shows registered projects and their runs; use Up/Down
+and Enter to attach, or `q`/Ctrl-C to leave. In an attached dashboard, Up/Down
+select an agent, `a` answers the next Inbox interaction, and `l` reads and renders
+a bounded tail of the selected agent's daemon-recorded log. If that log is
+unavailable, the dashboard shows that agent's durable event history instead. The
+attach UI is keyboard-only and does
+not provide mouse support or complete MCP elicitation handling. Without a TTY,
+omitting the ID prints the available project/run list and does not attach.
+
 Events are replayed from a durable cursor. The client acknowledges an event
 cursor only after it has rendered the prior batch, so an interrupted attach
 session can safely replay events.
+
+The daemon exposes `execution.agent_log` for controlled log fallback. It accepts
+only `runId`, `agentId`, optional `maxLines` (1-200), and optional `maxBytes`
+(1-65536); it resolves the log path from `StateDatabase`, requires it to remain
+inside the managed run directory after symlink resolution, and never accepts a
+caller-supplied filesystem path. The MCP bridge exposes the same operation as
+`agent_team_read_agent_log`.
 
 ## Contract Blocks
 

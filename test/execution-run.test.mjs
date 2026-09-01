@@ -1,7 +1,8 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULT_CONFIG } from '../src/core/config.ts';
@@ -58,6 +59,12 @@ function events(db, runId) {
   return db.db.prepare('SELECT event_type FROM events WHERE run_id = ? ORDER BY id').all(runId).map((row) => row.event_type);
 }
 
+function writeSkill(root, name, content) {
+  const directory = join(root, name);
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(join(directory, 'SKILL.md'), content, 'utf8');
+}
+
 test('creates an executable planned run from an external contract', async () => {
   const repoRoot = repository();
   const config = configFor(repoRoot);
@@ -91,6 +98,53 @@ test('creates an executable planned run from an external contract', async () => 
     assert.deepEqual(events(db, runId), ['RUN_CREATED', 'TASK_CREATED', 'EXECUTION_CONTRACT_CREATED']);
   } finally {
     db.close();
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('snapshots required project and user implementation Skills before creating tasks', async () => {
+  const repoRoot = repository();
+  const userHome = mkdtempSync(join(tmpdir(), 'agent-team-user-skills-'));
+  const config = configFor(repoRoot);
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
+  try {
+    writeSkill(join(repoRoot, '.agents', 'skills'), 'tdd', 'Project snapshot');
+    writeSkill(join(userHome, '.agents', 'skills'), 'domain', 'User snapshot');
+    const runId = await createExecutionRun({
+      config,
+      db,
+      userHome,
+      runId: 'skill-snapshots',
+      contract: contract(repoRoot, { tasks: [{
+        ...contract(repoRoot).tasks[0],
+        implementationSkills: [
+          { name: 'tdd', role: 'worker', required: true, source: 'project' },
+          { name: 'domain', role: 'worker', required: true, source: 'user' }
+        ]
+      }] })
+    });
+    assert.deepEqual(JSON.parse(db.getTask(runId, 'T001').resolvedSkillsJson), [
+      {
+        name: 'tdd', role: 'worker', source: 'project', path: join(repoRoot, '.agents', 'skills', 'tdd', 'SKILL.md'),
+        sha256: createHash('sha256').update('Project snapshot', 'utf8').digest('hex'), content: 'Project snapshot'
+      },
+      {
+        name: 'domain', role: 'worker', source: 'user', path: join(userHome, '.agents', 'skills', 'domain', 'SKILL.md'),
+        sha256: createHash('sha256').update('User snapshot', 'utf8').digest('hex'), content: 'User snapshot'
+      }
+    ]);
+
+    await assert.rejects(createExecutionRun({
+      config, db, runId: 'missing-required-skill',
+      contract: contract(repoRoot, { tasks: [{
+        ...contract(repoRoot).tasks[0],
+        implementationSkills: [{ name: 'missing', role: 'worker', required: true, source: 'project' }]
+      }] })
+    }), /Required project skill is missing/);
+    assert.equal(db.listRuns().some((run) => run.id === 'missing-required-skill'), false);
+  } finally {
+    db.close();
+    rmSync(userHome, { recursive: true, force: true });
     rmSync(repoRoot, { recursive: true, force: true });
   }
 });

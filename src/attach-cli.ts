@@ -3,19 +3,25 @@ import { randomUUID as nodeRandomUUID } from 'node:crypto';
 import { hostname as nodeHostname } from 'node:os';
 import { createInterface, type Interface } from 'node:readline/promises';
 import type { Readable, Writable } from 'node:stream';
-import { AttachRunUi, type AttachRunUiState } from './core/attach-ui.js';
+import { AttachRunSelectorUi, AttachRunUi, type AttachRunUiState } from './core/attach-ui.js';
+import { loadDaemonBootstrapConfig } from './core/daemon-config.js';
 import { resolveAgentTeamHome, type AgentTeamHome } from './core/home.js';
 import { LocalIpcClient } from './daemon/ipc.js';
 
 type IpcClient = Pick<LocalIpcClient, 'connect' | 'request' | 'close'>;
 type SignalRegister = (signal: NodeJS.Signals, listener: () => void) => void;
 type Ask = (prompt: string) => Promise<string>;
+type RawInput = Readable & { isTTY?: boolean; setRawMode?: (enabled: boolean) => void; resume(): void };
 
 interface AttachUi {
   readonly isInteractive: boolean;
   start(): void;
   update(state: AttachRunUiState): void;
   addEvents(events: unknown[]): void;
+  moveAgent?(delta: number): void;
+  requestAgentLog?(): string | undefined;
+  showAgentLog?(value: unknown): void;
+  showAgentLogFallback?(agentId: string, error: unknown): void;
   pause(): void;
   resume(): void;
   stop(): void;
@@ -39,20 +45,23 @@ export async function runAttachCli(
   args: string[] = process.argv.slice(2),
   deps: AttachCliDependencies = {}
 ): Promise<void> {
-  const { runId, home } = attachArguments(args, deps.resolveHome ?? resolveAgentTeamHome);
+  const { runId: requestedRunId, home } = attachArguments(args, deps.resolveHome ?? resolveAgentTeamHome);
   const input = deps.input ?? process.stdin;
   const output = deps.output ?? process.stdout;
   const client = deps.createClient ? deps.createClient(home) : new LocalIpcClient(home.socket);
   const clientId = (deps.randomUUID ?? nodeRandomUUID)();
-  const ui = deps.createUi ? deps.createUi(runId, output) : new AttachRunUi(runId, output);
   const sleep = deps.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
   const pollIntervalMs = deps.pollIntervalMs ?? 500;
   if (!Number.isInteger(pollIntervalMs) || pollIntervalMs < 1) throw new Error('attach pollIntervalMs must be a positive integer');
 
+  let runId = requestedRunId;
+  let ui: AttachUi | undefined;
   let attached = false;
   let stopped = false;
   let renderedEventId: number | undefined;
   let readline: Interface | undefined;
+  let cancelSelection: (() => void) | undefined;
+  let removeKeys: (() => void) | undefined;
   const ask: Ask = deps.ask ?? (async (prompt) => {
     if (!readline) readline = createInterface({
       input,
@@ -61,7 +70,11 @@ export async function runAttachCli(
     });
     return await readline.question(prompt);
   });
-  const stop = (): void => { stopped = true; readline?.close(); };
+  const stop = (): void => {
+    stopped = true;
+    cancelSelection?.();
+    readline?.close();
+  };
   const onEnd = (): void => stop();
   const registerSignal: SignalRegister = deps.registerSignal ?? ((signal, listener) => process.once(signal, listener));
   registerSignal('SIGINT', stop);
@@ -71,6 +84,20 @@ export async function runAttachCli(
 
   try {
     await client.connect();
+    if (!runId) {
+      const [projects, runs] = await Promise.all([
+        client.request('project.list'),
+        client.request('execution.list')
+      ]);
+      runId = await selectRun(projects, runs, input, output, loadDaemonBootstrapConfig(home.root).tui.color, (cancel) => {
+        cancelSelection = cancel;
+      });
+      cancelSelection = undefined;
+      if (!runId || stopped) return;
+    }
+    ui = deps.createUi
+      ? deps.createUi(runId, output)
+      : new AttachRunUi(runId, output, loadDaemonBootstrapConfig(home.root).tui.color);
     await client.request('controller.attach', {
       runId,
       host: (deps.hostname ?? nodeHostname)(),
@@ -79,6 +106,9 @@ export async function runAttachCli(
     });
     attached = true;
     ui.start();
+    let answerRequested = false;
+    let logAgentId: string | undefined;
+    removeKeys = attachKeys(input, ui, () => { answerRequested = true; }, () => { logAgentId = ui?.requestAgentLog?.(); }, stop);
 
     do {
       const response = await client.request('execution.events', eventParams(runId, clientId));
@@ -86,12 +116,26 @@ export async function runAttachCli(
       ui.addEvents(events.events);
       // The daemon advances its durable acknowledgement only when this next request includes the rendered cursor.
       if (events.lastEventId !== undefined) renderedEventId = events.lastEventId;
-      const execution = await client.request('execution.get', { runId });
-      const interactions = await client.request('interaction.list', { runId });
-      ui.update({ ...executionState(execution), interactions });
-      if (ui.isInteractive) {
+      const [execution, interactions, projects, runs] = await Promise.all([
+        client.request('execution.get', { runId }),
+        client.request('interaction.list', { runId }),
+        client.request('project.list'),
+        client.request('execution.list')
+      ]);
+      ui.update({ ...executionState(execution), interactions, projects, runs });
+      if (ui.isInteractive && logAgentId) {
+        const agentId = logAgentId;
+        logAgentId = undefined;
         try {
-          await answerQueuedInteraction(interactions, client, clientId, ui, ask);
+          ui.showAgentLog?.(await client.request('execution.agent_log', { runId, agentId }));
+        } catch (error) {
+          ui.showAgentLogFallback?.(agentId, error);
+        }
+      }
+      if (ui.isInteractive && answerRequested) {
+        answerRequested = false;
+        try {
+          await answerQueuedInteraction(interactions, client, clientId, ui, (prompt) => askWithCookedInput(input, ask, prompt));
         } catch (error) {
           if (!stopped) throw error;
         }
@@ -102,8 +146,9 @@ export async function runAttachCli(
   } finally {
     input.off('end', onEnd);
     input.off('error', onEnd);
+    removeKeys?.();
     readline?.close();
-    ui.stop();
+    ui?.stop();
     if (attached) {
       await client.request('interaction.requeue_client', { clientId }).catch(() => {});
       await client.request('controller.disconnect', { runId, clientId }).catch(() => {});
@@ -120,15 +165,103 @@ export async function runAttachCli(
   }
 }
 
-function attachArguments(args: string[], resolveHome: typeof resolveAgentTeamHome): { runId: string; home: AgentTeamHome } {
-  const [runId, ...options] = args;
-  if (!runId || runId.startsWith('--')) throw new Error('Usage: agent-team attach <run-id> [--home PATH]');
-  if (options.length === 0) return { runId, home: resolveHome() };
+export function attachArguments(args: string[], resolveHome: typeof resolveAgentTeamHome): { runId?: string; home: AgentTeamHome } {
+  const options = [...args];
+  const runId = options[0]?.startsWith('--') ? undefined : options.shift();
+  if (options.length === 0) return { ...(runId === undefined ? {} : { runId }), home: resolveHome() };
   if (options[0] !== '--home') throw new Error(`Unknown attach option: ${options[0]}`);
   const homePath = options[1];
   if (!homePath || homePath.startsWith('--')) throw new Error('--home requires a value');
   if (options.length > 2) throw new Error(`Unknown attach option: ${options[2]}`);
-  return { runId, home: resolveHome({ env: { ...process.env, AGENT_TEAM_HOME: homePath } }) };
+  return {
+    ...(runId === undefined ? {} : { runId }),
+    home: resolveHome({ env: { ...process.env, AGENT_TEAM_HOME: homePath } })
+  };
+}
+
+async function selectRun(
+  projects: unknown,
+  runs: unknown,
+  input: Readable,
+  output: Writable,
+  color: ReturnType<typeof loadDaemonBootstrapConfig>['tui']['color'],
+  setCancel: (cancel: () => void) => void
+): Promise<string | undefined> {
+  const selector = new AttachRunSelectorUi(list(projects), list(runs), output, color);
+  selector.start();
+  const terminal = input as RawInput;
+  if (!selector.isInteractive || !terminal.isTTY || !terminal.setRawMode) return undefined;
+  return await new Promise<string | undefined>((resolve) => {
+    let complete = false;
+    const finish = (runId?: string): void => {
+      if (complete) return;
+      complete = true;
+      terminal.off('data', onData);
+      terminal.setRawMode?.(false);
+      selector.stop();
+      resolve(runId);
+    };
+    const onData = (data: Buffer | string): void => {
+      const keys = terminalKeys(data.toString());
+      if (keys.includes('quit')) return finish();
+      if (keys.includes('up')) selector.move(-1);
+      if (keys.includes('down')) selector.move(1);
+      if (keys.includes('enter')) finish(selector.selectedRunId);
+    };
+    setCancel(() => finish());
+    terminal.setRawMode!(true);
+    terminal.on('data', onData);
+    terminal.resume();
+  });
+}
+
+function attachKeys(input: Readable, ui: AttachUi, answer: () => void, log: () => void, stop: () => void): () => void {
+  const terminal = input as RawInput;
+  if (!ui.isInteractive || !terminal.isTTY || !terminal.setRawMode) return () => {};
+  const onData = (data: Buffer | string): void => {
+    const keys = terminalKeys(data.toString());
+    if (keys.includes('quit')) {
+      stop();
+      return;
+    }
+    if (keys.includes('up')) ui.moveAgent?.(-1);
+    if (keys.includes('down')) ui.moveAgent?.(1);
+    if (keys.includes('answer')) answer();
+    if (keys.includes('log')) log();
+  };
+  terminal.setRawMode(true);
+  terminal.on('data', onData);
+  terminal.resume();
+  return () => {
+    terminal.off('data', onData);
+    terminal.setRawMode?.(false);
+  };
+}
+
+async function askWithCookedInput(input: Readable, ask: Ask, prompt: string): Promise<string> {
+  const terminal = input as RawInput;
+  const restoreRawMode = Boolean(terminal.isTTY && terminal.setRawMode);
+  if (restoreRawMode) terminal.setRawMode!(false);
+  try {
+    return await ask(prompt);
+  } finally {
+    if (restoreRawMode) terminal.setRawMode!(true);
+  }
+}
+
+function terminalKeys(value: string): Array<'up' | 'down' | 'enter' | 'answer' | 'log' | 'quit'> {
+  if (value.includes('\u0003') || value.toLowerCase().includes('q')) return ['quit'];
+  const keys: Array<'up' | 'down' | 'enter' | 'answer' | 'log' | 'quit'> = [];
+  if (value.includes('\x1b[A')) keys.push('up');
+  if (value.includes('\x1b[B')) keys.push('down');
+  if (value.includes('\r') || value.includes('\n')) keys.push('enter');
+  if (value.toLowerCase().includes('a')) keys.push('answer');
+  if (value.toLowerCase().includes('l')) keys.push('log');
+  return keys;
+}
+
+function list(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
 }
 
 function eventsFrom(value: unknown): { events: unknown[]; lastEventId?: number } {

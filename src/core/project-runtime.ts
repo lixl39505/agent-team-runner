@@ -105,8 +105,7 @@ function defaultConfig(): RunnerConfig {
       globalCommands: [...DEFAULT_CONFIG.verification.globalCommands]
     },
     integration: {
-      allowedPaths: [...DEFAULT_CONFIG.integration.allowedPaths],
-      runAgentAfterCherryPick: DEFAULT_CONFIG.integration.runAgentAfterCherryPick
+      allowedPaths: [...DEFAULT_CONFIG.integration.allowedPaths]
     }
   };
 }
@@ -181,14 +180,8 @@ export function runnerConfigFromProjectPolicy(
   }
   if (backendPolicy.integration !== undefined) {
     const integration = object(backendPolicy.integration, 'backendPolicy.integration');
-    allowedKeys(integration, ['allowedPaths', 'runAgentAfterCherryPick'], 'backendPolicy.integration');
+    allowedKeys(integration, ['allowedPaths'], 'backendPolicy.integration');
     if (integration.allowedPaths !== undefined) config.integration.allowedPaths = stringArray(integration.allowedPaths, 'backendPolicy.integration.allowedPaths');
-    if (integration.runAgentAfterCherryPick !== undefined) {
-      if (typeof integration.runAgentAfterCherryPick !== 'boolean') {
-        throw new Error('backendPolicy.integration.runAgentAfterCherryPick must be a boolean');
-      }
-      config.integration.runAgentAfterCherryPick = integration.runAgentAfterCherryPick;
-    }
   }
 
   const validation = validateAgents(config);

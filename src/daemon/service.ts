@@ -1,6 +1,13 @@
 import { ensureAgentTeamHome, type AgentTeamHome } from '../core/home.js';
-import { join } from 'node:path';
-import { readFileSync, writeFileSync } from 'node:fs';
+import {
+  defaultDaemonBootstrapConfig,
+  loadDaemonBootstrapConfig,
+  type DaemonBootstrapConfig
+} from '../core/daemon-config.js';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { open, realpath } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { StateDatabase } from '../core/db.js';
 import { createExecutionRun } from '../core/execution-run.js';
 import { runOrchestrator } from '../core/orchestrator.js';
@@ -10,6 +17,7 @@ import type { ContractBlockReport } from '../core/types.js';
 import { validateExecutionContract } from '../core/validation.js';
 import { assertAllowedCommand } from '../core/shell.js';
 import { writeJson, writeTaskMarkdown } from '../core/files.js';
+import { listProjectSkills, localSkillRoots, snapshotTaskSkills } from '../core/skill-handoff.js';
 import type { ExecutionContract, RunManifest } from '../core/types.js';
 import { ProjectRegistry, type JsonValue as ProjectJsonValue, type ProjectPolicyInput } from '../core/project-registry.js';
 import { runnerConfigFromProjectPolicy } from '../core/project-runtime.js';
@@ -25,9 +33,15 @@ type RunExecutor = (input: Pick<Parameters<typeof runOrchestrator>[0],
 type ActiveRun = {
   controller: AbortController;
   promise: Promise<void>;
+  leaseTimer: NodeJS.Timeout;
 };
 
 const CANCELLED_BY_CONTROLLER = 'Cancelled by controller; run again to resume.';
+const EXECUTION_LEASE_MS = 30_000;
+const DEFAULT_AGENT_LOG_LINES = 100;
+const MAX_AGENT_LOG_LINES = 200;
+const DEFAULT_AGENT_LOG_BYTES = 16 * 1024;
+const MAX_AGENT_LOG_BYTES = 64 * 1024;
 
 export interface AgentTeamDaemonOptions {
   protocolVersion?: number;
@@ -68,6 +82,13 @@ function optionalString(params: Record<string, unknown>, field: string, method: 
   return value;
 }
 
+function optionalBoolean(params: Record<string, unknown>, field: string, method: string): boolean | undefined {
+  const value = params[field];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'boolean') throw new Error(`${method} params.${field} must be a boolean`);
+  return value;
+}
+
 function optionalEventId(params: Record<string, unknown>, method: string): number | null | undefined {
   const value = params.lastAckEventId;
   if (value === undefined || value === null) return value;
@@ -97,6 +118,25 @@ function optionalEventLimit(params: Record<string, unknown>, method: string): nu
     throw new Error(`${method} params.limit must be an integer between 1 and 1000`);
   }
   return value;
+}
+
+function optionalBoundedPositiveInteger(
+  params: Record<string, unknown>,
+  field: string,
+  method: string,
+  maximum: number
+): number | undefined {
+  const value = params[field];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1 || value > maximum) {
+    throw new Error(`${method} params.${field} must be an integer between 1 and ${maximum}`);
+  }
+  return value;
+}
+
+function isWithinDirectory(path: string, directory: string): boolean {
+  const relativePath = relative(directory, path);
+  return relativePath === '' || (!relativePath.startsWith(`..${sep}`) && relativePath !== '..' && !isAbsolute(relativePath));
 }
 
 function strictObject(value: unknown, label: string, fields: readonly string[]): Record<string, unknown> {
@@ -228,6 +268,9 @@ export class AgentTeamDaemon {
   private readonly ownsStateDatabase: boolean;
   private readonly runExecutor: RunExecutor;
   private readonly activeRuns = new Map<string, ActiveRun>();
+  private readonly waitingRuns = new Set<string>();
+  private readonly daemonEpoch = randomUUID();
+  private daemonConfig: DaemonBootstrapConfig = defaultDaemonBootstrapConfig();
   private metadata: DaemonMetadata | undefined;
   private running = false;
   private stopping: Promise<void> | undefined;
@@ -272,18 +315,20 @@ export class AgentTeamDaemon {
       );
     });
     this.server.register('interaction.answer', async (params) => {
-      const input = objectParams(params, 'interaction.answer', ['id', 'clientId', 'response']);
+      const input = objectParams(params, 'interaction.answer', ['id', 'clientId', 'response', 'idempotencyKey']);
       if (!Object.hasOwn(input, 'response')) {
         throw new Error('interaction.answer params.response is required');
       }
       const id = requiredString(input, 'id', 'interaction.answer');
       const clientId = requiredString(input, 'clientId', 'interaction.answer');
+      const idempotencyKey = optionalString(input, 'idempotencyKey', 'interaction.answer');
       const interaction = this.controlPlaneStore.getInteraction(id);
       this.controlPlaneStore.assertControllerOwnership(interaction.runId, clientId);
       return this.controlPlaneStore.answerInteraction(
         id,
         clientId,
-        input.response as JsonValue
+        input.response as JsonValue,
+        idempotencyKey
       );
     });
     this.server.register('interaction.requeue_client', async (params) => {
@@ -298,20 +343,35 @@ export class AgentTeamDaemon {
       ]);
       const runId = requiredString(input, 'runId', 'controller.attach');
       const lastAckEventId = optionalEventId(input, 'controller.attach');
-      return this.controlPlaneStore.attachController({
+      const controller = this.controlPlaneStore.attachController({
         runId,
         host: requiredString(input, 'host', 'controller.attach'),
         externalThreadId: optionalString(input, 'externalThreadId', 'controller.attach') ?? runId,
         clientId: requiredString(input, 'clientId', 'controller.attach'),
         ...(lastAckEventId === undefined ? {} : { lastAckEventId })
       });
+      const run = this.stateDatabase.getRun(runId);
+      const afterEventId = lastAckEventId ?? controller.lastAckEventId ?? 0;
+      const handoffPath = join(this.home.runsDir, runId, 'handoff.json');
+      return {
+        ...controller,
+        execution: {
+          run,
+          tasks: this.stateDatabase.listTasks(runId),
+          agentExecutions: this.stateDatabase.listAgentExecutions(runId),
+          events: this.stateDatabase.listEvents(runId, afterEventId),
+          interactions: this.controlPlaneStore.listInteractions(runId),
+          handoffAvailable: existsSync(handoffPath)
+        }
+      };
     });
     this.server.register('controller.disconnect', async (params) => {
       const input = objectParams(params, 'controller.disconnect', ['runId', 'clientId']);
-      return this.controlPlaneStore.disconnectController(
-        requiredString(input, 'runId', 'controller.disconnect'),
-        requiredString(input, 'clientId', 'controller.disconnect')
-      );
+      const runId = requiredString(input, 'runId', 'controller.disconnect');
+      const clientId = requiredString(input, 'clientId', 'controller.disconnect');
+      const controller = this.controlPlaneStore.disconnectController(runId, clientId);
+      this.controlPlaneStore.requeueClientInteractions(clientId);
+      return controller;
     });
     this.server.register('controller.heartbeat', async (params) => {
       const input = objectParams(params, 'controller.heartbeat', ['runId', 'clientId']);
@@ -321,22 +381,46 @@ export class AgentTeamDaemon {
       );
     });
     this.server.register('controller.reconnectable', async (params) => {
-      if (params !== undefined) throw new Error('controller.reconnectable does not accept params');
-      return this.controlPlaneStore.listReconnectableRuns();
+      if (params === undefined) return this.controlPlaneStore.listReconnectableRuns();
+      const input = objectParams(params, 'controller.reconnectable', ['projectId']);
+      const projectId = optionalString(input, 'projectId', 'controller.reconnectable');
+      return this.controlPlaneStore.listReconnectableRuns().filter((controller) => {
+        if (projectId === undefined) return true;
+        return this.stateDatabase.getRun(controller.runId).projectId === projectId;
+      });
     });
     this.server.register('project.register', async (params) => {
-      const input = objectParams(params, 'project.register', ['gitCommonDir', 'repoRoot', 'displayName', 'gitIdentity', 'policy']);
+      const input = objectParams(params, 'project.register', [
+        'gitCommonDir', 'repoRoot', 'displayName', 'gitIdentity', 'policy', 'createdBy', 'note'
+      ]);
+      const createdBy = optionalString(input, 'createdBy', 'project.register');
+      const note = optionalString(input, 'note', 'project.register');
       return this.projectRegistry.registerProject({
         gitCommonDir: requiredString(input, 'gitCommonDir', 'project.register'),
         repoRoot: requiredString(input, 'repoRoot', 'project.register'),
         displayName: requiredString(input, 'displayName', 'project.register'),
         gitIdentity: requiredJsonValue(input.gitIdentity, 'project.register params.gitIdentity'),
-        policy: projectPolicy(input)
+        policy: projectPolicy(input),
+        ...(createdBy === undefined ? {} : { createdBy }),
+        ...(note === undefined ? {} : { note })
       });
     });
     this.server.register('project.list', async (params) => {
-      if (params !== undefined) throw new Error('project.list does not accept params');
-      return this.projectRegistry.listProjects();
+      if (params === undefined) return this.projectRegistry.listProjects();
+      const input = objectParams(params, 'project.list', ['includeArchived']);
+      const includeArchived = optionalBoolean(input, 'includeArchived', 'project.list');
+      return this.projectRegistry.listProjects({
+        ...(includeArchived === undefined ? {} : { includeArchived })
+      });
+    });
+    this.server.register('project.archive', async (params) => {
+      const input = objectParams(params, 'project.archive', ['projectId']);
+      return this.projectRegistry.archiveProject(requiredString(input, 'projectId', 'project.archive'));
+    });
+    this.server.register('project.skills', async (params) => {
+      const input = objectParams(params, 'project.skills', ['projectId']);
+      const project = this.projectRegistry.getProject(requiredString(input, 'projectId', 'project.skills'));
+      return listProjectSkills(project.repoRoot);
     });
     this.server.register('execution.submit', async (params) => {
       const input = objectParams(params, 'execution.submit', ['contract', 'runId']);
@@ -415,20 +499,28 @@ export class AgentTeamDaemon {
         for (const task of additions) affected.add(task.id);
       }
       const currentById = new Map(currentTasks.map((task) => [task.taskId, task]));
+      const skillRoots = localSkillRoots(config.workspace.repoRoot);
+      const revisedSkills = new Map(
+        contract.tasks
+          .filter((task) => affected.has(task.id) && currentById.get(task.id)?.status !== 'approved')
+          .map((task) => [task.id, snapshotTaskSkills(task, skillRoots)])
+      );
       for (const task of contract.tasks) {
         const current = currentById.get(task.id);
         if (!current) {
           if (!task.dependsOn.some((dependency) => affected.has(dependency))) {
             throw new Error(`New task ${task.id} must depend on a contract-blocked task`);
           }
-          this.stateDatabase.insertTask(runId, task);
+          this.stateDatabase.insertTask(runId, task, revisedSkills.get(task.id));
           affected.add(task.id);
           continue;
         }
         if (!affected.has(task.id) && current.specJson !== JSON.stringify(task)) {
           throw new Error(`Contract revision can only change blocked tasks or their downstream tasks: ${task.id}`);
         }
-        if (affected.has(task.id) && current.status !== 'approved') this.stateDatabase.replaceTaskSpec(runId, task);
+        if (affected.has(task.id) && current.status !== 'approved') {
+          this.stateDatabase.replaceTaskSpec(runId, task, revisedSkills.get(task.id));
+        }
       }
       const revision = this.stateDatabase.appendContractRevision(runId, JSON.stringify(contract));
       const manifest: RunManifest = {
@@ -438,7 +530,8 @@ export class AgentTeamDaemon {
         tasks: contract.tasks
       };
       this.stateDatabase.updateRun(runId, {
-        status: 'planned', error: null, finishedAt: null, manifestJson: JSON.stringify(manifest)
+        status: 'planned', runtimeState: 'recovering', desiredState: 'running',
+        error: null, finishedAt: null, manifestJson: JSON.stringify(manifest)
       });
       const runDir = join(this.home.runsDir, runId);
       writeJson(join(runDir, 'contract.json'), contract);
@@ -458,14 +551,29 @@ export class AgentTeamDaemon {
     this.server.register('execution.start', async (params) => {
       const input = objectParams(params, 'execution.start', ['runId']);
       const runId = requiredString(input, 'runId', 'execution.start');
+      const run = this.stateDatabase.getRun(runId);
+      this.stateDatabase.updateRun(runId, {
+        ...(run.status === 'cancelled' ? { status: 'planned', finishedAt: null } : {}),
+        desiredState: 'running', runtimeState: 'recovering', error: null
+      });
       return { runId, scheduled: this.scheduleRun(runId) };
+    });
+    this.server.register('execution.pause', async (params) => {
+      const input = objectParams(params, 'execution.pause', ['runId']);
+      const runId = requiredString(input, 'runId', 'execution.pause');
+      const activeRun = this.activeRuns.get(runId);
+      this.waitingRuns.delete(runId);
+      this.stateDatabase.updateRun(runId, { desiredState: 'paused', runtimeState: 'paused' });
+      activeRun?.controller.abort();
+      this.stateDatabase.addEvent(runId, null, 'RUN_PAUSED');
+      return { runId, paused: true };
     });
     this.server.register('execution.cancel', async (params) => {
       const input = objectParams(params, 'execution.cancel', ['runId']);
       const runId = requiredString(input, 'runId', 'execution.cancel');
       const activeRun = this.activeRuns.get(runId);
-      // Abort first: the orchestrator synchronously marks an interrupted run as running.
-      // Persisting controller cancellation afterwards prevents automatic recovery on restart.
+      this.waitingRuns.delete(runId);
+      this.stateDatabase.updateRun(runId, { desiredState: 'cancel_requested', runtimeState: 'cancelling' });
       activeRun?.controller.abort();
       this.markRunCancelled(runId);
       return { runId, cancelled: true };
@@ -478,6 +586,16 @@ export class AgentTeamDaemon {
         tasks: this.stateDatabase.listTasks(runId),
         agentExecutions: this.stateDatabase.listAgentExecutions(runId)
       };
+    });
+    this.server.register('execution.agent_log', async (params) => {
+      const input = objectParams(params, 'execution.agent_log', ['runId', 'agentId', 'maxLines', 'maxBytes']);
+      const runId = requiredString(input, 'runId', 'execution.agent_log');
+      const agentId = requiredString(input, 'agentId', 'execution.agent_log');
+      const maxLines = optionalBoundedPositiveInteger(input, 'maxLines', 'execution.agent_log', MAX_AGENT_LOG_LINES)
+        ?? DEFAULT_AGENT_LOG_LINES;
+      const maxBytes = optionalBoundedPositiveInteger(input, 'maxBytes', 'execution.agent_log', MAX_AGENT_LOG_BYTES)
+        ?? DEFAULT_AGENT_LOG_BYTES;
+      return await this.readAgentLog(runId, agentId, maxLines, maxBytes);
     });
     this.server.register('execution.handoff', async (params) => {
       const input = objectParams(params, 'execution.handoff', ['runId']);
@@ -512,6 +630,7 @@ export class AgentTeamDaemon {
     if (this.running) return;
 
     ensureAgentTeamHome(this.home);
+    this.daemonConfig = loadDaemonBootstrapConfig(this.home.root);
     const metadata: DaemonMetadata = {
       pid: process.pid,
       startedAt: new Date().toISOString(),
@@ -522,14 +641,14 @@ export class AgentTeamDaemon {
     try {
       await this.server.start(this.home.socket);
       this.running = true;
-      for (const run of this.stateDatabase.listRuns()) {
-        if (run.adapter === 'external'
-          && (run.status === 'planned' || run.status === 'running')
-          && run.projectId !== null
-          && run.projectPolicyRevisionId !== null) {
-          this.scheduleRun(run.id);
-        }
-      }
+      this.stateDatabase.releaseExpiredExecutionLeases();
+      this.controlPlaneStore.releaseExpiredControllerLeases();
+      this.controlPlaneStore.requeueDisconnectedControllerInteractions();
+      const waitingRunIds = this.stateDatabase.listRuns()
+        .filter((run) => this.isAutomaticallySchedulable(run))
+        .map((run) => run.id);
+      for (const runId of waitingRunIds) this.stateDatabase.updateRun(runId, { runtimeState: 'recovering' });
+      this.scheduleWaitingRuns(waitingRunIds);
     } catch (error) {
       this.lock.release();
       this.metadata = undefined;
@@ -549,7 +668,10 @@ export class AgentTeamDaemon {
     const stopping = (async () => {
       try {
         const activeRuns = [...this.activeRuns.values()];
-        for (const activeRun of activeRuns) activeRun.controller.abort();
+        for (const [runId, activeRun] of this.activeRuns) {
+          this.stateDatabase.updateRun(runId, { runtimeState: 'recovering' });
+          activeRun.controller.abort();
+        }
         await this.server.stop();
         await Promise.allSettled(activeRuns.map((activeRun) => activeRun.promise));
       } finally {
@@ -572,18 +694,107 @@ export class AgentTeamDaemon {
     this.controlPlaneStoreClosed = true;
   }
 
+  private async readAgentLog(runId: string, agentId: string, maxLines: number, maxBytes: number): Promise<{
+    runId: string;
+    agentId: string;
+    content: string;
+    lineCount: number;
+    byteCount: number;
+    truncated: boolean;
+  }> {
+    let logPath: string;
+    try {
+      logPath = this.stateDatabase.getAgentExecution(runId, agentId).logPath;
+    } catch {
+      throw new Error(`Agent log is not recorded: ${runId}/${agentId}`);
+    }
+
+    const runDirectory = resolve(this.home.runsDir, runId);
+    const requestedPath = resolve(logPath);
+    // Only daemon-recorded logs within this run's managed directory may be read.
+    if (!isWithinDirectory(requestedPath, runDirectory)) {
+      throw new Error(`Agent log is outside the managed run directory: ${runId}/${agentId}`);
+    }
+
+    let resolvedRunDirectory: string;
+    let resolvedLogPath: string;
+    try {
+      [resolvedRunDirectory, resolvedLogPath] = await Promise.all([realpath(runDirectory), realpath(requestedPath)]);
+    } catch (error) {
+      throw this.agentLogReadError(runId, agentId, error);
+    }
+    // Resolve symlinks as well so a managed-looking path cannot escape the run directory.
+    if (!isWithinDirectory(resolvedLogPath, resolvedRunDirectory)) {
+      throw new Error(`Agent log is outside the managed run directory: ${runId}/${agentId}`);
+    }
+
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    try {
+      handle = await open(resolvedLogPath, 'r');
+      const metadata = await handle.stat();
+      if (!metadata.isFile()) throw new Error('NOT_REGULAR_FILE');
+      const byteCount = Math.min(metadata.size, maxBytes);
+      const buffer = Buffer.alloc(byteCount);
+      const { bytesRead } = await handle.read(buffer, 0, byteCount, Math.max(0, metadata.size - byteCount));
+      const captured = buffer.subarray(0, bytesRead).toString('utf8');
+      const capturedLines = captured.length === 0 ? [] : captured.endsWith('\n') ? captured.slice(0, -1).split('\n') : captured.split('\n');
+      const lines = capturedLines.slice(-maxLines).map((line) => line.endsWith('\r') ? line.slice(0, -1) : line);
+      return {
+        runId,
+        agentId,
+        content: lines.join('\n'),
+        lineCount: lines.length,
+        byteCount: bytesRead,
+        truncated: metadata.size > bytesRead || capturedLines.length > lines.length
+      };
+    } catch (error) {
+      if (error instanceof Error && error.message === 'NOT_REGULAR_FILE') {
+        throw new Error(`Agent log is not readable: ${runId}/${agentId} is not a regular file`);
+      }
+      throw this.agentLogReadError(runId, agentId, error);
+    } finally {
+      await handle?.close();
+    }
+  }
+
+  private agentLogReadError(runId: string, agentId: string, error: unknown): Error {
+    const code = typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;
+    if (code === 'ENOENT') return new Error(`Agent log does not exist: ${runId}/${agentId}`);
+    if (code === 'EACCES' || code === 'EPERM') return new Error(`Agent log is not readable: ${runId}/${agentId}`);
+    return new Error(`Agent log is unavailable: ${runId}/${agentId}${code ? ` (${code})` : ''}`);
+  }
+
   private scheduleRun(runId: string): boolean {
+    if (!this.running) return false;
     if (this.activeRuns.has(runId)) return false;
     const run = this.stateDatabase.getRun(runId);
+    if (run.desiredState !== 'running') return false;
     if (!['planned', 'running', 'needs_attention', 'failed'].includes(run.status)) {
       throw new Error(`Run ${runId} cannot be scheduled from status ${run.status}`);
     }
     if (!run.projectId || !run.projectPolicyRevisionId) {
       throw new Error(`Run ${runId} has no persistent project policy; legacy runs cannot be scheduled`);
     }
+    if (this.activeRuns.size >= this.daemonConfig.concurrency.maxActiveRuns) {
+      this.waitingRuns.add(runId);
+      return false;
+    }
+    const holder = `daemon:${process.pid}`;
+    if (!this.stateDatabase.acquireExecutionLease(runId, this.daemonEpoch, holder, EXECUTION_LEASE_MS)) {
+      this.waitingRuns.add(runId);
+      return false;
+    }
+    this.waitingRuns.delete(runId);
     const project = this.projectRegistry.getProject(run.projectId);
     const policy = this.projectRegistry.getProjectPolicyRevision(project.id, run.projectPolicyRevisionId);
     const controller = new AbortController();
+    const leaseTimer = setInterval(() => {
+      if (!this.stateDatabase.renewExecutionLease(runId, this.daemonEpoch, holder, EXECUTION_LEASE_MS)) {
+        controller.abort(new Error(`Execution lease was lost for run ${runId}`));
+      }
+    }, Math.floor(EXECUTION_LEASE_MS / 3));
+    leaseTimer.unref();
+    this.stateDatabase.updateRun(runId, { runtimeState: 'active' });
     const promise = Promise.resolve()
       .then(async () => {
         await this.runExecutor({
@@ -600,21 +811,67 @@ export class AgentTeamDaemon {
       })
       .catch((error: unknown) => {
         const latest = this.stateDatabase.getRun(runId);
+        if (!this.running && latest.desiredState === 'running') {
+          this.stateDatabase.updateRun(runId, { runtimeState: 'recovering' });
+          return;
+        }
+        if (latest.desiredState === 'paused') {
+          this.stateDatabase.updateRun(runId, { runtimeState: 'paused' });
+          return;
+        }
+        if (latest.desiredState === 'cancel_requested') {
+          this.stateDatabase.updateRun(runId, { runtimeState: 'paused' });
+          return;
+        }
         if (latest.status !== 'done' && latest.status !== 'needs_attention') {
           this.stateDatabase.updateRun(runId, { status: 'failed', error: String(error), finishedAt: new Date().toISOString() });
           this.stateDatabase.addEvent(runId, null, 'RUN_DAEMON_FAILED', { error: String(error) });
         }
       })
-      .finally(() => this.activeRuns.delete(runId));
-    this.activeRuns.set(runId, { controller, promise });
+      .finally(() => {
+        clearInterval(leaseTimer);
+        this.stateDatabase.releaseExecutionLease(runId, this.daemonEpoch, holder);
+        this.activeRuns.delete(runId);
+        if (this.running) this.scheduleWaitingRuns();
+      });
+    this.activeRuns.set(runId, { controller, promise, leaseTimer });
     return true;
+  }
+
+  private scheduleWaitingRuns(runIds: readonly string[] = []): void {
+    for (const runId of runIds) this.waitingRuns.add(runId);
+    for (const runId of [...this.waitingRuns]) {
+      if (this.activeRuns.size >= this.daemonConfig.concurrency.maxActiveRuns) return;
+      const run = this.stateDatabase.getRun(runId);
+      if (!this.isQueuedRunSchedulable(run)) {
+        this.waitingRuns.delete(runId);
+        continue;
+      }
+      this.scheduleRun(runId);
+    }
+  }
+
+  private isAutomaticallySchedulable(run: ReturnType<StateDatabase['getRun']>): boolean {
+    return this.isQueuedRunSchedulable(run)
+      && (run.status === 'planned' || run.status === 'running');
+  }
+
+  private isQueuedRunSchedulable(run: ReturnType<StateDatabase['getRun']>): boolean {
+    return run.adapter === 'external'
+      && ['planned', 'running', 'needs_attention', 'failed'].includes(run.status)
+      && run.desiredState === 'running'
+      && run.projectId !== null
+      && run.projectPolicyRevisionId !== null;
   }
 
   private markRunCancelled(runId: string): void {
     const run = this.stateDatabase.getRun(runId);
     if (run.status === 'done') throw new Error(`Run ${runId} cannot be cancelled from status done`);
-    if (run.status === 'needs_attention' && run.error === CANCELLED_BY_CONTROLLER) return;
-    this.stateDatabase.updateRun(runId, { status: 'needs_attention', error: CANCELLED_BY_CONTROLLER });
+    if (run.status === 'cancelled') return;
+    this.stateDatabase.updateRun(runId, {
+      status: 'cancelled', runtimeState: 'paused', desiredState: 'cancel_requested',
+      error: CANCELLED_BY_CONTROLLER, finishedAt: new Date().toISOString()
+    });
     this.stateDatabase.addEvent(runId, null, 'RUN_CANCELLED');
   }
 
