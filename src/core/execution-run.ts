@@ -82,7 +82,7 @@ export async function createExecutionRun(input: {
       writeTaskMarkdown(join(runDir, 'tasks', `${task.id}.md`), task, baseSha);
     }
     input.db.updateRun(runId, {
-      status: 'planned',
+      status: 'queued',
       manifestJson: JSON.stringify(manifest),
       rolesJson: JSON.stringify(snapshotAgents(input.config))
     });

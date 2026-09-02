@@ -1,16 +1,18 @@
 #!/usr/bin/env node
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { StateDatabase } from './core/db.js';
 import { syncSkills } from './core/files.js';
+import { formatRunStatus } from './core/status.js';
 import { ensureGitRepo } from './core/git.js';
 import { isBackendId, isValidAgentName } from './core/agent-config.js';
 import { createCredentialStore } from './core/credentials.js';
 import { promptMaskedSecret } from './core/terminal-input.js';
-import { runMcpCli } from './mcp-cli.js';
-import { runAttachCli } from './attach-cli.js';
-import { runStartCli } from './start-cli.js';
-import { migrateLegacyProjectState } from './core/migration.js';
-import { resolveAgentTeamHome } from './core/home.js';
+import { parseRunCommandArgs, executeRunCommand } from './core/run-execute.js';
+import { cleanRunArtifacts } from './core/run-clean.js';
+import { DEFAULT_AGENT_LOG_BYTES, DEFAULT_AGENT_LOG_LINES, readAgentLog } from './core/agent-log.js';
+import { renderMachineSummary, renderRunSummary } from './core/run-exit.js';
+import { resolveAgentTeamHome, type AgentTeamHome } from './core/home.js';
 
 let argv: string[] = [];
 let command: string | undefined;
@@ -28,9 +30,101 @@ function repoOption(): string {
   return resolve(option('--repo') ?? process.cwd());
 }
 
+function homeOption(): AgentTeamHome | undefined {
+  const homePath = option('--home');
+  return homePath === undefined
+    ? undefined
+    : resolveAgentTeamHome({ env: { ...process.env, AGENT_TEAM_HOME: resolve(homePath) } });
+}
+
+function withStateDatabase<T>(home: AgentTeamHome, body: (db: StateDatabase) => T): T {
+  const db = new StateDatabase(home.stateDb);
+  try {
+    return body(db);
+  } finally {
+    db.close();
+  }
+}
+
 async function main(): Promise<void> {
   if (!command || command === 'help' || command === '--help' || command === '-h') {
     printHelp();
+    return;
+  }
+
+  if (command === 'run') {
+    const home = homeOption();
+    const parsed = parseRunCommandArgs(argv);
+    argv = [];
+    const outcome = await executeRunCommand({
+      contractPath: parsed.contractPath,
+      ...(parsed.runId === undefined ? {} : { runId: parsed.runId }),
+      ...(parsed.grantPath === undefined ? {} : { grantPath: parsed.grantPath }),
+      ...(parsed.debounceMs === undefined ? {} : { debounceMs: parsed.debounceMs }),
+      ...(parsed.maxParallel === undefined ? {} : { maxParallel: parsed.maxParallel }),
+      ...(parsed.exitMode === undefined ? {} : { exitMode: parsed.exitMode }),
+      ...(home === undefined ? {} : { home })
+    });
+    console.log(renderRunSummary({
+      runId: outcome.runId,
+      kind: outcome.kind,
+      code: outcome.exitCode,
+      status: outcome.runStatus,
+      integrationBranch: outcome.integrationBranch,
+      integrationCommit: outcome.integrationCommit,
+      contractRevision: outcome.contractRevision,
+      tasks: outcome.tasks,
+      pending: outcome.pending,
+      blockers: outcome.blockers,
+      pendingPath: outcome.pendingPath,
+      ...(outcome.handoffPath !== null ? { handoffPath: outcome.handoffPath } : {})
+    }));
+    console.log(renderMachineSummary({
+      runId: outcome.runId,
+      kind: outcome.kind,
+      code: outcome.exitCode,
+      status: outcome.runStatus,
+      contractRevision: outcome.contractRevision,
+      pendingCount: outcome.pending.length,
+      blockers: outcome.blockers
+    }));
+    process.exitCode = outcome.exitCode;
+    return;
+  }
+
+  if (command === 'status') {
+    const home = homeOption() ?? resolveAgentTeamHome();
+    const runId = argv.shift();
+    if (argv.length > 0) throw new Error(`Unknown status argument: ${argv[0]}`);
+    withStateDatabase(home, (db) => {
+      const run = runId === undefined ? db.listRuns()[0] : db.getRun(runId);
+      if (run === undefined) throw new Error('No runs found; submit a contract with agent-team run first');
+      console.log(formatRunStatus(run, db.listTasks(run.id)));
+    });
+    return;
+  }
+
+  if (command === 'log') {
+    const home = homeOption() ?? resolveAgentTeamHome();
+    const runId = argv.shift();
+    const agentId = argv.shift();
+    if (!runId || !agentId) throw new Error('Usage: agent-team log RUN_ID AGENT_ID [--lines N]');
+    const lines = Number(option('--lines') ?? DEFAULT_AGENT_LOG_LINES);
+    if (!Number.isSafeInteger(lines) || lines < 1) throw new Error('--lines must be a positive integer');
+    const homeResolved = home;
+    const content = await withStateDatabase(homeResolved, async (db) =>
+      (await readAgentLog(db, homeResolved.runsDir, runId, agentId, lines, DEFAULT_AGENT_LOG_BYTES)).content);
+    console.log(content);
+    return;
+  }
+
+  if (command === 'clean') {
+    const home = homeOption() ?? resolveAgentTeamHome();
+    const runId = argv.shift();
+    if (!runId) throw new Error('Usage: agent-team clean RUN_ID');
+    if (argv.length > 0) throw new Error(`Unknown clean argument: ${argv[0]}`);
+    const result = await withStateDatabase(home, (db) => cleanRunArtifacts(db, runId));
+    console.log(`Removed ${result.removedWorktrees.length} worktree(s) and ${result.removedBranches.length} branch(es) for run ${runId}.`);
     return;
   }
 
@@ -56,34 +150,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (command === 'migrate') {
-    await runMigrateCommand();
-    return;
-  }
-
   throw new Error(`Unknown command: ${command}`);
-}
-
-async function runMigrateCommand(): Promise<void> {
-  const repoFromOption = option('--repo');
-  const homePath = option('--home');
-  const dryRunIndex = argv.indexOf('--dry-run');
-  const dryRun = dryRunIndex >= 0;
-  if (dryRun) argv.splice(dryRunIndex, 1);
-  const repoFromArgument = argv.shift();
-  if (repoFromOption && repoFromArgument) throw new Error('migrate accepts either [repo] or --repo PATH, not both');
-  if (argv.length > 0) throw new Error(`Unknown migrate option: ${argv[0]}`);
-  const home = homePath === undefined
-    ? resolveAgentTeamHome()
-    : resolveAgentTeamHome({ env: { ...process.env, AGENT_TEAM_HOME: homePath } });
-  const plan = await migrateLegacyProjectState(repoFromOption ?? repoFromArgument ?? process.cwd(), home, dryRun);
-  const summary = `${plan.stateRuns} state run(s), ${plan.runArtifacts} run artifact(s)`;
-  if (dryRun) {
-    console.log(`Migration preflight passed (dry run): ${summary}.`);
-  } else {
-    console.log(`Migrated ${summary} to ${home.root}.`);
-  }
-  console.log(`Worktrees were not migrated (${plan.preservedWorktrees} direct legacy entries preserved); only terminal runs are supported.`);
 }
 
 async function runAuthCommand(): Promise<void> {
@@ -135,16 +202,6 @@ export async function runCli(args: string[] = process.argv.slice(2)): Promise<vo
   argv = [...args];
   command = argv.shift();
   try {
-    if (command === 'start' || command === 'mcp' || command === 'attach') {
-      const controlPlaneCommand = command;
-      const controlPlaneArgs = argv;
-      argv = [];
-      command = undefined;
-      if (controlPlaneCommand === 'start') await runStartCli(controlPlaneArgs);
-      else if (controlPlaneCommand === 'mcp') await runMcpCli(controlPlaneArgs);
-      else await runAttachCli(controlPlaneArgs);
-      return;
-    }
     await main();
   } finally {
     argv = [];
@@ -156,12 +213,14 @@ function printHelp(): void {
   console.log(`agent-team-runner
 
 Commands:
+  run --contract PATH                 Execute an execution contract (create or replay a run)
+          [--run-id ID] [--grant PATH] [--debounce-ms N] [--max-parallel N]
+          [--exit-mode eager|quiescence] [--home PATH]
+  status [RUN_ID] [--home PATH]       Show run and task status (latest run by default)
+  log RUN_ID AGENT_ID [--lines N] [--home PATH]
+                                      Tail a worker/reviewer/integrator log
+  clean RUN_ID [--home PATH]          Remove a run's worktrees and branches (non-replayable afterwards)
   init [repo]                         Sync host skills without modifying repository config
-  start [--home PATH]                 Start or connect to the daemon, then open the Inbox
-  mcp [--home PATH]                   Run the MCP server
-  attach [run-id] [--home PATH]       Select or attach an interactive daemon run dashboard
-  migrate [repo] [--repo PATH]        Read and safely migrate terminal legacy state to AGENT_TEAM_HOME
-          [--home PATH] [--dry-run]   Never merges or overwrites state.sqlite or run artifacts
   skills sync [--repo PATH]          Mirror portable skills for Codex/OpenCode/Claude
   auth set --backend ID --profile N  Save an API key in the macOS Keychain
   auth status --backend ID --profile N
@@ -169,6 +228,8 @@ Commands:
   auth logout --backend ID --profile N
                                      Delete a Keychain credential
   auth login --backend ID            Use the backend native CLI instead (OAuth unsupported)
+
+Run exit codes: 0 done, 10 needs-approval, 11 contract-blocked, 1 failed, 130 interrupted.
 `);
 }
 

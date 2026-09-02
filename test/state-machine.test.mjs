@@ -102,9 +102,10 @@ test('orchestrator retries reviewer feedback and integrates the approved task', 
   const repoRoot = await repository();
   const config = configFor(repoRoot);
   const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
-  const persistedSkills = [{
-    name: 'tdd', role: 'worker', source: 'project', path: '/stored/tdd/SKILL.md', sha256: 'persisted-sha', content: 'Use the stored snapshot.'
-  }];
+  const persistedSkills = [
+    { name: 'tdd', role: 'worker', source: 'project', path: '/stored/tdd/SKILL.md', sha256: 'worker-sha', content: 'Use the stored worker snapshot.' },
+    { name: 'review', role: 'reviewer', source: 'project', path: '/stored/review/SKILL.md', sha256: 'reviewer-sha', content: 'Use the stored reviewer snapshot.' }
+  ];
   const manifest = {
     version: 1, title: 'Run', summary: 'test run',
     tasks: [task({ implementationSkills: [{ name: 'tdd', role: 'worker', required: true, source: 'project' }] })]
@@ -140,8 +141,13 @@ test('orchestrator retries reviewer feedback and integrates the approved task', 
     const workerPrompts = backend.specs.filter((spec) => spec.role === 'worker').map((spec) => spec.prompt);
     assert.match(workerPrompts[1], /Reviewer feedback \(verbatim\).*needs fix/s);
     assert.match(workerPrompts[1], /Previous worker summary.*first pass/s);
-    assert.match(workerPrompts[0], /Use the stored snapshot/);
-    assert.match(workerPrompts[0], /sha256:persisted-sha/);
+    assert.match(workerPrompts[0], /Use the stored worker snapshot/);
+    assert.match(workerPrompts[0], /sha256:worker-sha/);
+    assert.equal(workerPrompts[0].includes('Use the stored reviewer snapshot.'), false);
+    const reviewerPrompts = backend.specs.filter((spec) => spec.role === 'reviewer').map((spec) => spec.prompt);
+    assert.match(reviewerPrompts[0], /Use the stored reviewer snapshot/);
+    assert.match(reviewerPrompts[0], /sha256:reviewer-sha/);
+    assert.equal(reviewerPrompts[0].includes('Use the stored worker snapshot.'), false);
     assert.equal(readFileSync(join(db.getRun('run').integrationWorktree, 'src', 'feature.txt'), 'utf8'), 'fixed\n');
     assert.ok(eventTypes(db, 'run').includes('CHANGES_REQUESTED'));
     assert.ok(eventTypes(db, 'run').includes('INTEGRATION_COMPLETED'));

@@ -134,7 +134,7 @@ test('workerPrompt renders optional worktree, feedback, and complete retry conte
       { name: 'review', role: 'reviewer', source: 'project', path: '/tmp/review/SKILL.md', sha256: 'def', content: 'Do not show this to the worker.' }
     ]
   });
-  assert.match(withSkill, /# Required implementation skills/);
+  assert.match(withSkill, /# Required worker skills/);
   assert.match(withSkill, /tdd \(project, sha256:abc\)/);
   assert.match(withSkill, /Write a failing test first/);
   assert.equal(withSkill.includes('Do not show this to the worker.'), false);
@@ -142,28 +142,42 @@ test('workerPrompt renders optional worktree, feedback, and complete retry conte
   assert.match(withSkill, /never expand scope yourself/);
 });
 
-test('reviewerPrompt and integrationPrompt render their conditional contexts', () => {
+test('reviewerPrompt and integrationPrompt render their conditional contexts and role-specific skills', () => {
+  const skills = [
+    { name: 'worker-skill', role: 'worker', source: 'project', path: '/tmp/worker/SKILL.md', sha256: 'worker-sha', content: 'Worker-only instruction.' },
+    { name: 'reviewer-skill', role: 'reviewer', source: 'project', path: '/tmp/reviewer/SKILL.md', sha256: 'reviewer-sha', content: 'Reviewer-only instruction.' },
+    { name: 'integrator-skill', role: 'integrator', source: 'project', path: '/tmp/integrator/SKILL.md', sha256: 'integrator-sha', content: 'Integrator-only instruction.' }
+  ];
   const review = reviewerPrompt({
     task,
     startSha: 'start',
     worktreePath: '/tmp/worktree',
     workerResult: { status: 'completed' },
     candidateFiles: ['src/a.ts'],
-    candidateDiff: `${'d'.repeat(24_001)}tail`
+    candidateDiff: `${'d'.repeat(24_001)}tail`,
+    skills
   });
   assert.match(review, /Your working directory \(the task worktree\): \/tmp\/worktree/);
   assert.match(review, /# Complete changed-file manifest\n\n- src\/a.ts/);
   assert.match(review, /# Staged candidate diff/);
   assert.match(review, /… \(truncated, 5 more characters\)/);
+  assert.match(review, /# Required reviewer skills/);
+  assert.match(review, /Reviewer-only instruction/);
+  assert.equal(review.includes('Worker-only instruction.'), false);
+  assert.equal(review.includes('Integrator-only instruction.'), false);
   const bareReview = reviewerPrompt({ task, startSha: 'start', workerResult: null, candidateFiles: [], candidateDiff: '' });
   assert.equal(bareReview.includes('Your working directory'), false);
   assert.equal(bareReview.includes('Complete changed-file manifest'), false);
   assert.equal(bareReview.includes('Staged candidate diff'), false);
   assert.match(reviewerPrompt({ task, startSha: 'start', workerResult: null, candidateDiff: 'small diff' }), /# Staged candidate diff\n\nsmall diff/);
 
-  const conflict = integrationPrompt({ manifest: { version: 1, title: 'Run', summary: 'Summary', tasks: [task] }, worktreePath: '/tmp/integration', conflictFiles: ['src/a.ts'] });
+  const conflict = integrationPrompt({ manifest: { version: 1, title: 'Run', summary: 'Summary', tasks: [task] }, worktreePath: '/tmp/integration', conflictFiles: ['src/a.ts'], skills });
   assert.match(conflict, /A cherry-pick conflict is active\. Resolve only these files: src\/a\.ts\./);
   assert.match(conflict, /Your working directory \(the integration worktree\): \/tmp\/integration/);
+  assert.match(conflict, /# Required integrator skills/);
+  assert.match(conflict, /Integrator-only instruction/);
+  assert.equal(conflict.includes('Worker-only instruction.'), false);
+  assert.equal(conflict.includes('Reviewer-only instruction.'), false);
   assert.match(integrationPrompt({ manifest: { version: 1, title: 'Run', summary: 'Summary', tasks: [] } }), /Resolve only these files: \./);
 });
 

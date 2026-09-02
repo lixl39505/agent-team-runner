@@ -49,6 +49,8 @@ export interface SessionSpec {
   role: AgentRole;
   /** Human-readable run/task context for terminal approval prompts. */
   label?: string | undefined;
+  /** Owning task id, threaded into approval/question requests for durable collection. */
+  taskId?: string | undefined;
   cwd: string;
   prompt: string;
   /** 结构化输出 JSON Schema（后端原生通道：outputFormat/outputSchema/format） */

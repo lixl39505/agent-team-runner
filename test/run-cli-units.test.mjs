@@ -1,0 +1,577 @@
+import { test, vi } from 'vitest';
+import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { git } from '../src/core/git.ts';
+import { resolveAgentTeamHome } from '../src/core/home.ts';
+import { StateDatabase } from '../src/core/db.ts';
+import { ProjectRegistry } from '../src/core/project-registry.ts';
+import { runnerConfigFromProjectPolicy } from '../src/core/project-runtime.ts';
+import { validateExecutionContract, assertExecutionContractFields } from '../src/core/validation.ts';
+import { createExecutionRun } from '../src/core/execution-run.ts';
+import { applyContractRevision } from '../src/core/contract-revision.ts';
+import { readHandoff, writeHandoff } from '../src/core/handoff.ts';
+import { agentLogReadError, readAgentLog, reconnectAgentLogs } from '../src/core/agent-log.ts';
+import { cleanRunArtifacts } from '../src/core/run-clean.ts';
+import {
+  ApprovalCollector,
+  extractCommands,
+  partitionGrants
+} from '../src/core/approval-collector.ts';
+import {
+  blockersPath,
+  classifyRunExit,
+  contractBlockers,
+  handoffPath,
+  pendingItemPath,
+  readPendingFileSync,
+  renderMachineSummary,
+  renderRunSummary,
+  writeBlockersFileSync,
+  writePendingFileSync
+} from '../src/core/run-exit.ts';
+import { executeRunCommand, parseRunCommandArgs, readGrantDecisions } from '../src/core/run-execute.ts';
+
+function scratch(prefix) {
+  return mkdtempSync(join(tmpdir(), `${prefix}-`));
+}
+
+const RUN_FAILED = { status: 'failed' };
+const TASK_OK = { taskId: 'T001', status: 'approved', lastError: null };
+
+test('classifyRunExit orders interrupted, done, contract blocks, and pending approvals', () => {
+  assert.deepEqual(classifyRunExit({ run: { status: 'running' }, tasks: [], pending: [], interrupted: true }),
+    { code: 130, kind: 'interrupted' });
+  assert.deepEqual(classifyRunExit({ run: { status: 'done' }, tasks: [TASK_OK], pending: [], interrupted: false }),
+    { code: 0, kind: 'done' });
+  assert.deepEqual(classifyRunExit({
+    run: { status: 'needs_attention' },
+    tasks: [{ taskId: 'T001', status: 'blocked_on_contract', lastError: 'why' }],
+    pending: [], interrupted: false
+  }), { code: 11, kind: 'contract_blocked' });
+  assert.deepEqual(classifyRunExit({
+    run: { status: 'needs_attention' }, tasks: [{ taskId: 'T001', status: 'blocked' }], pending: [{ id: 'p1' }], interrupted: false
+  }), { code: 10, kind: 'needs_approval' });
+  assert.deepEqual(classifyRunExit({ run: RUN_FAILED, tasks: [TASK_OK], pending: [], interrupted: false }),
+    { code: 1, kind: 'failed' });
+});
+
+test('run exit helpers render summaries and derive artifact paths', () => {
+  const blockers = contractBlockers([
+    { taskId: 'T002', title: 'Blocked task', attempts: 2, status: 'blocked_on_contract', lastError: 'reason text' },
+    { taskId: 'T003', title: 'No reason', attempts: 1, status: 'blocked_on_contract', lastError: null }
+  ]);
+  assert.deepEqual(blockers.map((blocker) => blocker.reason), ['reason text', 'Worker requested a contract revision without a reason.']);
+
+  const summary = renderRunSummary({
+    runId: 'r1', kind: 'contract_blocked', code: 11, status: 'needs_attention',
+    integrationBranch: 'agent-team/r1/integration', integrationCommit: 'abc',
+    contractRevision: 2, tasks: [{ taskId: 'T001', status: 'approved' }],
+    pending: [{ id: 'p1' }], blockers, pendingPath: '/tmp/pending.json', handoffPath: '/tmp/handoff.json'
+  });
+  assert.match(summary, /Run r1: contract_blocked \(exit 11\)/);
+  assert.match(summary, /Contract blockers: T002, T003/);
+  assert.match(summary, /Handoff:/);
+
+  const plain = renderRunSummary({
+    runId: 'r2', kind: 'done', code: 0, status: 'done', integrationBranch: null, integrationCommit: null,
+    contractRevision: 1, tasks: [], pending: [], blockers: [], pendingPath: '/tmp/p2.json'
+  });
+  assert.match(plain, /Integration branch: none/);
+  assert.doesNotMatch(plain, /Handoff:/);
+
+  const machine = renderMachineSummary({
+    runId: 'r1', kind: 'needs_approval', code: 10, status: 'running', contractRevision: 3,
+    pendingCount: 2, blockers: [{ taskId: 'T009' }]
+  });
+  assert.deepEqual(JSON.parse(machine), {
+    runId: 'r1', kind: 'needs_approval', exit: 10, status: 'running',
+    contractRevision: 3, pending: 2, contractBlockedTaskIds: ['T009']
+  });
+
+  assert.equal(pendingItemPath('/runs', 'r'), join('/runs', 'r', 'pending.json'));
+  assert.equal(blockersPath('/runs', 'r'), join('/runs', 'r', 'blockers.json'));
+  assert.equal(handoffPath('/runs', 'r'), join('/runs', 'r', 'handoff.json'));
+});
+
+test('pending and blockers files round-trip and tolerate malformed input', () => {
+  const dir = scratch('agent-team-run-exit-files-');
+  const pendingPath = join(dir, 'nested', 'pending.json');
+  writePendingFileSync(pendingPath, { runId: 'r1', pending: [{ id: 'p1', kind: 'approval', taskId: null, agentId: 'worker:claude', subject: 'x', reason: 'y' }] });
+  assert.equal(readPendingFileSync(pendingPath).pending.length, 1);
+  assert.equal(readPendingFileSync(join(dir, 'missing.json')), undefined);
+
+  writeFileSync(join(dir, 'garbage.json'), 'not json', 'utf8');
+  assert.equal(readPendingFileSync(join(dir, 'garbage.json')), undefined);
+  writeFileSync(join(dir, 'shape.json'), JSON.stringify({ runId: 7, pending: 'nope' }), 'utf8');
+  assert.equal(readPendingFileSync(join(dir, 'shape.json')), undefined);
+
+  const blockersPathFile = join(dir, 'nested2', 'blockers.json');
+  writeBlockersFileSync(blockersPathFile, [{ taskId: 'T001', title: 't', attempts: 1, reason: 'r' }]);
+  assert.deepEqual(JSON.parse(readFileSync(blockersPathFile, 'utf8')).blockers.length, 1);
+});
+
+test('extractCommands collects command strings from backend input shapes', () => {
+  assert.deepEqual(extractCommands({ command: 'pnpm add zod' }), ['pnpm add zod']);
+  assert.deepEqual(extractCommands({ cmd: 'make test' }), ['make test']);
+  assert.deepEqual(extractCommands({ script: 'go test ./...' }), ['go test ./...']);
+  assert.deepEqual(extractCommands({ command: ['docker', 'compose', 'up'] }), ['docker compose up']);
+  assert.deepEqual(extractCommands('raw string'), ['raw string']);
+  assert.deepEqual(extractCommands(['a', { command: 'b' }]), ['a', 'b']);
+  assert.deepEqual(extractCommands({ unrelated: true }), []);
+  assert.deepEqual(extractCommands(null), []);
+});
+
+test('partitionGrants splits approve, deny, and unresolved decisions', () => {
+  const pending = [{ id: 'p1' }, { id: 'p2' }, { id: 'p3' }];
+  const split = partitionGrants(pending, { p1: 'approve', p2: 'deny' });
+  assert.deepEqual(split.approved.map((item) => item.id), ['p1']);
+  assert.deepEqual(split.denied.map((item) => item.id), ['p2']);
+  assert.deepEqual(split.unresolved.map((item) => item.id), ['p3']);
+});
+
+test('ApprovalCollector denies with guidance, persists items, and drives eager aborts', async () => {
+  const dir = scratch('agent-team-collector-');
+  const pendingPath = join(dir, 'pending.json');
+  const existing = { runId: 'run-a', pending: [{ id: 'p7', kind: 'approval', taskId: null, agentId: 'w', subject: 'old', reason: 'r' }] };
+  writePendingFileSync(pendingPath, existing);
+
+  const aborts = [];
+  const collector = new ApprovalCollector({
+    runId: 'run-a', pendingPath, debounceMs: 0, exitMode: 'eager', onEagerAbort: () => aborts.push('a')
+  });
+  assert.equal(collector.pending.length, 1);
+  assert.equal(collector.hasPending, true);
+
+  const decision = await collector.requestApproval({
+    backend: 'claude', role: 'worker', cwd: '/w', kind: 'command', tool: 'Bash',
+    input: { command: 'pnpm add left-pad' }, allowSession: false
+  });
+  assert.equal(decision, 'deny');
+  assert.equal(collector.pending.length, 2);
+  assert.equal(collector.pending[1].id, 'p8');
+  assert.equal(collector.pending[1].taskId, null);
+  assert.deepEqual(collector.pending[1].commands, ['pnpm add left-pad']);
+  assert.match(collector.pending[1].reason, /mechanically equivalent alternative/);
+  assert.deepEqual(aborts, ['a']);
+
+  const answers = await collector.requestUserInput({
+    backend: 'codex', role: 'reviewer', cwd: '/w', taskId: 'T001',
+    questions: [{ id: 'q1', question: 'Which format?' }]
+  });
+  assert.deepEqual(answers, {});
+  assert.equal(collector.pending[2].kind, 'question');
+  assert.equal(collector.pending[2].taskId, 'T001');
+  assert.deepEqual(collector.pending[2].commands, undefined);
+  assert.deepEqual(aborts, ['a', 'a']);
+
+  const onDisk = JSON.parse(readFileSync(pendingPath, 'utf8'));
+  assert.equal(onDisk.pending.length, 3);
+
+  collector.dispose();
+  const quiescent = new ApprovalCollector({
+    runId: 'other-run', pendingPath, debounceMs: 50, exitMode: 'quiescence', onEagerAbort: () => aborts.push('never')
+  });
+  assert.equal(quiescent.pending.length, 0, 'items from another run are not carried over');
+  await quiescent.requestApproval({
+    backend: 'claude', role: 'worker', cwd: '/w', kind: 'tool', tool: 'WebFetch',
+    input: 'https://example.test', allowSession: true, reason: 'custom reason'
+  });
+  assert.deepEqual(aborts.filter((entry) => entry === 'never'), []);
+  assert.equal(quiescent.pending[0].reason, 'custom reason');
+  quiescent.dispose();
+});
+
+test('agent log reads bounded tails inside the run directory only', async () => {
+  const parent = scratch('agent-team-agent-log-');
+  const home = resolveAgentTeamHome({ env: { AGENT_TEAM_HOME: join(parent, 'home') } });
+  mkdirSync(join(home.runsDir, 'r1', 'logs'), { recursive: true });
+  const logPath = join(home.runsDir, 'r1', 'logs', 'agent.log');
+  writeFileSync(logPath, Array.from({ length: 20 }, (_, index) => `line-${index}`).join('\n'), 'utf8');
+  const db = new StateDatabase(home.stateDb);
+  db.createRun({ id: 'r1', repoRoot: parent, goalFile: 'g', baseRef: 'HEAD', baseSha: 's', adapter: 'external' });
+  db.startAgentExecution({ runId: 'r1', agentId: 'w1', role: 'worker', backend: 'claude', logPath });
+
+  const tail = await readAgentLog(db, home.runsDir, 'r1', 'w1', 5, 64 * 1024);
+  assert.equal(tail.lineCount, 5);
+  assert.equal(tail.content.split('\n')[0], 'line-15');
+  assert.equal(tail.truncated, true);
+
+  const byteLimited = await readAgentLog(db, home.runsDir, 'r1', 'w1', 200, 20);
+  assert.equal(byteLimited.truncated, true);
+  assert.ok(byteLimited.byteCount <= 20);
+  db.close();
+
+  const emptyDb = new StateDatabase(join(scratch('agent-team-agent-log-empty-'), 'state.sqlite'));
+  await assert.rejects(readAgentLog(emptyDb, home.runsDir, 'r1', 'missing', 10, 1024), /not recorded/);
+  await assert.rejects(readAgentLog(emptyDb, home.runsDir, 'gone', 'w1', 10, 1024), /not recorded|does not exist|unavailable/);
+  emptyDb.close();
+});
+
+test('agent log rejects paths outside the managed run directory and non-files', async () => {
+  const parent = scratch('agent-team-agent-log-guard-');
+  const home = resolveAgentTeamHome({ env: { AGENT_TEAM_HOME: join(parent, 'home') } });
+  mkdirSync(join(home.runsDir, 'r1'), { recursive: true });
+  const outside = join(parent, 'outside.log');
+  writeFileSync(outside, 'secret', 'utf8');
+  const db = new StateDatabase(home.stateDb);
+  db.createRun({ id: 'r1', repoRoot: parent, goalFile: 'g', baseRef: 'HEAD', baseSha: 's', adapter: 'external' });
+  db.startAgentExecution({ runId: 'r1', agentId: 'w1', role: 'worker', backend: 'claude', logPath: outside });
+  await assert.rejects(readAgentLog(db, home.runsDir, 'r1', 'w1', 10, 1024), /outside the managed run directory/);
+
+  const directoryLog = join(home.runsDir, 'r1', 'dirlog');
+  mkdirSync(directoryLog, { recursive: true });
+  db.startAgentExecution({ runId: 'r1', agentId: 'w2', role: 'worker', backend: 'claude', logPath: directoryLog });
+  await assert.rejects(readAgentLog(db, home.runsDir, 'r1', 'w2', 10, 1024), /is not a regular file/);
+
+  db.startAgentExecution({ runId: 'r1', agentId: 'w3', role: 'worker', backend: 'claude', logPath: join(home.runsDir, 'r1', 'missing.log') });
+  await assert.rejects(readAgentLog(db, home.runsDir, 'r1', 'w3', 10, 1024), /does not exist/);
+  db.close();
+});
+
+test('clean removes task and integration worktrees and branches, then cancels the run', async () => {
+  const repoRoot = scratch('agent-team-clean-repo-');
+  writeFileSync(join(repoRoot, 'base.txt'), 'base\n', 'utf8');
+  await git(repoRoot, ['init', '-q']);
+  await git(repoRoot, ['config', 'user.email', 't@e.com']);
+  await git(repoRoot, ['config', 'user.name', 't']);
+  await git(repoRoot, ['add', '-A']);
+  await git(repoRoot, ['commit', '-q', '-m', 'base']);
+
+  const parent = scratch('agent-team-clean-home-');
+  const home = resolveAgentTeamHome({ env: { AGENT_TEAM_HOME: join(parent, 'home') } });
+  mkdirSync(join(home.worktreesDir, 'r1'), { recursive: true });
+  const worktreePath = join(home.worktreesDir, 'r1', 'integration');
+  const integrationBranch = 'agent-team/r1/integration';
+  await git(repoRoot, ['worktree', 'add', worktreePath, '-b', integrationBranch, 'HEAD']);
+
+  const db = new StateDatabase(home.stateDb);
+  let result;
+  try {
+    db.createRun({ id: 'r1', repoRoot, goalFile: 'g', baseRef: 'HEAD', baseSha: 'base', adapter: 'external' });
+    db.insertTask('r1', {
+      id: 'T001', title: 't', description: 'd', dependsOn: [], allowedPaths: ['**'], blockedPaths: [],
+      acceptance: ['a'], verificationCommands: []
+    });
+    db.updateTask('r1', 'T001', { branch: integrationBranch, worktree: worktreePath });
+    db.updateRun('r1', { integrationBranch, integrationWorktree: worktreePath });
+    result = await cleanRunArtifacts(db, 'r1');
+    assert.deepEqual(result.removedWorktrees, [worktreePath]);
+    assert.deepEqual(result.removedBranches, [integrationBranch]);
+    const run = db.getRun('r1');
+    assert.equal(run.status, 'cancelled');
+    assert.match(run.error, /Cleaned by agent-team clean/);
+    const listed = await git(repoRoot, ['worktree', 'list', '--porcelain'], true);
+    assert.doesNotMatch(listed.stdout, /agent-team\/r1\/integration/);
+
+    const second = await cleanRunArtifacts(db, 'r1');
+    assert.deepEqual(second.removedWorktrees, []);
+    assert.deepEqual(second.removedBranches, []);
+    assert.equal(db.getRun('r1').status, 'cancelled');
+  } finally {
+    db.close();
+  }
+});
+
+function unitsContract(repoRoot) {
+  return {
+    version: 1, project: { id: 'bare-project', repoRoot, baseRef: 'HEAD' },
+    tasks: [{ id: 'T001', title: 't', description: 'd', dependsOn: [], allowedPaths: ['**'], blockedPaths: [], acceptance: ['a'], verificationCommands: [] }]
+  };
+}
+
+test('contract revision requires a materialized external contract', async () => {
+  const parent = scratch('agent-team-revision-bare-');
+  const home = resolveAgentTeamHome({ env: { AGENT_TEAM_HOME: join(parent, 'home') } });
+  const registry = new ProjectRegistry(home.stateDb);
+  const db = new StateDatabase(home.stateDb);
+  try {
+    registry.registerProject({
+      gitCommonDir: join(parent, '.git'), repoRoot: parent, displayName: 'bare',
+      gitIdentity: { root: parent },
+      id: 'bare-project',
+      policy: {
+        baseRef: 'HEAD', verificationAllowedCommandPrefixes: ['pnpm test'], baselinePathPolicy: {},
+        agentProfileMapping: { defaultAgent: 'default-claude', agents: { 'default-claude': { backend: 'claude' } }, roles: {} },
+        backendPolicy: {}
+      }
+    });
+    const bareDb = join(parent, 'bare.sqlite');
+    const bare = new StateDatabase(bareDb);
+    bare.createRun({ id: 'no-contract', repoRoot: parent, goalFile: 'g', baseRef: 'HEAD', baseSha: 's', adapter: 'external' });
+    assert.throws(() => applyContractRevision({ db: bare, projectRegistry: registry, home, runId: 'no-contract', contract: unitsContract(parent) }), /no external execution contract/);
+    bare.close();
+
+    const withContract = new StateDatabase(join(parent, 'with.sqlite'));
+    withContract.createRun({
+      id: 'contract-only', repoRoot: parent, goalFile: 'g', baseRef: 'HEAD', baseSha: 's', adapter: 'external',
+      executionContractJson: JSON.stringify(unitsContract(parent))
+    });
+    assert.throws(() => applyContractRevision({ db: withContract, projectRegistry: registry, home, runId: 'contract-only', contract: unitsContract(parent) }), /no external execution contract/);
+    withContract.close();
+  } finally {
+    db.close();
+  }
+});
+
+test('contract revision rejects protected changes and accepts a valid revision', async () => {
+  const repoRoot = scratch('agent-team-revision-repo-');
+  writeFileSync(join(repoRoot, 'base.txt'), 'base\n', 'utf8');
+  await git(repoRoot, ['init', '-q']);
+  await git(repoRoot, ['config', 'user.email', 't@e.com']);
+  await git(repoRoot, ['config', 'user.name', 't']);
+  await git(repoRoot, ['add', '-A']);
+  await git(repoRoot, ['commit', '-q', '-m', 'base']);
+  const parent = scratch('agent-team-revision-home-');
+  const home = resolveAgentTeamHome({ env: { AGENT_TEAM_HOME: join(parent, 'home') } });
+  const registry = new ProjectRegistry(home.stateDb);
+  const db = new StateDatabase(home.stateDb);
+  try {
+    const project = registry.registerProject({
+      gitCommonDir: join(repoRoot, '.git'),
+      repoRoot,
+      displayName: 'rev',
+      gitIdentity: { root: repoRoot },
+      id: 'rev-project',
+      policy: {
+        baseRef: 'HEAD',
+        verificationAllowedCommandPrefixes: ['pnpm test'],
+        baselinePathPolicy: {},
+        agentProfileMapping: { defaultAgent: 'default-claude', agents: { 'default-claude': { backend: 'claude' } }, roles: {} },
+        backendPolicy: {}
+      }
+    });
+    const policy = registry.getProjectPolicy(project.id);
+    const config = runnerConfigFromProjectPolicy(policy, project, home);
+      const contract = {
+      version: 1,
+      project: { id: 'rev-project', repoRoot, baseRef: 'HEAD' },
+      tasks: [
+        { id: 'T001', title: 't', description: 'd', dependsOn: [], allowedPaths: ['server/**'], blockedPaths: [], acceptance: ['first'], verificationCommands: [] },
+        { id: 'T002', title: 'u', description: 'e', dependsOn: ['T001'], allowedPaths: ['docs/**'], blockedPaths: [], acceptance: ['docs'], verificationCommands: [] },
+        { id: 'T004', title: 'v', description: 'f', dependsOn: [], allowedPaths: ['web/**'], blockedPaths: [], acceptance: ['web'], verificationCommands: [] }
+      ]
+    };
+    const runId = await createExecutionRun({ config, db, contract, projectPolicyRevisionId: policy.id });
+    db.updateTask(runId, 'T001', { status: 'blocked_on_contract', lastError: 'need more scope' });
+
+    const clone = (value) => JSON.parse(JSON.stringify(value));
+    const revise = (mutate) => applyContractRevision({
+      db, projectRegistry: registry, home, runId, contract: mutate(clone(contract))
+    });
+
+    assert.throws(() => revise((c) => { c.project.baseRef = 'other'; return c; }), /cannot change the run project or base ref/);
+    assert.throws(() => revise((c) => { c.tasks.pop(); return c; }), /cannot remove task T004/);
+    assert.throws(() => revise((c) => { c.tasks[0].verificationCommands = ['rm -rf /']; return c; }), /not allowlisted/);
+    assert.throws(() => revise((c) => { c.tasks[2].acceptance = ['web changed']; return c; }), /can only change blocked tasks or their downstream tasks: T004/);
+    assert.throws(() => revise((c) => {
+      c.tasks.push({ id: 'T009', title: 'n', description: 'd', dependsOn: [], allowedPaths: ['ios/**'], blockedPaths: [], acceptance: ['a'], verificationCommands: [] });
+      return c;
+    }), /must depend on a contract-blocked task/);
+
+    db.updateTask(runId, 'T001', { status: 'approved' });
+    assert.throws(() => revise((c) => { c.tasks[0].acceptance = ['second']; return c; }), /cannot change approved task T001/);
+    assert.throws(() => revise((c) => c), /has no blocked_on_contract task/);
+    db.updateTask(runId, 'T001', { status: 'blocked_on_contract' });
+    db.updateTask(runId, 'T002', { status: 'approved' });
+
+    // Downstream of a blocked task is affected: approved downstream keeps its spec, and a dependent new task is inserted.
+    const result = revise((c) => {
+      c.tasks[0].acceptance = ['second'];
+      c.tasks.push({ id: 'T003', title: 'n', description: 'd', dependsOn: ['T001'], allowedPaths: ['android/**'], blockedPaths: [], acceptance: ['a'], verificationCommands: [] });
+      return c;
+    });
+    assert.equal(result.revision, 2);
+    assert.deepEqual(result.affectedTaskIds, ['T001', 'T002', 'T003']);
+    assert.deepEqual(db.listTasks(runId).map((task) => `${task.taskId}:${task.status}`), ['T001:pending', 'T002:approved', 'T003:pending', 'T004:pending']);
+
+    // A run without a pinned policy revision falls back to the current project policy.
+    const fallbackRunId = await createExecutionRun({ config, db, contract: clone(contract) });
+    db.updateTask(fallbackRunId, 'T001', { status: 'blocked_on_contract' });
+    const fallbackContract = clone(contract);
+    fallbackContract.tasks[0].acceptance = ['fallback'];
+    const fallback = applyContractRevision({
+      db, projectRegistry: registry, home, runId: fallbackRunId, contract: fallbackContract
+    });
+    assert.equal(fallback.revision, 2);
+    assert.deepEqual(fallback.affectedTaskIds, ['T001', 'T002']);
+    const task = db.getTask(runId, 'T001');
+    assert.equal(task.status, 'pending');
+    assert.equal(db.getRun(runId).contractRevision, 2);
+    const stored = JSON.parse(readFileSync(join(home.runsDir, runId, 'contract.json'), 'utf8'));
+    assert.deepEqual(stored.tasks[0].acceptance, ['second']);
+  } finally {
+    db.close();
+  }
+});
+
+test('handoff reads and writes completed runs only', () => {
+  const parent = scratch('agent-team-handoff-');
+  const home = resolveAgentTeamHome({ env: { AGENT_TEAM_HOME: join(parent, 'home') } });
+  const db = new StateDatabase(home.stateDb);
+  try {
+    db.createRun({ id: 'h1', repoRoot: parent, goalFile: 'g', baseRef: 'HEAD', baseSha: 'base', adapter: 'external' });
+    db.insertTask('h1', { id: 'T001', title: 't', description: 'd', dependsOn: [], allowedPaths: ['**'], blockedPaths: [], acceptance: ['a'], verificationCommands: [] });
+
+    writeHandoff(db, home.runsDir, 'h1');
+    assert.equal(existsSync(handoffPath(home.runsDir, 'h1')), false);
+    assert.equal(readHandoff(home.runsDir, 'h1'), undefined);
+
+    db.updateRun('h1', { status: 'done' });
+    writeHandoff(db, home.runsDir, 'h1');
+    const handoff = readHandoff(home.runsDir, 'h1');
+    assert.equal(handoff.run.status, 'done');
+    assert.equal(handoff.contract, null);
+    assert.deepEqual(handoff.tasks[0].status, 'pending');
+  } finally {
+    db.close();
+  }
+});
+
+test('parseRunCommandArgs validates run options', () => {
+  assert.deepEqual(parseRunCommandArgs(['c.json']), { contractPath: 'c.json' });
+  assert.deepEqual(parseRunCommandArgs(['--contract', 'c.json', '--run-id', 'r1', '--grant', 'g.json']), {
+    contractPath: 'c.json', runId: 'r1', grantPath: 'g.json'
+  });
+  const full = parseRunCommandArgs([
+    '--contract', 'c.json', '--debounce-ms', '25', '--max-parallel', '2', '--exit-mode', 'eager', '--home', '/tmp/h'
+  ]);
+  assert.deepEqual(full, {
+    contractPath: 'c.json', debounceMs: 25, maxParallel: 2, exitMode: 'eager', homePath: '/tmp/h'
+  });
+  assert.throws(() => parseRunCommandArgs([]), /requires --contract/);
+  assert.throws(() => parseRunCommandArgs(['--contract']), /requires a value/);
+  assert.throws(() => parseRunCommandArgs(['c.json', '--nope']), /Unknown run option/);
+  assert.throws(() => parseRunCommandArgs(['--exit-mode', 'sometimes']), /must be "eager" or "quiescence"/);
+  assert.throws(() => parseRunCommandArgs(['--debounce-ms', '-5']), /non-negative integer/);
+  assert.throws(() => parseRunCommandArgs(['--debounce-ms', 'soon']), /non-negative integer/);
+  assert.throws(() => parseRunCommandArgs(['--max-parallel', '0']), /positive integer/);
+  assert.throws(() => parseRunCommandArgs(['--max-parallel', 'many']), /positive integer/);
+});
+
+test('readGrantDecisions validates decision payloads', () => {
+  const dir = scratch('agent-team-grants-');
+  const path = join(dir, 'decisions.json');
+  writeFileSync(path, JSON.stringify({ p1: 'approve', p2: 'deny' }), 'utf8');
+  assert.deepEqual(readGrantDecisions(path), { p1: 'approve', p2: 'deny' });
+  writeFileSync(path, JSON.stringify(['p1']), 'utf8');
+  assert.throws(() => readGrantDecisions(path), /must be a JSON object/);
+  writeFileSync(path, JSON.stringify({ p1: 'maybe' }), 'utf8');
+  assert.throws(() => readGrantDecisions(path), /must be "approve" or "deny"/);
+});
+
+test('agent log guards symlinks, empty files, CRLF, and non-regular targets', async () => {
+  const parent = scratch('agent-team-agent-log-edges-');
+  const home = resolveAgentTeamHome({ env: { AGENT_TEAM_HOME: join(parent, 'home') } });
+  mkdirSync(join(home.runsDir, 'r1', 'logs'), { recursive: true });
+  const db = new StateDatabase(home.stateDb);
+  db.createRun({ id: 'r1', repoRoot: parent, goalFile: 'g', baseRef: 'HEAD', baseSha: 's', adapter: 'external' });
+
+  const outside = join(parent, 'outside.log');
+  writeFileSync(outside, 'secret', 'utf8');
+  const symlinked = join(home.runsDir, 'r1', 'logs', 'link.log');
+  symlinkSync(outside, symlinked);
+  db.startAgentExecution({ runId: 'r1', agentId: 'link', role: 'worker', backend: 'claude', logPath: symlinked });
+  await assert.rejects(readAgentLog(db, home.runsDir, 'r1', 'link', 10, 1024), /outside the managed run directory/);
+
+  const emptyLog = join(home.runsDir, 'r1', 'logs', 'empty.log');
+  writeFileSync(emptyLog, '', 'utf8');
+  db.startAgentExecution({ runId: 'r1', agentId: 'empty', role: 'worker', backend: 'claude', logPath: emptyLog });
+  const emptyTail = await readAgentLog(db, home.runsDir, 'r1', 'empty', 10, 1024);
+  assert.deepEqual([emptyTail.lineCount, emptyTail.content, emptyTail.truncated], [0, '', false]);
+
+  const crlfLog = join(home.runsDir, 'r1', 'logs', 'crlf.log');
+  writeFileSync(crlfLog, 'one\r\ntwo\r\n', 'utf8');
+  db.startAgentExecution({ runId: 'r1', agentId: 'crlf', role: 'worker', backend: 'claude', logPath: crlfLog });
+  const crlfTail = await readAgentLog(db, home.runsDir, 'r1', 'crlf', 10, 1024);
+  assert.equal(crlfTail.content, 'one\ntwo');
+
+  const unterminated = join(home.runsDir, 'r1', 'logs', 'unterminated.log');
+  writeFileSync(unterminated, 'tail-line', 'utf8');
+  db.startAgentExecution({ runId: 'r1', agentId: 'unterminated', role: 'worker', backend: 'claude', logPath: unterminated });
+  assert.equal((await readAgentLog(db, home.runsDir, 'r1', 'unterminated', 10, 1024)).content, 'tail-line');
+
+  db.close();
+
+  const errorArms = [
+    [agentLogReadError('r', 'a', { code: 'ENOENT' }).message, /does not exist/],
+    [agentLogReadError('r', 'a', { code: 'EACCES' }).message, /not readable/],
+    [agentLogReadError('r', 'a', 'plain failure').message, /unavailable: r\/a$/]
+  ];
+  for (const [message, pattern] of errorArms) assert.match(message, pattern);
+
+  const successDb = new StateDatabase(join(scratch('agent-team-agent-log-success-'), 'state.sqlite'));
+  successDb.createRun({ id: 'r2', repoRoot: parent, goalFile: 'g', baseRef: 'HEAD', baseSha: 's', adapter: 'external' });
+  mkdirSync(join(home.runsDir, 'r2', 'logs'), { recursive: true });
+  const okLog = join(home.runsDir, 'r2', 'logs', 'ok.log');
+  writeFileSync(okLog, 'ok-line', 'utf8');
+  successDb.startAgentExecution({ runId: 'r2', agentId: 'w', role: 'worker', backend: 'claude', logPath: okLog });
+  const reconnected = await reconnectAgentLogs(successDb, home.runsDir, 'r2', [
+    { runId: 'r2', agentId: 'w', role: 'worker', backend: 'claude', logPath: okLog, status: 'running' }
+  ]);
+  assert.equal(reconnected[0].status, 'available');
+  const failedReconnect = await reconnectAgentLogs(successDb, home.runsDir, 'r2', [
+    { runId: 'r2', agentId: 'ghost', role: 'worker', backend: 'claude', logPath: '/tmp/x', status: 'running' }
+  ], async () => { throw 'boom'; });
+  assert.equal(failedReconnect[0].status, 'unavailable');
+  assert.match(failedReconnect[0].reason, /unavailable: r2\/ghost/);
+  successDb.close();
+});
+
+test('ApprovalCollector tolerates non-numeric ids, null question tasks, and circular inputs', async () => {
+  const dir = scratch('agent-team-collector-edges-');
+  const pendingPath = join(dir, 'pending.json');
+  writePendingFileSync(pendingPath, {
+    runId: 'r1',
+    pending: [{ id: 'legacy-item', kind: 'question', taskId: null, agentId: 'w', subject: 'old', reason: 'r' }]
+  });
+  const collector = new ApprovalCollector({
+    runId: 'r1', pendingPath, debounceMs: 50, exitMode: 'quiescence', onEagerAbort: () => {}
+  });
+  assert.equal(collector.pending[0].id, 'legacy-item');
+
+  const circular = {};
+  circular.self = circular;
+  collector.requestApproval({
+    backend: 'claude', role: 'worker', cwd: '/w', kind: 'tool', tool: 'Loop',
+    input: circular, allowSession: false
+  });
+  assert.match(collector.pending[1].subject, /Loop: unknown input/);
+
+  const answers = await collector.requestUserInput({
+    backend: 'codex', role: 'worker', cwd: '/w', questions: [{ id: 'q', question: 'Proceed?' }]
+  });
+  assert.deepEqual(answers, {});
+  assert.equal(collector.pending[2].taskId, null);
+  collector.flush();
+  assert.equal(readPendingFileSync(pendingPath).pending.length, 3);
+});
+
+test('agent log maps unknown errno codes and reconnect Error instances', async () => {
+  assert.match(agentLogReadError('r', 'a', { code: 'EIO' }).message, /unavailable: r\/a \(EIO\)/);
+
+  const parent = scratch('agent-team-agent-log-reconnect-');
+  const home = resolveAgentTeamHome({ env: { AGENT_TEAM_HOME: join(parent, 'home') } });
+  const db = new StateDatabase(home.stateDb);
+  db.createRun({ id: 'r3', repoRoot: parent, goalFile: 'g', baseRef: 'HEAD', baseSha: 's', adapter: 'external' });
+  const failed = await reconnectAgentLogs(db, home.runsDir, 'r3', [
+    { runId: 'r3', agentId: 'ghost', role: 'worker', backend: 'claude', logPath: '/tmp/none', status: 'running' }
+  ]);
+  assert.equal(failed[0].status, 'unavailable');
+  assert.match(failed[0].reason, /not recorded: r3\/ghost/);
+  db.close();
+});
+
+test('ApprovalCollector records undefined tool input as unknown', () => {
+  const dir = scratch('agent-team-collector-undefined-');
+  const collector = new ApprovalCollector({
+    runId: 'r1', pendingPath: join(dir, 'pending.json'), debounceMs: 0, exitMode: 'eager', onEagerAbort: () => {}
+  });
+  collector.requestApproval({
+    backend: 'claude', role: 'worker', cwd: '/w', kind: 'tool', tool: 'Unknown',
+    input: undefined, allowSession: false
+  });
+  assert.match(collector.pending[0].subject, /Unknown: unknown input/);
+  collector.dispose();
+});

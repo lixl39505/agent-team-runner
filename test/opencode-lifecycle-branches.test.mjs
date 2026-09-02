@@ -1,4 +1,5 @@
 import { test } from 'vitest';
+import { denialGuidance } from '../src/core/approval-collector.ts';
 import assert from 'node:assert/strict';
 import { OpenCodeBackend } from '../src/agent/opencode/sdk.ts';
 
@@ -90,7 +91,7 @@ test('OpenCode session contains permission and question failures', async () => {
     path: { id: 'session-1', permissionID: 'permission-denied' }, body: { response: 'reject' }
   }]);
   assert.deepEqual(denied.calls.events.at(-1), {
-    type: 'permission-check', tool: 'bash', input: {}, allowed: false, reason: 'denied by user'
+    type: 'permission-check', tool: 'bash', input: {}, allowed: false, reason: denialGuidance
   });
 
   let approval;
@@ -121,13 +122,15 @@ test('OpenCode session contains permission and question failures', async () => {
   await missingHandler.session.answerQuestion('question-rejected', [{ question: 'Continue?' }]);
   assert.deepEqual(missingHandler.calls.rejects, [{ requestID: 'question-rejected', directory: '/workspace' }]);
 
+  const capturedQuestion = { taskId: undefined };
   const replyFailure = await open(
     { data: { info: { structured: {} } } },
-    { requestUserInput: async () => ({}) },
+    { taskId: 'T9', requestUserInput: async (request) => { capturedQuestion.taskId = request.taskId; return {}; } },
     { reply: async () => { throw new Error('request gone'); } }
   );
   await replyFailure.session.answerQuestion('question-reply-failed', [{ question: 'Continue?', custom: false }]);
   assert.deepEqual(replyFailure.calls.replies[0].answers, [[]]);
+  assert.equal(capturedQuestion.taskId, 'T9');
   assert.deepEqual(replyFailure.calls.rejects, [{ requestID: 'question-reply-failed', directory: '/workspace' }]);
 });
 

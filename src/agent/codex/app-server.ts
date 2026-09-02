@@ -18,6 +18,7 @@ import { JsonRpcConnection } from './jsonrpc.js';
 import { compileCodex, type CompiledCodexPolicy } from './policy.js';
 import type { ApprovalDecision, ApprovalRequest } from '../approval.js';
 import { sanitizedEnv } from '../env.js';
+import { denialGuidance } from '../../core/approval-collector.js';
 import { parseAgentJson } from '../parse.js';
 // 窄类型导入（import type = 零运行时耦合）：只引入我们实际消费的协议类型，
 // 上游破坏性变更在 `npm run check` 时直接变成编译错误——升级流程见 gen:codex。
@@ -340,7 +341,7 @@ export class CodexBackend implements AgentBackend {
           this.platformCheckPromise = null;
         }
       },
-      sanitizedEnv(this.options.env, !this.options.minimalEnv)
+      sanitizedEnv(this.options.env)
     );
     this.connection = connection;
     try {
@@ -452,7 +453,7 @@ class CodexAgentSession implements AgentSession {
       tool: 'Bash',
       input: { command },
       allowed: decision !== 'deny',
-      ...(decision === 'deny' ? { reason: 'denied by user' } : {})
+      ...(decision === 'deny' ? { reason: denialGuidance } : {})
     });
     return codexDecision(decision);
   }
@@ -481,7 +482,7 @@ class CodexAgentSession implements AgentSession {
       tool: 'Edit',
       input: { paths },
       allowed: decision !== 'deny',
-      ...(decision === 'deny' ? { reason: 'denied by user' } : {})
+      ...(decision === 'deny' ? { reason: denialGuidance } : {})
     });
     return codexDecision(decision);
   }
@@ -501,7 +502,7 @@ class CodexAgentSession implements AgentSession {
       tool: 'Permissions',
       input: request.permissions,
       allowed: decision !== 'deny',
-      ...(decision === 'deny' ? { reason: 'denied by user' } : {})
+      ...(decision === 'deny' ? { reason: denialGuidance } : {})
     });
     if (decision === 'deny') return deniedPermissionResponse();
     return { permissions: grantable, scope: decision === 'session' ? 'session' : 'turn' };
@@ -520,7 +521,8 @@ class CodexAgentSession implements AgentSession {
       }));
       const answers = await this.spec.requestUserInput({
         backend: 'codex', role: this.spec.role, label: this.spec.label,
-        sessionId: this.sessionId, cwd: this.spec.cwd, questions
+        sessionId: this.sessionId, ...(this.spec.taskId !== undefined ? { taskId: this.spec.taskId } : {}),
+        cwd: this.spec.cwd, questions
       }, this.approvalController.signal);
       this.spec.onEvent?.({ type: 'activity' });
       return {
@@ -642,12 +644,13 @@ class CodexAgentSession implements AgentSession {
     return this.resultPromise;
   }
 
-  private async ask(request: Omit<ApprovalRequest, 'backend' | 'role' | 'label' | 'sessionId' | 'cwd'>): Promise<ApprovalDecision> {
+  private async ask(request: Omit<ApprovalRequest, 'backend' | 'role' | 'label' | 'sessionId' | 'taskId' | 'cwd'>): Promise<ApprovalDecision> {
     if (!this.spec.requestApproval) return 'deny';
     try {
       return await this.spec.requestApproval({
         backend: 'codex', role: this.spec.role, label: this.spec.label,
-        sessionId: this.sessionId, cwd: this.spec.cwd, ...request
+        sessionId: this.sessionId, ...(this.spec.taskId !== undefined ? { taskId: this.spec.taskId } : {}),
+        cwd: this.spec.cwd, ...request
       }, this.approvalController.signal);
     } catch {
       return 'deny';

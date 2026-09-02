@@ -48,7 +48,6 @@ test('database rolls back failed contract revisions and lease acquisitions', () 
 
     assert.throws(() => db.appendContractRevision('contract-run', '{"version":3}'), /UNIQUE constraint failed/);
     assert.equal(db.getRun('contract-run').contractRevision, 1);
-    assert.throws(() => db.acquireExecutionLease('missing-run', 'epoch', 'daemon', 30_000), /FOREIGN KEY constraint failed/);
   } finally {
     db.close();
   }

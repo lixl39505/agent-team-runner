@@ -1,193 +1,72 @@
 # 运行维护指南
 
-本文面向维护本机 `agent-team-runner` daemon 的操作者。运行状态和 project policy
-属于 `$AGENT_TEAM_HOME`，不是目标仓库的 `.agent-team` 目录；目标仓库仅提供 Git
-工作区和可选 implementation Skill。运行时不会读取项目内配置或状态。
+本文覆盖 headless CLI 形态(ADR 0002)的日常运维。daemon/IPC/MCP 时代的
+操作手册已随该架构删除。
 
-## Daemon 生命周期
-
-使用 `agent-team start` 启动或复用本机 daemon；它会等待固定 IPC endpoint 可用
-再进入 Inbox。也可直接运行 `agent-team-daemon [--home PATH]`。Unix-like 平台的
-endpoint 是 `$AGENT_TEAM_HOME/daemon.sock`，Windows 是 `\\.\pipe\agent-team`。
-
-- daemon 启动时创建并严格读取 `$AGENT_TEAM_HOME/config.yml`；修改配置后必须重启。
-- `daemon.lock` 和 `daemon.json` 记录 PID、启动时间和协议版本。存活 PID 的 lock
-  会拒绝第二个 daemon；死 PID 或损坏的 lock 会被替换。
-- IPC socket 权限在 Unix-like 平台被限制为 `0600`。不要共享、移动或手工改写 socket。
-- Windows 使用 Node 创建的 `\\.\pipe\agent-team` named pipe。监听完成后立即通过
-  `SetSecurityInfo` 将 DACL 替换为仅 object owner（daemon 所在当前 OS 用户）的完全访问；
-  Windows CI 也会以独立的非特权本地账户验证连接被拒绝。管理员、`LocalSystem` 等可取得
-  ownership 的特权主体不在此隔离边界内。
-- Node 不允许在 `CreateNamedPipe` 时传入安全描述符，因此 bind 到 DACL 修补之间存在极短
-  TOCTOU 窗口。DACL 修补失败会使 daemon 启动失败；不要将该实现视为可抵御本机特权对手。
-- `agent-team start`、`agent-team attach` 和 MCP gateway 都只是客户端。离开 Inbox、
-  断开 MCP 或关闭终端不会停止 daemon 或取消已提交的 run。
-- 通过 `SIGINT` 或 `SIGTERM` 停止 daemon 时，活跃执行收到 abort，持久状态转为
-  `recovering`；daemon 会等待执行退出后才关闭 SQLite 和释放 lock。
-
-检查 daemon 是否可达可使用 `agent_team_get_status`，或重新运行 `agent-team start`。
-不要用删除 socket 的方式停止 daemon。
-
-## 运行恢复
-
-run 的契约、项目 policy revision、任务、事件、agent execution、交互和 controller
-cursor 都持久化在 SQLite；`runs/<run-id>/` 保存契约快照、日志、结果及 handoff。
-
-- daemon 启动时释放过期 execution lease 和 controller lease，并重新调度
-  `planned` 或 `running` 且 `desiredState=running` 的外部契约 run。
-- 中断时仍处于 worker、verification 或 reviewer 阶段的任务，下次调度会成为
-  `changes_requested`/`recovered`；已有 worktree 会重置到其记录的起点，再以新会话
-  执行。不要假设中断中的后端会话可继续。
-- `paused` run 不会自动恢复。使用 `agent_team_start_run` 或 `agent-team attach`
-  对应操作显式恢复；`cancelled` run 也需显式重新启动。
-- 重启后 runtime 配置从 run 固定的项目 policy revision 重建，不依赖原 MCP client
-  仍在运行。若该 policy 或 run 数据损坏，应停止 daemon、备份 home 后排查，而不是
-  直接编辑 SQLite。
-
-`ExecutionContract.target.integrationBranch` 是完成 run 的目标集成分支；未提供时
-使用 `agent-team/<run-id>/integration`。handoff 会记录实际 integration branch 和
-commit。
-
-## Controller Lease 与重连
-
-controller 对一个 run 具有临时独占 lease。attach 时提供稳定的 `clientId`，可选的
-`externalThreadId` 仅作外层 Host 关联记录。
-
-- `agent_team_attach_controller` 返回完整 reconnect context：契约、run、任务、agent
-  executions、事件、交互、blocker、handoff 和受控日志尾部。
-- `agent_team_read_run_events` 用 `afterEventId` 明确确认已渲染事件。读取本身不推进
-  cursor；客户端中断后从持久 cursor 重放。
-- 定期调用 `agent_team_heartbeat_controller` 续租。正常断开应调用
-  `agent_team_disconnect_controller`，它会释放 lease 并重新排队该 client 已 claim 的
-  interaction。
-- MCP gateway 关闭时也会执行相同清理，因此 TUI 或另一 MCP client 可以接管。
-  若客户端崩溃而未断开，等待 lease 过期后再接管，不要绕过 ownership 直接回答交互。
-
-持久重连不等于 Host thread resume。daemon 保存 `externalThreadId` 并恢复
-control-plane context。`agent_team_get_host_capabilities` 返回 Claude Code、Codex、
-OpenCode 的显式 capability registry，分别记录 `logging`、`elicitation`、`idleEvent`、
-`resumeExternalThread` 与 `startReviewTurn`。内置条目全部是未验证且未声明，默认拒绝
-外层动作。
-
-只有 controller lease owner 通过 `agent_team_resume_external_thread` 或
-`agent_team_start_review_turn` 提供 `explicitlyRequested: true`，且该 Host capability 已由
-维护者显式声明并注入对应 adapter 时，daemon 才会尝试调用。未知 Host、未声明、无 adapter
-或 adapter 失败都返回 `fallback: "durable_context_and_tui"`，不会改写 controller、事件、
-handoff 或 interaction；改用 `agent-team attach` 与 durable event 工具。
-
-截至 Claude Code `2.1.251`、Codex `0.150.1` 与 OpenCode `1.18.25` 的 headless
-probe，三者均可发现并调用本 gateway 的 Tools，但均未声明 MCP form elicitation；排队的
-approval 会保留给 Inbox。三个 CLI 的 `resume`/`continue` 仅允许其自身启动或恢复会话，
-没有让 daemon 调用的外层 thread resume 或 review turn transport。因此这些 capability
-继续保持未声明，不能把内部 backend session resume 当作外层 Host adapter。
-
-## MCP Notification 与 Elicitation
-
-MCP gateway 通过 stdio 连接本机 daemon。它的工具是固定控制面，不暴露 shutdown 或
-任意文件路径。
-
-- gateway 从全局 durable event stream 轮询，发送标准 MCP
-  `notifications/message` logging notification，logger 为 `agent-team.run`。
-- 状态通知的 `data` 是 `{ type: "run.status", runId, status, eventId, eventType,
-  createdAt }`。完成通知只发送 `{ type: "run.completed", handoff: { runId,
-  available: true } }`，绝不包含 task、contract、handoff 正文或本地路径。
-- 通知是尽力而为的连接体验，不替代 `agent_team_read_run_events` 的 durable cursor。
-  Host 必须能展示标准 logging notification，或自行轮询事件工具。
-- 只有在 client 声明 `capabilities.elicitation.form` 后，已 attach 的 gateway 才会依次
-  form elicit 非敏感 approval 和 agent question。它先 claim，只有有效回答才带稳定
-  idempotency key 回答。
-- `contract_block` 不走 elicitation，必须由 controller 提交完整 revised contract。
-  secret、嵌套/数组值不安全的问题、无 capability、取消、失败或断线，都会保持 queued
-  或重新入队，供 `agent-team attach` 处理。
-
-Host capability spike 不是已完成的真实 Host 验收。各 Host 对 notification、elicitation、
-闲置会话事件、thread continuation、review turn 和断线的实际行为仍需分别验证；不要将本地
-fake/protocol 测试或 registry 中的 probe 结果视为 Host UI 兼容性证明。
-
-## 外部验收清单
-
-以下项目必须在真实、已登录的 Host 或 Windows runner 上执行，不能以伪造 MCP JSON、
-in-memory transport 或 mock 结果替代。每次验收记录 Host 版本、模型、OS、时间、MCP server
-配置与原始输出；通过 probe 不会自动声明 capability，仍须单独评审公开 API 与 adapter。
-
-### 交互式 Host TUI
-
-对 Claude Code、Codex、OpenCode 分别创建隔离的 `$AGENT_TEAM_HOME`、启动 daemon，并以
-真实 stdio MCP 配置加载 `agent-team-mcp --home <path>`。每个 Host 都要完成以下检查：
-
-- 调用 `agent_team_get_status`，确认 Tool discovery 与实际调用。
-- attach 一个带有新的 durable run event 的 run，确认 Host TUI 是否展示
-  `notifications/message`、logger `agent-team.run` 与安全的 `run.status`/`run.completed` payload。
-- attach 一个包含 approval 的 run，确认是否声明并渲染 `elicitation/create` form；分别验证
-  accept、decline、cancel 后的 claim、answer/requeue 与 idempotency 行为。
-- 让 Host 会话保持 idle，再产生 durable event；确认通知是否仍呈现，或明确记录 Host 没有
-  可消费的 idle event API。
-- 正常退出 Host，再模拟异常终止；确认正常关闭会 disconnect/requeue，异常关闭最多在
-  controller lease 到期后转为 disconnected 并 requeue。用 `agent_team_list_reconnectable_runs`
-  和 `agent_team_read_run_events` 验证恢复。
-- 查阅该版本 Host 的公开 API，确认 daemon 是否真的可以发起外层 thread resume 或 review turn。
-  没有公开、稳定 transport 时必须记录为不支持，且不能在 capability registry 中声明。
-
-当前仅完成 headless CLI 观察：Claude Code `2.1.251`、Codex `0.150.1`、OpenCode `1.18.25`
-都能发现并调用 Tool，但未声明 form elicitation，且未在 CLI 输出中呈现 logging notification。
-Claude Code print session 正常关闭会 disconnect；OpenCode 与 Codex headless session 依赖 daemon
-lease 回收。该结论不能外推到各自的交互式 TUI。
-
-### Windows IPC 安全
-
-在 `windows-latest` runner 执行 `.github/workflows/test.yml` 的 Windows job。该 job 会创建临时
-非特权本地用户，并通过 `test/daemon-ipc.test.mjs` 验证下列边界：
-
-- 当前用户可以连接 daemon 并完成 IPC request。
-- 独立本地用户对同一 named pipe 的连接失败。
-- Node 创建 pipe 后，`CreateFileW`、owner-only SDDL DACL 与 `SetSecurityInfo` 修补路径成功；
-  DACL 修补失败必须使 daemon 启动失败。
-- job 无论成功或失败都删除临时用户，且不泄露其密码。
-
-此实现的安全边界是不同的非特权本地用户。管理员、`LocalSystem` 等能取得 object ownership
-的特权主体不在隔离范围内；Node 不支持在创建 pipe 时直接传入 security descriptor，因此
-创建与 DACL 修补之间的短暂 TOCTOU 窗口也必须在验收记录中保留。
-
-## Handoff
-
-成功完成的 run 写入 `runs/<run-id>/handoff.json` 与 `handoff.md`，并产生
-`RUN_HANDOFF_CREATED` durable event。调用 `agent_team_get_handoff` 获取结构化交接，
-其中包含 run 的 policy/contract revision、集成分支/commit、每项任务状态和契约快照。
-
-handoff 不存在通常说明 run 尚未完成、已失败或需要 controller attention。先读取 run、
-任务、交互和 durable events；不要根据 MCP 完成通知猜测 handoff 内容。
-
-## 迁移
-
-旧项目级 `.agent-team` 的安全迁移命令为：
+## Run 生命周期
 
 ```sh
-agent-team migrate
-agent-team migrate /path/to/repository --dry-run
-agent-team migrate --repo /path/to/repository --home /path/to/global-home
+agent-team run --contract ./contract.json          # 创建并执行
+agent-team status                                   # 最近一个 run 的状态
+agent-team status <run-id>                          # 指定 run
+agent-team log <run-id> <agent-id> --lines 100      # agent 日志尾(符号链接防护)
+agent-team run --contract ./contract.json --run-id <run-id> ...   # 重放
+agent-team clean <run-id>                           # 删除 worktree/分支,标记 cancelled
 ```
 
-迁移器是项目内 `.agent-team` 的唯一 legacy reader：预检阶段只读执行 SQLite `quick_check`，
-拒绝非终态 run，检查目标 run 名，并通过 SQLite backup
-复制而非复制活动 WAL。目标 `$AGENT_TEAM_HOME/state.sqlite` 必须不存在，迁移不会合并
-数据库、覆盖 run 目录或删除源目录。先以 `--dry-run` 验证。
+重放是幂等的:已 approved 的任务跳过;崩溃或被中断的在途任务在重放开始时由
+`resetInterrupted` 重置;worker 通过后端 session resume 续上下文,不从头重做。
 
-Git worktree 不在迁移范围内。不要复制 `.agent-team/worktrees`；完成或清理旧的活跃 run，
-再由 Git 正常管理 worktree 元数据。
+## 退出码与产物
+
+| exit | 含义 | 关键产物 |
+|---|---|---|
+| 0 | 全部任务 approved 并完成集成 | `runs/<id>/handoff.json`、`handoff.md` |
+| 10 | 存在待外层决定的审批/提问 | `runs/<id>/pending.json` |
+| 11 | 存在 `blocked_on_contract` 任务 | `runs/<id>/blockers.json` |
+| 1 | 失败(run 或任务终态失败,且无待决项) | 事件与 `status` 输出 |
+| 130 | 被信号中断,可重放续作 | 事件 `RUN_INTERRUPTED` |
+
+stdout 最后一行是机器可读 JSON(`runId`/`kind`/`exit`/`pending`/
+`contractBlockedTaskIds`),供外层控制器解析。
+
+## 审批与 allowlist 沉淀
+
+- 默认 eager 退出:首个 pending 后经 `--debounce-ms`(默认 10000)防抖即中止,
+  携带全部已收集项;`--exit-mode quiescence` 跑到自然停止点再批量上报。
+- 恢复:`run --run-id <id> --grant decisions.json`,decisions 为
+  `{ "<pendingId>": "approve" | "deny" }`。
+- approve 的命令按原样沉淀进项目 allowlist(`project_policy_revisions`
+  新增 revision,run 指向新 revision);deny 的任务置 failed。
+- pending 频繁出现是契约/授权信号:优先沉淀常用命令或修 DAG,而不是改机制。
+
+## 契约修订
+
+仅存在 `blocked_on_contract` 任务且契约内容有实际变化时,`run --run-id`
+携带修订版契约才会生成新 revision。规则:project/baseRef 不可变、approved
+任务不可变、仅 blocked 任务及其传递下游可被修改、新任务必须依赖受影响任务。
+
+## 常驻与断线
+
+run 进程即 run 本身。长时间无人值守的 run 应放进常驻终端运行时(如 Herdr 的
+受管 pane);进程死亡后,同 runId 重放从盘上状态恢复,worktree 保留复用。
+
+## 清理
+
+`agent-team clean <run-id>` 删除该 run 在项目仓库中的任务 worktree、任务分支
+与集成分支,并将 run 标记为 `cancelled`(此后不可重放)。run 的日志与结果
+目录保留在 `$AGENT_TEAM_HOME/runs/<id>/`,按需手工归档。
 
 ## 故障排查
 
-| 症状 | 排查与处理 |
-| --- | --- |
-| 启动提示 daemon 已运行 | 先用 `agent-team start` 或 health 确认可达；确认对应 PID 已死亡后再重试。不要删除仍存活 daemon 的 lock。 |
-| socket 无法连接 | 确认使用同一个 `AGENT_TEAM_HOME`，检查 daemon 日志和 `daemon.json` PID；若无进程，重新执行 `agent-team start`。 |
-| run 没有自动继续 | 检查 `status`、`desiredState` 和 project policy revision。`paused`/`cancelled` 必须显式 start；`needs_attention` 要先处理 blocker。 |
-| 无法 attach 或 answer interaction | 检查 controller lease owner；由原 client heartbeat、disconnect，或等待 lease 过期后接管。不要用另一个 `clientId` 回答已 claim 的交互。 |
-| MCP 没有通知或表单 | 确认 Host 支持 MCP logging；确认 client 声明 form elicitation。无能力时改用 `agent-team attach` 和 durable event 工具。 |
-| 获取不到 handoff | 确认 run 已 `done` 且存在 `RUN_HANDOFF_CREATED`；读取 run events 和错误字段定位失败或 integration 问题。 |
-| agent log 不可读 | 仅能读取 daemon 记录且位于受管 run 目录内的常规文件。不要传入路径；检查磁盘、权限和日志是否已创建。 |
-| 需要恢复后端会话 | 当前恢复策略是 durable run/task 状态加干净会话，不保证原 Host thread 或后端 session continuation。 |
+1. `agent-team status <run-id>` 查看 run/task 终态与 lastError。
+2. `agent-team log <run-id> <agent-id>` 看 agent 输出尾(自动校验路径在
+   run 目录内并解析符号链接,拒绝越界)。
+3. 事件表(`events`)保留完整执行轨迹,`RUN_STARTED`/`WORKER_*`/`TASK_*`/
+   `RUN_INTERRUPTED` 等可用于定位阶段。
+4. 崩溃后 worktree 有残留属预期:重放会复用;彻底放弃用 `clean`。
 
-提交前的离线验收可运行 `npm test`。P2 daemon 验收中的三后端路径使用现有
-`FakeBackend` seam，不访问 Claude、Codex 或 OpenCode 网络；真实 CLI/协议检查仍按
-`npm run test:protocol` 和环境门控的 integration 测试单独执行。
+## 迁移
+
+旧版项目内 `.agent-team/` 目录在新架构下没有任何运行时含义,可直接归档删除;
+其 SQLite/runs 与现行全局 schema 不兼容,不提供自动迁移。

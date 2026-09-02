@@ -90,9 +90,11 @@ test('Codex restarts when initialized connections are missing or exited', async 
 
 test('Codex covers optional approval and input fields', async () => {
   const events = [];
+  const captured = { taskId: undefined };
   const value = await open({
     onEvent: (event) => events.push(event),
-    requestApproval: async () => 'deny',
+    taskId: 'T9',
+    requestApproval: async (request) => { captured.taskId = request.taskId; return 'deny'; },
     requestUserInput: async () => ({})
   });
 
@@ -102,6 +104,7 @@ test('Codex covers optional approval and input fields', async () => {
     proposedNetworkPolicyAmendments: []
   }, undefined, ['command']), 'decline');
   assert.equal(await value.session.approveCommand('command', {}, undefined, ['command']), 'decline');
+  assert.equal(captured.taskId, 'T9');
   assert.equal(await value.session.approveFilePaths(['src/a.ts'], '/outside'), 'decline');
   assert.deepEqual(await value.session.approvePermissions({ permissions: {} }), { permissions: {}, scope: 'turn' });
   assert.deepEqual(await value.session.answerUserInput({

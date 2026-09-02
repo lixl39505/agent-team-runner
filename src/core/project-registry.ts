@@ -19,6 +19,8 @@ export interface RegisterProjectInput {
   displayName: string;
   gitIdentity: JsonValue;
   policy: ProjectPolicyInput;
+  /** Stable caller-supplied id (e.g. the execution contract's project.id). */
+  id?: string;
   createdBy?: string;
   note?: string;
 }
@@ -192,7 +194,7 @@ export class ProjectRegistry {
           existing.id
         );
       } else {
-        const projectId = `project-${randomUUID()}`;
+        const projectId = input.id ?? `project-${randomUUID()}`;
         const policyRevisionId = `${projectId}:r1`;
         this.db.prepare(`
           INSERT INTO projects (
@@ -311,4 +313,56 @@ export class ProjectRegistry {
       createdAt
     );
   }
+}
+
+function requiredStringField(params: Record<string, unknown>, field: string, label: string): string {
+  const value = params[field];
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error(`${label} must be a non-empty string`);
+  }
+  return value;
+}
+
+function requiredStringArrayField(params: Record<string, unknown>, field: string, label: string): string[] {
+  const value = params[field];
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) {
+    throw new Error(`${label} must be an array of strings`);
+  }
+  return value;
+}
+
+function requiredJsonValueField(value: unknown, label: string): JsonValue {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') return value;
+  if (typeof value === 'number') {
+    if (Number.isFinite(value)) return value;
+    throw new Error(`${label} must be a JSON value`);
+  }
+  if (Array.isArray(value)) return value.map((entry, index) => requiredJsonValueField(entry, `${label}[${index}]`));
+  if (value && typeof value === 'object') {
+    const result: { [key: string]: JsonValue } = {};
+    for (const [key, entry] of Object.entries(value)) result[key] = requiredJsonValueField(entry, `${label}.${key}`);
+    return result;
+  }
+  throw new Error(`${label} must be a JSON value`);
+}
+
+/** Parses the strict project policy payload shape used by external submission surfaces. */
+export function parseProjectPolicyInput(params: Record<string, unknown>): ProjectPolicyInput {
+  const policyValue = params.policy;
+  if (!policyValue || typeof policyValue !== 'object' || Array.isArray(policyValue)) {
+    throw new Error('project.register params.policy must be an object');
+  }
+  const policy = policyValue as Record<string, unknown>;
+  for (const field of Object.keys(policy)) {
+    if (!['baseRef', 'verificationAllowedCommandPrefixes', 'baselinePathPolicy', 'agentProfileMapping', 'backendPolicy'].includes(field)) {
+      throw new Error(`project.register params.policy contains unknown field: ${field}`);
+    }
+  }
+  return {
+    baseRef: requiredStringField(policy, 'baseRef', 'project.register params.policy.baseRef'),
+    verificationAllowedCommandPrefixes: requiredStringArrayField(policy, 'verificationAllowedCommandPrefixes', 'project.register params.policy.verificationAllowedCommandPrefixes'),
+    baselinePathPolicy: requiredJsonValueField(policy.baselinePathPolicy, 'project.register params.policy.baselinePathPolicy'),
+    agentProfileMapping: requiredJsonValueField(policy.agentProfileMapping, 'project.register params.policy.agentProfileMapping'),
+    backendPolicy: requiredJsonValueField(policy.backendPolicy, 'project.register params.policy.backendPolicy')
+  };
 }

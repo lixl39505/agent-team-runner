@@ -96,11 +96,11 @@ function backendPool(backend) {
   return { claude: backend, codex: backend, opencode: backend };
 }
 
-async function createPlannedRun(db, config, tasks, id = 'run') {
+async function createPlannedRun(db, config, tasks, id = 'run', resolvedSkills = new Map()) {
   const baseSha = await currentHead(config.workspace.repoRoot);
   const manifest = { version: 1, title: 'Run', summary: 'test run', tasks };
   db.createRun({ id, repoRoot: config.workspace.repoRoot, goalFile: 'goal.md', baseRef: 'HEAD', baseSha, adapter: 'claude' });
-  for (const spec of tasks) db.insertTask(id, spec);
+  for (const spec of tasks) db.insertTask(id, spec, resolvedSkills.get(spec.id));
   db.updateRun(id, {
     status: 'planned', manifestJson: JSON.stringify(manifest), rolesJson: JSON.stringify(snapshotAgents(config))
   });
@@ -117,12 +117,12 @@ async function createConflictingCommit(repoRoot, baseSha, id, content) {
   return currentHead(worktree);
 }
 
-async function createApprovedConflictRun(handler) {
+async function createApprovedConflictRun(handler, resolvedSkills = new Map()) {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
   const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const tasks = [task('T001'), task('T002')];
-  const baseSha = await createPlannedRun(db, config, tasks);
+  const baseSha = await createPlannedRun(db, config, tasks, 'run', resolvedSkills);
   const firstCommit = await createConflictingCommit(repoRoot, baseSha, 'T001', 'first\n');
   const secondCommit = await createConflictingCommit(repoRoot, baseSha, 'T002', 'second\n');
   db.updateTask('run', 'T001', { status: 'approved', phase: 'done', commitSha: firstCommit });
@@ -180,9 +180,13 @@ test('orchestrator reports a persisted DAG with no executable task', async () =>
 test('orchestrator lets the integrator resolve a real cherry-pick conflict within the conflict files', async () => {
   const setup = await createApprovedConflictRun((spec) => {
     assert.equal(spec.role, 'integrator');
+    assert.match(spec.prompt, /Use the stored integrator snapshot/);
+    assert.match(spec.prompt, /sha256:integrator-sha/);
     writeFileSync(join(spec.cwd, 'src', 'feature.txt'), 'resolved\n', 'utf8');
     return integrationResult();
-  });
+  }, new Map([['T002', [{
+    name: 'merge', role: 'integrator', source: 'project', path: '/stored/merge/SKILL.md', sha256: 'integrator-sha', content: 'Use the stored integrator snapshot.'
+  }]]]));
   try {
     const events = [];
     await runOrchestrator({

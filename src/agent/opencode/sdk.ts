@@ -26,6 +26,7 @@ import type { NativeWindowsSandboxPolicy } from '../../core/types.js';
 import { compileOpenCode, compileOpenCodeBasePermission } from './policy.js';
 import { parseAgentJson } from '../parse.js';
 import { sanitizedEnv } from '../env.js';
+import { denialGuidance } from '../../core/approval-collector.js';
 import { killProcessTree } from '../process-tree.js';
 import { unsupportedNativeWindowsSandbox } from '../platform.js';
 
@@ -326,7 +327,7 @@ export class OpenCodeBackend implements AgentBackend {
     const port = this.options.port ?? 4100 + Math.floor(Math.random() * 800);
     const child = this.spawn(command, ['serve', `--hostname=${hostname}`, `--port=${port}`], {
       env: {
-        ...sanitizedEnv(this.options.env, !this.options.minimalEnv),
+        ...sanitizedEnv(this.options.env),
         OPENCODE_CONFIG_CONTENT: JSON.stringify({
           permission: compileOpenCodeBasePermission()
         })
@@ -593,6 +594,7 @@ ${JSON.stringify(this.spec.schema)}`;
           role: this.spec.role,
           label: this.spec.label,
           sessionId: this.sessionId,
+          ...(this.spec.taskId !== undefined ? { taskId: this.spec.taskId } : {}),
           cwd: this.spec.cwd,
           kind,
           tool: request.type,
@@ -610,7 +612,7 @@ ${JSON.stringify(this.spec.schema)}`;
       tool: request.type,
       input: { ...(request.pattern !== undefined ? { pattern: request.pattern } : {}) },
       allowed: response !== 'reject',
-      ...(response === 'reject' ? { reason: hardDenied ? 'read-only role' : 'denied by user' } : {})
+      ...(response === 'reject' ? { reason: hardDenied ? 'read-only role' : denialGuidance } : {})
     });
     try {
       await this.client.postSessionIdPermissionsPermissionId({
@@ -636,7 +638,8 @@ ${JSON.stringify(this.spec.schema)}`;
       }));
       const answers = await this.spec.requestUserInput({
         backend: 'opencode', role: this.spec.role, label: this.spec.label,
-        sessionId: this.sessionId, cwd: this.spec.cwd, questions: normalized
+        sessionId: this.sessionId, ...(this.spec.taskId !== undefined ? { taskId: this.spec.taskId } : {}),
+        cwd: this.spec.cwd, questions: normalized
       }, this.approvalController.signal);
       await this.questionClient.question.reply({
         requestID: requestId,

@@ -31,6 +31,14 @@ Implement exactly one assigned task in the current Git worktree.
 - Keep using ordinary `blocked` for non-contract blockers, with the exact path and reason when relevant.
 - The Runner, not the Worker, decides whether tests and path checks pass.
 
+## Denied approvals (headless runs)
+
+In headless runs every permission request is denied with guidance instead of being asked interactively. When a request is denied:
+
+1. Prefer a **mechanically equivalent alternative** that stays inside the declared commands and allowed paths. Important decisions were already fixed by the outer workflow at contract time; only mechanical substitution is yours to make.
+2. Never work around a denial by changing what the task delivers — that is a contract change, so return `blocked_on_contract` instead.
+3. If you truly need non-allowlisted operations, do not retry them one by one: finish the attempt with `blocked` and list **every** required operation, with exact commands and reasons, in a single place.
+
 ## Reporting
 
 Report what changed, checks run, and known risks.

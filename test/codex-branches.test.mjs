@@ -114,9 +114,11 @@ test('Codex workspace permission paths handle automatic, denied, and thrown deci
   const automatic = await open();
   assert.equal(await automatic.session.approveFilePaths(['src/a.ts']), 'accept');
 
-  const denied = await open('workspace-write', { requestApproval: async () => 'deny' });
+  const captured = { taskId: undefined };
+  const denied = await open('workspace-write', { taskId: 'T9', requestApproval: async (request) => { captured.taskId = request.taskId; return 'deny'; } });
   assert.equal(await denied.session.approveFilePaths(['outside/a.ts'], '/outside', 'outside root'), 'decline');
   assert.equal(await denied.session.approveCommand('curl test', { networkApprovalContext: { host: 'example.test' } }), 'decline');
+  assert.equal(captured.taskId, 'T9');
 
   const thrown = await open('workspace-write', { requestApproval: async () => { throw new Error('closed'); } });
   assert.equal(await thrown.session.approveCommand('npm test'), 'decline');

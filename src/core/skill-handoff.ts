@@ -60,8 +60,11 @@ export function resolveTaskSkills(
     const key = `${requirement.name}\u0000${requirement.role}\u0000${requirement.source}`;
     const existing = uniqueRequirements.get(key);
     if (existing) {
+      if (existing.sha256 !== undefined && requirement.sha256 !== undefined && existing.sha256.toLowerCase() !== requirement.sha256.toLowerCase()) {
+        throw new Error(`Conflicting SHA-256 digests for skill ${requirement.name}`);
+      }
       if (requirement.required && !existing.required) {
-        uniqueRequirements.set(key, { ...existing, required: true });
+        uniqueRequirements.set(key, { ...existing, required: true, ...(existing.sha256 === undefined && requirement.sha256 !== undefined ? { sha256: requirement.sha256 } : {}) });
       }
       continue;
     }
@@ -96,12 +99,16 @@ export function resolveTaskSkills(
     }
 
     const content = readFileSync(realSkillPath, 'utf8');
+    const sha256 = createHash('sha256').update(content, 'utf8').digest('hex');
+    if (requirement.sha256 !== undefined && sha256 !== requirement.sha256.toLowerCase()) {
+      throw new Error(`Skill ${requirement.name} SHA-256 digest does not match the declared digest`);
+    }
     skills.push(Object.freeze({
       name: requirement.name,
       role: requirement.role,
       source: requirement.source,
       path: skillPath,
-      sha256: createHash('sha256').update(content, 'utf8').digest('hex'),
+      sha256,
       content
     }));
   }
@@ -146,6 +153,9 @@ function validateRequirement(requirement: SkillRequirement): void {
   if (!SKILL_ROLES.includes(requirement.role)) throw new Error(`Invalid skill role: ${String(requirement.role)}`);
   if (typeof requirement.required !== 'boolean') throw new Error(`Skill ${requirement.name} requires boolean required`);
   if (!SKILL_SOURCES.includes(requirement.source)) throw new Error(`Invalid skill source: ${String(requirement.source)}`);
+  if (requirement.sha256 !== undefined && (typeof requirement.sha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(requirement.sha256))) {
+    throw new Error(`Skill ${requirement.name} sha256 must be a 64-character hexadecimal digest`);
+  }
 }
 
 function isInsideRoot(root: string, path: string): boolean {

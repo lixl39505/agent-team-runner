@@ -90,7 +90,17 @@ function validateSkillRequirement(value: unknown, taskId: string, index: number)
   if (!['project', 'user'].includes(source)) {
     throw new Error(`Task ${taskId} has invalid implementation skill source: ${source}`);
   }
-  return { name, role: role as SkillRequirement['role'], required: value.required, source: source as SkillRequirement['source'] };
+  const sha256 = value.sha256;
+  if (sha256 !== undefined && (typeof sha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(sha256))) {
+    throw new Error(`Task ${taskId} implementation skill ${name} sha256 must be a 64-character hexadecimal digest`);
+  }
+  return {
+    name,
+    role: role as SkillRequirement['role'],
+    required: value.required,
+    source: source as SkillRequirement['source'],
+    ...(sha256 === undefined ? {} : { sha256: sha256.toLowerCase() })
+  };
 }
 
 /** 验证外层 SDD 提交的执行契约，不解释来源系统。 */
@@ -102,8 +112,8 @@ export function validateExecutionContract(value: unknown, validAgentNames?: stri
   const repoRoot = String(value.project.repoRoot ?? '');
   const baseRef = String(value.project.baseRef ?? '');
   if (!projectId || !repoRoot || !baseRef) throw new Error('Execution contract project requires id, repoRoot, and baseRef');
-  assertObject(value.target, 'Execution contract target');
-  const integrationBranch = value.target.integrationBranch;
+  if (value.target !== undefined) assertObject(value.target, 'Execution contract target');
+  const integrationBranch = value.target === undefined ? undefined : value.target.integrationBranch;
   if (integrationBranch !== undefined && (typeof integrationBranch !== 'string' || integrationBranch.length === 0)) {
     throw new Error('Execution contract target.integrationBranch must be a non-empty string');
   }
@@ -344,3 +354,49 @@ export const INTEGRATION_SCHEMA = {
     testsRun: { type: 'array', items: { type: 'string' } }, knownRisks: { type: 'array', items: { type: 'string' } }, blockedReason: { type: 'string' }
   }
 } as const;
+
+function strictObjectFields(value: unknown, label: string, fields: readonly string[]): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  const record = value as Record<string, unknown>;
+  for (const field of Object.keys(record)) {
+    if (!fields.includes(field)) throw new Error(`${label} contains unknown field: ${field}`);
+  }
+  return record;
+}
+
+/** Validates the outer ExecutionContract envelope shape before deep validation. */
+export function assertExecutionContractFields(
+  value: unknown,
+  label: string = 'execution.submit params.contract'
+): void {
+  const contract = strictObjectFields(value, label, ['version', 'project', 'target', 'provenance', 'tasks']);
+  strictObjectFields(contract.project, `${label}.project`, ['id', 'repoRoot', 'baseRef']);
+  if (contract.target !== undefined) {
+    strictObjectFields(contract.target, `${label}.target`, ['integrationBranch']);
+  }
+  if (contract.provenance !== undefined) {
+    const provenance = strictObjectFields(contract.provenance, `${label}.provenance`, ['documents']);
+    if (Array.isArray(provenance.documents)) {
+      for (const [index, document] of provenance.documents.entries()) {
+        strictObjectFields(document, `${label}.provenance.documents[${index}]`, ['kind', 'locator', 'revision']);
+      }
+    }
+  }
+  const tasks = Array.isArray(contract.tasks) ? contract.tasks : [];
+  for (let index = 0; index < tasks.length; index += 1) {
+    const taskInput = strictObjectFields(tasks[index], `${label}.tasks[${index}]`, [
+      'id', 'externalId', 'title', 'description', 'role', 'agent', 'dependsOn', 'allowedPaths', 'blockedPaths',
+      'acceptance', 'verificationCommands', 'implementationSkills', 'implementationGuidance', 'allowNoChanges'
+    ]);
+    if (Array.isArray(taskInput.implementationSkills)) {
+      const skills = taskInput.implementationSkills;
+      for (let skillIndex = 0; skillIndex < skills.length; skillIndex += 1) {
+        strictObjectFields(skills[skillIndex], `${label}.tasks[${index}].implementationSkills[${skillIndex}]`, [
+          'name', 'role', 'required', 'source', 'sha256'
+        ]);
+      }
+    }
+  }
+}

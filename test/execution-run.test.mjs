@@ -65,7 +65,7 @@ function writeSkill(root, name, content) {
   writeFileSync(join(directory, 'SKILL.md'), content, 'utf8');
 }
 
-test('creates an executable planned run from an external contract', async () => {
+test('creates an executable queued run from an external contract', async () => {
   const repoRoot = repository();
   const config = configFor(repoRoot);
   const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
@@ -81,7 +81,7 @@ test('creates an executable planned run from an external contract', async () => 
     const run = db.getRun(runId);
     const manifest = JSON.parse(run.manifestJson);
 
-    assert.equal(run.status, 'planned');
+    assert.equal(run.status, 'queued');
     assert.equal(run.repoRoot, repoRoot);
     assert.equal(run.goalFile, '<execution-contract>');
     assert.equal(run.adapter, 'external');
@@ -142,6 +142,14 @@ test('snapshots required project and user implementation Skills before creating 
       }] })
     }), /Required project skill is missing/);
     assert.equal(db.listRuns().some((run) => run.id === 'missing-required-skill'), false);
+    await assert.rejects(createExecutionRun({
+      config, db, userHome, runId: 'wrong-skill-digest',
+      contract: contract(repoRoot, { tasks: [{
+        ...contract(repoRoot).tasks[0],
+        implementationSkills: [{ name: 'tdd', role: 'worker', required: true, source: 'project', sha256: '0'.repeat(64) }]
+      }] })
+    }), /digest does not match/);
+    assert.equal(db.listRuns().some((run) => run.id === 'wrong-skill-digest'), false);
   } finally {
     db.close();
     rmSync(userHome, { recursive: true, force: true });

@@ -1,4 +1,5 @@
 import { test } from 'vitest';
+import { denialGuidance } from '../src/core/approval-collector.ts';
 import assert from 'node:assert/strict';
 import { OpenCodeBackend } from '../src/agent/opencode/sdk.ts';
 
@@ -95,8 +96,10 @@ test('OpenCode emits activity only for active session updates', () => {
 });
 
 test('OpenCode permission interactions reject denied, failed, and interrupted approvals', async () => {
-  const denied = await open({ requestApproval: async () => 'reject' });
+  const captured = { taskId: undefined };
+  const denied = await open({ taskId: 'T9', requestApproval: async (request) => { captured.taskId = request.taskId; return 'reject'; } });
   await denied.session.answerPermission('denied', { type: 'bash' });
+  assert.equal(captured.taskId, 'T9');
 
   const failed = await open({ requestApproval: async () => { throw new Error('dialog failed'); } });
   await failed.session.answerPermission('failed', { type: 'webfetch' });
@@ -117,7 +120,7 @@ test('OpenCode permission interactions reject denied, failed, and interrupted ap
   for (const result of [denied, failed, interrupted]) {
     assert.equal(result.calls.permissions[0].body.response, 'reject');
     assert.equal(result.calls.events.at(-1).allowed, false);
-    assert.equal(result.calls.events.at(-1).reason, 'denied by user');
+    assert.equal(result.calls.events.at(-1).reason, denialGuidance);
   }
   assert.deepEqual(interrupted.calls.aborts, [{ path: { id: 'known-session' } }]);
 });

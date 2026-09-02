@@ -1,27 +1,17 @@
 import { gitIsolationEnv } from '../core/process-env.js';
 
 /**
- * 子进程环境净化：默认只保留安全的基础变量 + 后端认证变量，
- * 防止把父进程的全部秘密（云凭证、token）泄漏给能执行命令的 agent。
- * 项目通过 extraEnv 显式放行更多变量。
+ * 子进程环境净化：默认只保留安全的基础变量，避免把父进程的
+ * 后端 API key 或其他秘密泄漏给能执行命令的 agent。调用方通过
+ * extraEnv 显式传入后端认证变量或其他必要变量。
  */
 const BASE_ENV_KEYS = ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'TZ', 'SHELL', 'USER', 'LOGNAME', 'XDG_CONFIG_HOME', 'http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'no_proxy'];
 
-const BACKEND_AUTH_KEYS = [
-  // claude
-  'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'ANTHROPIC_SMALL_FAST_MODEL', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY', 'DISABLE_TELEMETRY',
-  // codex
-  'CODEX_HOME', 'OPENAI_API_KEY', 'CODEX_API_KEY',
-  // opencode
-  'OPENCODE_CONFIG', 'OPENCODE_MODELS_URL'
-];
-
 export function sanitizedEnv(
-  extraEnv: Record<string, string | undefined> = {},
-  inheritBackendAuth: boolean = true
+  extraEnv: Record<string, string | undefined> = {}
 ): Record<string, string> {
   const result: Record<string, string> = {};
-  for (const key of [...BASE_ENV_KEYS, ...(inheritBackendAuth ? BACKEND_AUTH_KEYS : [])]) {
+  for (const key of BASE_ENV_KEYS) {
     const value = extraEnv[key] ?? process.env[key];
     if (value !== undefined) result[key] = value;
   }

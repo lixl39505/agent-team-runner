@@ -16,6 +16,7 @@ import type {
 } from '../types.js';
 import type { BackendId } from '../../core/types.js';
 import type { NativeWindowsSandboxPolicy } from '../../core/types.js';
+import { denialGuidance } from '../../core/approval-collector.js';
 import { compileClaude } from './policy.js';
 import { sanitizedEnv } from '../env.js';
 import { unsupportedNativeWindowsSandbox } from '../platform.js';
@@ -165,6 +166,7 @@ export class ClaudeBackend implements AgentBackend {
             const questions = claudeUserQuestions(input);
             const answers = await spec.requestUserInput({
               backend: 'claude', role: spec.role, label: spec.label,
+              ...(spec.taskId !== undefined ? { taskId: spec.taskId } : {}),
               cwd: spec.cwd, questions
             }, context.signal);
             const answerByQuestion = Object.fromEntries(questions.map((question) => [
@@ -198,6 +200,7 @@ export class ClaudeBackend implements AgentBackend {
             backend: 'claude',
             role: spec.role,
             label: spec.label,
+            ...(spec.taskId !== undefined ? { taskId: spec.taskId } : {}),
             cwd: spec.cwd,
             kind: claudeApprovalKind(toolName, context.blockedPath),
             tool: toolName,
@@ -219,7 +222,7 @@ export class ClaudeBackend implements AgentBackend {
           allowed: decision !== 'deny',
           ...(decision === 'deny' ? { reason: 'denied by user' } : {})
         });
-        if (decision === 'deny') return { behavior: 'deny', message: 'Denied by user.' };
+        if (decision === 'deny') return { behavior: 'deny', message: denialGuidance };
         return {
           behavior: 'allow',
           ...(decision === 'session' && context.suggestions ? {
@@ -246,7 +249,7 @@ export class ClaudeBackend implements AgentBackend {
 
   private baseOptions(overrides: Partial<Options>): Options {
     return {
-      env: sanitizedEnv(this.options.env, !this.options.minimalEnv),
+      env: sanitizedEnv(this.options.env),
       // Match Claude Code: native settings may pre-authorize operations; remaining asks reach canUseTool.
       settingSources: ['user', 'project', 'local'],
       ...(this.options.command ? { pathToClaudeCodeExecutable: this.options.command } : {}),

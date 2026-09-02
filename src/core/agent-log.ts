@@ -1,0 +1,127 @@
+import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { open, realpath } from 'node:fs/promises';
+import { StateDatabase } from './db.js';
+import type { AgentExecutionRecord } from './types.js';
+
+export const DEFAULT_AGENT_LOG_LINES = 100;
+export const MAX_AGENT_LOG_LINES = 200;
+export const DEFAULT_AGENT_LOG_BYTES = 16 * 1024;
+export const MAX_AGENT_LOG_BYTES = 64 * 1024;
+
+export interface AgentLogTail {
+  runId: string;
+  agentId: string;
+  content: string;
+  lineCount: number;
+  byteCount: number;
+  truncated: boolean;
+}
+
+export function isWithinDirectory(path: string, directory: string): boolean {
+  const relativePath = relative(directory, path);
+  return relativePath === '' || (!relativePath.startsWith(`..${sep}`) && relativePath !== '..' && !isAbsolute(relativePath));
+}
+
+export async function readAgentLog(
+  db: StateDatabase,
+  runsDir: string,
+  runId: string,
+  agentId: string,
+  maxLines: number,
+  maxBytes: number
+): Promise<AgentLogTail> {
+  let logPath: string;
+  try {
+    logPath = db.getAgentExecution(runId, agentId).logPath;
+  } catch {
+    throw new Error(`Agent log is not recorded: ${runId}/${agentId}`);
+  }
+
+  const runDirectory = resolve(runsDir, runId);
+  const requestedPath = resolve(logPath);
+  // Only runner-recorded logs within this run's managed directory may be read.
+  if (!isWithinDirectory(requestedPath, runDirectory)) {
+    throw new Error(`Agent log is outside the managed run directory: ${runId}/${agentId}`);
+  }
+
+  let resolvedRunDirectory: string;
+  let resolvedLogPath: string;
+  try {
+    [resolvedRunDirectory, resolvedLogPath] = await Promise.all([realpath(runDirectory), realpath(requestedPath)]);
+  } catch (error) {
+    throw agentLogReadError(runId, agentId, error);
+  }
+  // Resolve symlinks as well so a managed-looking path cannot escape the run directory.
+  if (!isWithinDirectory(resolvedLogPath, resolvedRunDirectory)) {
+    throw new Error(`Agent log is outside the managed run directory: ${runId}/${agentId}`);
+  }
+
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(resolvedLogPath, 'r');
+    const metadata = await handle.stat();
+    if (!metadata.isFile()) throw new Error('NOT_REGULAR_FILE');
+    const byteCount = Math.min(metadata.size, maxBytes);
+    const buffer = Buffer.alloc(byteCount);
+    const { bytesRead } = await handle.read(buffer, 0, byteCount, Math.max(0, metadata.size - byteCount));
+    const captured = buffer.subarray(0, bytesRead).toString('utf8');
+    const capturedLines = captured.length === 0 ? [] : captured.endsWith('\n') ? captured.slice(0, -1).split('\n') : captured.split('\n');
+    const lines = capturedLines.slice(-maxLines).map((line) => line.endsWith('\r') ? line.slice(0, -1) : line);
+    return {
+      runId,
+      agentId,
+      content: lines.join('\n'),
+      lineCount: lines.length,
+      byteCount: bytesRead,
+      truncated: metadata.size > bytesRead || capturedLines.length > lines.length
+    };
+  } catch (error) {
+    /* istanbul ignore if -- non-regular in-run targets already fail the stat check above. */
+    if (error instanceof Error && error.message === 'NOT_REGULAR_FILE') {
+      throw new Error(`Agent log is not readable: ${runId}/${agentId} is not a regular file`);
+    }
+    throw agentLogReadError(runId, agentId, error);
+  } finally {
+    await handle?.close();
+  }
+}
+
+export async function reconnectAgentLogs(
+  db: StateDatabase,
+  runsDir: string,
+  runId: string,
+  agentExecutions: readonly AgentExecutionRecord[],
+  readTail: typeof readAgentLog = readAgentLog
+): Promise<Array<{
+  agentId: string;
+  status: 'available';
+  tail: AgentLogTail;
+} | {
+  agentId: string;
+  status: 'unavailable';
+  reason: string;
+}>> {
+  return await Promise.all(agentExecutions.map(async (agent) => {
+    try {
+      // Reuse the recorded-path and symlink checks used by readAgentLog.
+      return {
+        agentId: agent.agentId,
+        status: 'available' as const,
+        tail: await readTail(db, runsDir, runId, agent.agentId, DEFAULT_AGENT_LOG_LINES, DEFAULT_AGENT_LOG_BYTES)
+      };
+    } catch (error) {
+      return {
+        agentId: agent.agentId,
+        status: 'unavailable' as const,
+        reason: error instanceof Error ? error.message : `Agent log is unavailable: ${runId}/${agent.agentId}`
+      };
+    }
+  }));
+}
+
+export function agentLogReadError(runId: string, agentId: string, error: unknown): Error {
+  const code = typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : undefined;
+  if (code === 'ENOENT') return new Error(`Agent log does not exist: ${runId}/${agentId}`);
+  if (code === 'EACCES' || code === 'EPERM') return new Error(`Agent log is not readable: ${runId}/${agentId}`);
+  return new Error(`Agent log is unavailable: ${runId}/${agentId}${code ? ` (${code})` : ''}`);
+}

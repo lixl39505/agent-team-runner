@@ -104,6 +104,15 @@ test('deduplicates matching requirements and preserves required semantics', () =
       { name: 'tdd', role: 'worker', required: false, source: 'project' },
       { name: 'tdd', role: 'worker', required: false, source: 'project' }
     ], state.roots).length, 1);
+    const sha256 = createHash('sha256').update('content', 'utf8').digest('hex');
+    assert.equal(resolveTaskSkills([
+      { name: 'tdd', role: 'worker', required: false, source: 'project' },
+      { name: 'tdd', role: 'worker', required: true, source: 'project', sha256 }
+    ], state.roots)[0].sha256, sha256);
+    assert.throws(() => resolveTaskSkills([
+      { name: 'tdd', role: 'worker', required: true, source: 'project', sha256 },
+      { name: 'tdd', role: 'worker', required: true, source: 'project', sha256: '0'.repeat(64) }
+    ], state.roots), /Conflicting SHA-256 digests/);
 
     assert.throws(() => resolveTaskSkills([
       { name: 'missing', role: 'worker', required: false, source: 'project' },
@@ -128,6 +137,27 @@ test('uses SkillRequirement validation defaults', () => {
     { name: 'tdd', role: 'worker', required: true, source: 'project' }
   ]);
   assert.throws(() => validateTaskSpec({ ...task, implementationSkills: [{ required: true }] }, 0), /invalid implementation skill name/);
+  assert.throws(() => validateTaskSpec({ ...task, implementationSkills: [{ name: 'tdd', required: true, sha256: 'bad' }] }, 0), /64-character hexadecimal digest/);
+  assert.deepEqual(validateTaskSpec({
+    ...task,
+    implementationSkills: [{ name: 'tdd', required: true, sha256: 'A'.repeat(64) }]
+  }, 0).implementationSkills, [{ name: 'tdd', role: 'worker', required: true, source: 'project', sha256: 'a'.repeat(64) }]);
+});
+
+test('rejects declared Skill digests that differ from the resolved content', () => {
+  const state = fixture();
+  try {
+    writeSkill(state.project, 'tdd', 'verified content');
+    const sha256 = createHash('sha256').update('verified content', 'utf8').digest('hex');
+    assert.equal(resolveTaskSkills([
+      { name: 'tdd', role: 'worker', required: true, source: 'project', sha256 }
+    ], state.roots)[0].sha256, sha256);
+    assert.throws(() => resolveTaskSkills([
+      { name: 'tdd', role: 'worker', required: true, source: 'project', sha256: '0'.repeat(64) }
+    ], state.roots), /digest does not match/);
+  } finally {
+    state.cleanup();
+  }
 });
 
 test('skips missing optional skills and snapshots TaskSpec requirements', () => {
@@ -154,6 +184,7 @@ test('rejects missing required skills, invalid requirements, and invalid roots',
     assert.throws(() => resolveTaskSkills([{ name: 'tdd', role: 'lead', required: true, source: 'project' }], state.roots), /Invalid skill role/);
     assert.throws(() => resolveTaskSkills([{ name: 'tdd', role: 'worker', required: 'true', source: 'project' }], state.roots), /boolean required/);
     assert.throws(() => resolveTaskSkills([{ name: 'tdd', role: 'worker', required: true, source: 'remote' }], state.roots), /Invalid skill source/);
+    assert.throws(() => resolveTaskSkills([{ name: 'tdd', role: 'worker', required: true, source: 'project', sha256: 'bad' }], state.roots), /64-character hexadecimal digest/);
     assert.throws(() => resolveTaskSkills([{ name: 'tdd', role: 'worker', required: true, source: 'user' }], [{ source: 'project', path: state.project }]), /No user skill root/);
     assert.throws(() => resolveTaskSkills({}, state.roots), /requirements must be an array/);
     assert.throws(() => resolveTaskSkills([{ name: 'tdd', role: 'worker', required: true, source: 'project' }], {}), /Skill roots must be an array/);

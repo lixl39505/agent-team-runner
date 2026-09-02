@@ -115,7 +115,7 @@ maybeTest('codex: full session with structured output and native approval routin
           '3. Run the shell command: node --version',
           `4. Return JSON {"done": true, "note": "ok"}`
         ].join('\n'),
-        schema: { type: 'object', properties: { done: { type: 'boolean' }, note: { type: 'string' } }, required: ['done', 'note'] },
+        schema: { type: 'object', properties: { done: { type: 'boolean' }, note: { type: 'string' } }, required: ['done', 'note'], additionalProperties: false },
         access: 'workspace-write',
         requestApproval: async (request) => {
           approvals.push(request);
@@ -160,7 +160,7 @@ opencodeSessionTest('opencode: full session with structured output', { timeout: 
         role: 'worker',
         cwd,
         prompt: 'Read src/a.txt, then return JSON {"done": true, "note": "<first line of the file>"}',
-        schema: { type: 'object', properties: { done: { type: 'boolean' }, note: { type: 'string' } }, required: ['done', 'note'] },
+        schema: { type: 'object', properties: { done: { type: 'boolean' }, note: { type: 'string' } }, required: ['done', 'note'], additionalProperties: false },
         access: 'workspace-write',
         requestApproval: async () => 'once',
         timeoutMs: 150_000,

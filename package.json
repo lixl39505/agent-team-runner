@@ -4,9 +4,7 @@
   "description": "Reusable local orchestrator for Worker/Reviewer/Integrator coding agents with Git worktrees and SQLite.",
   "type": "module",
   "bin": {
-    "agent-team": "dist/cli.js",
-    "agent-team-daemon": "dist/daemon-cli.js",
-    "agent-team-mcp": "dist/mcp-cli.js"
+    "agent-team": "dist/cli.js"
   },
   "files": [
     "dist",
@@ -21,20 +19,16 @@
     "test": "npm run build && vitest run",
     "test:coverage": "npm run build && vitest run --coverage",
     "check": "npm run build && npm test",
-    "test:protocol": "npm run build && AGENT_TEAM_PROTOCOL=1 node --test --test-force-exit test/integration-backends.test.mjs",
-    "test:integration": "npm run build && AGENT_TEAM_INTEGRATION=1 node --test --test-force-exit test/integration-backends.test.mjs test/integration-claude.test.mjs"
+    "test:protocol": "AGENT_TEAM_PROTOCOL=1 vitest run --config vitest.integration.config.ts",
+    "test:integration": "AGENT_TEAM_INTEGRATION=1 vitest run --config vitest.integration.config.ts"
   },
   "engines": {
     "node": ">=22.13"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.241",
-    "@modelcontextprotocol/sdk": "^1.30.0",
     "@opencode-ai/sdk": "1.18.21",
-    "cross-spawn": "^7.0.6",
-    "koffi": "^3.1.6",
-    "yaml": "^2.9.0",
-    "zod": "^4.4.3"
+    "cross-spawn": "^7.0.6"
   },
   "devDependencies": {
     "@types/cross-spawn": "^6.0.6",

@@ -25,9 +25,6 @@ test('persists run and task state', () => {
   assert.equal(taskColumns.includes('pid'), false);
   db.startAgentExecution({ runId: 'demo', agentId: 'T001-worker-1', taskId: 'T001', role: 'worker', backend: 'codex', model: 'gpt-5', logPath: '/tmp/worker.log' });
   db.updateAgentExecution('demo', 'T001-worker-1', { sessionId: 'thread-1', status: 'completed', finishedAt: '2026-01-01T00:00:00.000Z' });
-  assert.deepEqual(db.listAgentExecutions('demo').map((entry) => ({ id: entry.agentId, status: entry.status, session: entry.sessionId })), [
-    { id: 'T001-worker-1', status: 'completed', session: 'thread-1' }
-  ]);
   assert.equal(db.getAgentExecution('demo', 'T001-worker-1').logPath, '/tmp/worker.log');
   db.updateAgentExecution('demo', 'T001-worker-1', {});
   assert.throws(() => db.getAgentExecution('demo', 'missing'), /not found/);
@@ -140,9 +137,6 @@ test('lists durable events as ordered JSON records with bounded cursor paginatio
     assert.throws(() => db.listEvents('events', 0.5), /afterEventId/);
     assert.throws(() => db.listEvents('events', 0, 0), /limit/);
     assert.throws(() => db.listEvents('events', 0, 1001), /limit/);
-    assert.equal(db.listEventsSince().length, 4);
-    assert.throws(() => db.listEventsSince(-1), /afterEventId/);
-    assert.throws(() => db.listEventsSince(0, 0), /limit/);
   } finally {
     db.close();
   }
@@ -189,26 +183,3 @@ test('reads null resolved skills JSON from a legacy task row', () => {
   }
 });
 
-test('coordinates execution leases across acquisition, renewal, release, and expiry', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agent-team-db-leases-'));
-  const db = new StateDatabase(join(dir, 'state.sqlite'));
-  try {
-    db.createRun({ id: 'leased-run', repoRoot: dir, goalFile: 'goal.md', baseRef: 'HEAD', baseSha: 'abc', adapter: 'external' });
-
-    assert.equal(db.acquireExecutionLease('leased-run', 'epoch-a', 'daemon-a', 30_000), true);
-    assert.equal(db.acquireExecutionLease('leased-run', 'epoch-b', 'daemon-b', 30_000), false);
-    assert.equal(db.renewExecutionLease('leased-run', 'epoch-a', 'daemon-a', 30_000), true);
-    assert.equal(db.renewExecutionLease('leased-run', 'epoch-b', 'daemon-b', 30_000), false);
-
-    db.releaseExecutionLease('leased-run', 'epoch-b', 'daemon-b');
-    assert.equal(db.acquireExecutionLease('leased-run', 'epoch-b', 'daemon-b', 30_000), false);
-    db.releaseExecutionLease('leased-run', 'epoch-a', 'daemon-a');
-    assert.equal(db.acquireExecutionLease('leased-run', 'epoch-b', 'daemon-b', 30_000), true);
-
-    db.db.prepare("UPDATE execution_leases SET expires_at = '1970-01-01T00:00:00.000Z' WHERE run_id = ?").run('leased-run');
-    assert.equal(db.releaseExpiredExecutionLeases(), 1);
-    assert.equal(db.acquireExecutionLease('leased-run', 'epoch-c', 'daemon-c', 30_000), true);
-  } finally {
-    db.close();
-  }
-});

@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "project": {
+    "id": "admin-console",
+    "repoRoot": "/absolute/path/to/admin-console",
+    "baseRef": "dev"
+  },
+  "target": {
+    "integrationBranch": "agent-team/order-export-42/integration"
+  },
+  "provenance": {
+    "documents": [
+      {
+        "kind": "requirement",
+        "locator": "sdd://orders/export-spec@rev-7",
+        "revision": "rev-7"
+      }
+    ]
+  },
+  "tasks": [
+    {
+      "id": "T101",
+      "externalId": "ORD-42",
+      "title": "Order CSV export endpoint",
+      "description": "Backend endpoint exporting orders by time range and status as CSV.",
+      "dependsOn": [],
+      "allowedPaths": ["server/orders/**", "server/tests/**"],
+      "blockedPaths": ["server/db/migrations/**"],
+      "acceptance": [
+        "export by date range and status",
+        "explicit error without export permission",
+        "unit tests cover empty results, limits, and permission errors"
+      ],
+      "verificationCommands": ["pnpm test server/orders"],
+      "implementationSkills": [
+        { "name": "tdd", "role": "worker", "required": false, "source": "project" }
+      ]
+    },
+    {
+      "id": "T102",
+      "externalId": "ORD-43",
+      "title": "Export UI entry",
+      "description": "Frontend button to start an export and surface failures.",
+      "dependsOn": ["T101"],
+      "allowedPaths": ["web/orders/**"],
+      "blockedPaths": [],
+      "acceptance": ["export can be started from the order list", "failures render an error message"],
+      "verificationCommands": ["pnpm test web/orders"]
+    }
+  ]
+}

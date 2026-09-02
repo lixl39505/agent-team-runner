@@ -6,6 +6,7 @@ export type NativeWindowsSandboxPolicy = 'require' | 'allow-degraded';
 export type AuthIsolation = 'shared' | 'isolated';
 
 export type RunStatus =
+  | 'queued'
   | 'planning'
   | 'planned'
   | 'running'
@@ -137,6 +138,8 @@ export interface SkillRequirement {
   role: 'worker' | 'reviewer' | 'integrator';
   required: boolean;
   source: 'project' | 'user';
+  /** Optional content digest supplied by the contract for snapshot verification. */
+  sha256?: string;
 }
 
 export interface ResolvedSkill {

@@ -29,17 +29,7 @@ export function workerPrompt(input: {
 The worktree still carries the previous attempt's uncommitted changes. Inspect them before editing.
 ${input.retry.diff ? `\n## Uncommitted diff (may be truncated)\n\n${truncate(input.retry.diff, DIFF_LIMIT)}\n` : ''}${input.retry.review ? `\n## Reviewer feedback (verbatim)\n\n${input.retry.review}\n` : ''}${input.retry.previousSummary ? `\n## Previous worker summary\n\n${input.retry.previousSummary}\n` : ''}`
     : '';
-  const skills = input.skills?.filter((skill) => skill.role === 'worker') ?? [];
-  const skillHandoff = skills.length === 0
-    ? ''
-    : `# Required implementation skills
-
-Follow each skill below when it does not conflict with the Runner contract. These are immutable snapshots selected by the external workflow; do not fetch replacements or invoke an outer implementation workflow.
-
-${skills.map((skill) => `## ${skill.name} (${skill.source}, sha256:${skill.sha256})
-
-${skill.content}`).join('\n\n')}
-`;
+  const handoff = skillHandoff('worker', input.skills);
   return `${loadSkill('worker')}
 
 # Runtime contract
@@ -51,7 +41,7 @@ ${input.worktreePath ? `Your working directory (the task worktree): ${input.work
 Task specification:
 ${JSON.stringify(input.task, null, 2)}
 
-${skillHandoff}${input.priorFeedback ? `# Previous failure or review feedback\n\n${input.priorFeedback}\n` : ''}${retry}
+${handoff}${input.priorFeedback ? `# Previous failure or review feedback\n\n${input.priorFeedback}\n` : ''}${retry}
 The Runner owns staging and commits. You may run the task verification commands while implementing; the Runner repeats them after your turn. Do not run git add, git commit, git merge, git rebase, git push, deployment, or production mutations. Work only inside the current worktree.
 
 # Contract escalation
@@ -71,6 +61,8 @@ export function reviewerPrompt(input: {
   workerResult: unknown;
   candidateDiff?: string | undefined;
   candidateFiles?: string[] | undefined;
+  /** 已在提交执行契约时固化的本地 Skill 内容。 */
+  skills?: readonly ResolvedSkill[];
 }): string {
   return `${loadSkill('reviewer')}
 
@@ -83,13 +75,15 @@ Task start SHA: ${input.startSha}
 ${input.worktreePath ? `Your working directory (the task worktree): ${input.worktreePath}\nThe Runner has included the staged candidate diff below; use direct file-reading tools for additional context.\n` : ''}Worker report:
 ${JSON.stringify(input.workerResult, null, 2)}
 
-${input.candidateFiles?.length ? `# Complete changed-file manifest\n\n${input.candidateFiles.map((file) => `- ${file}`).join('\n')}\n\n` : ''}${input.candidateDiff ? `# Staged candidate diff\n\n${truncate(input.candidateDiff, DIFF_LIMIT)}\n\n` : ''}The candidate changes are staged by the Runner (git add -A already ran). Read every affected file needed to cover the complete manifest; the inline diff may be truncated. Workers never commit — do not request commits; the Runner commits after your approval. Do not modify, stage, or commit anything. Return the structured review decision.`;
+${skillHandoff('reviewer', input.skills)}${input.candidateFiles?.length ? `# Complete changed-file manifest\n\n${input.candidateFiles.map((file) => `- ${file}`).join('\n')}\n\n` : ''}${input.candidateDiff ? `# Staged candidate diff\n\n${truncate(input.candidateDiff, DIFF_LIMIT)}\n\n` : ''}The candidate changes are staged by the Runner (git add -A already ran). Read every affected file needed to cover the complete manifest; the inline diff may be truncated. Workers never commit — do not request commits; the Runner commits after your approval. Do not modify, stage, or commit anything. Return the structured review decision.`;
 }
 
 export function integrationPrompt(input: {
   manifest: RunManifest;
   worktreePath?: string;
   conflictFiles?: string[];
+  /** 已在提交执行契约时固化的本地 Skill 内容。 */
+  skills?: readonly ResolvedSkill[];
 }): string {
   return `${loadSkill('integrator')}
 
@@ -100,7 +94,21 @@ ${input.worktreePath ? `\nYour working directory (the integration worktree): ${i
 Run manifest:
 ${JSON.stringify(input.manifest, null, 2)}
 
-Return the structured integration result.`;
+${skillHandoff('integrator', input.skills)}Return the structured integration result.`;
+}
+
+function skillHandoff(role: ResolvedSkill['role'], resolved: readonly ResolvedSkill[] | undefined): string {
+  const skills = resolved?.filter((skill) => skill.role === role) ?? [];
+  if (skills.length === 0) return '';
+  return `# Required ${role} skills
+
+Follow each skill below when it does not conflict with the Runner contract. These are immutable snapshots selected by the external workflow; do not fetch replacements or invoke an outer workflow.
+
+${skills.map((skill) => `## ${skill.name} (${skill.source}, sha256:${skill.sha256})
+
+${skill.content}`).join('\n\n')}
+
+`;
 }
 
 export function reviewFeedback(review: ReviewResult): string {

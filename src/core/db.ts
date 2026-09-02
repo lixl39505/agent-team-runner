@@ -193,16 +193,6 @@ export class StateDatabase {
         FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
       ) STRICT;
 
-      CREATE TABLE IF NOT EXISTS execution_leases (
-        run_id TEXT NOT NULL,
-        task_id TEXT NOT NULL DEFAULT '',
-        daemon_epoch TEXT NOT NULL,
-        holder TEXT NOT NULL,
-        expires_at TEXT NOT NULL,
-        PRIMARY KEY (run_id, task_id),
-        FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
-      ) STRICT;
-
       CREATE INDEX IF NOT EXISTS idx_tasks_run_status ON tasks(run_id, status);
       CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, id);
       CREATE INDEX IF NOT EXISTS idx_agent_executions_run ON agent_executions(run_id, started_at);
@@ -277,15 +267,6 @@ export class StateDatabase {
     return (this.db.prepare('SELECT * FROM runs ORDER BY created_at DESC').all() as Record<string, unknown>[]).map(mapRun);
   }
 
-  listContractRevisions(runId: string): Array<{ revision: number; contractJson: string; createdAt: string }> {
-    return (this.db.prepare(`
-      SELECT revision, contract_json, created_at
-      FROM execution_contract_revisions WHERE run_id = ? ORDER BY revision
-    `).all(runId) as Record<string, unknown>[]).map((row) => ({
-      revision: Number(row.revision), contractJson: String(row.contract_json), createdAt: String(row.created_at)
-    }));
-  }
-
   appendContractRevision(runId: string, contractJson: string): number {
     const run = this.getRun(runId);
     if (run.executionContractJson === null) throw new Error(`Run ${runId} has no execution contract`);
@@ -314,6 +295,8 @@ export class StateDatabase {
     desiredState: RunDesiredState;
     manifestJson: string;
     rolesJson: string;
+    projectId: string;
+    projectPolicyRevisionId: string;
     integrationBranch: string;
     integrationWorktree: string;
     integrationCommit: string;
@@ -328,6 +311,8 @@ export class StateDatabase {
       desiredState: 'desired_state',
       manifestJson: 'manifest_json',
       rolesJson: 'roles_json',
+      projectId: 'project_id',
+      projectPolicyRevisionId: 'project_policy_revision_id',
       integrationBranch: 'integration_branch',
       integrationWorktree: 'integration_worktree',
       integrationCommit: 'integration_commit',
@@ -339,43 +324,6 @@ export class StateDatabase {
     sets.push('updated_at = ?');
     values.push(now(), id);
     this.db.prepare(`UPDATE runs SET ${sets.join(', ')} WHERE id = ?`).run(...values);
-  }
-
-  acquireExecutionLease(runId: string, daemonEpoch: string, holder: string, leaseMs: number): boolean {
-    const timestamp = now();
-    const expiresAt = new Date(Date.now() + leaseMs).toISOString();
-    this.db.exec('BEGIN IMMEDIATE;');
-    try {
-      this.db.prepare('DELETE FROM execution_leases WHERE expires_at < ?').run(timestamp);
-      const result = this.db.prepare(`
-        INSERT INTO execution_leases (run_id, task_id, daemon_epoch, holder, expires_at)
-        VALUES (?, '', ?, ?, ?)
-        ON CONFLICT(run_id, task_id) DO NOTHING
-      `).run(runId, daemonEpoch, holder, expiresAt);
-      this.db.exec('COMMIT;');
-      return result.changes === 1;
-    } catch (error) {
-      this.db.exec('ROLLBACK;');
-      throw error;
-    }
-  }
-
-  releaseExecutionLease(runId: string, daemonEpoch: string, holder: string): void {
-    this.db.prepare(`
-      DELETE FROM execution_leases WHERE run_id = ? AND task_id = '' AND daemon_epoch = ? AND holder = ?
-    `).run(runId, daemonEpoch, holder);
-  }
-
-  renewExecutionLease(runId: string, daemonEpoch: string, holder: string, leaseMs: number): boolean {
-    const result = this.db.prepare(`
-      UPDATE execution_leases SET expires_at = ?
-      WHERE run_id = ? AND task_id = '' AND daemon_epoch = ? AND holder = ? AND expires_at >= ?
-    `).run(new Date(Date.now() + leaseMs).toISOString(), runId, daemonEpoch, holder, now());
-    return result.changes === 1;
-  }
-
-  releaseExpiredExecutionLeases(): number {
-    return Number(this.db.prepare('DELETE FROM execution_leases WHERE expires_at < ?').run(now()).changes);
   }
 
   insertTask(runId: string, spec: TaskSpec, resolvedSkills: readonly ResolvedSkill[] = []): void {
@@ -468,22 +416,6 @@ export class StateDatabase {
     `).all(runId, afterEventId, limit) as Record<string, unknown>[]).map(mapEvent);
   }
 
-  /** Reads the daemon-wide durable event stream without advancing any controller cursor. */
-  listEventsSince(afterEventId = 0, limit = 100): RunEventRecord[] {
-    if (!Number.isSafeInteger(afterEventId) || afterEventId < 0) {
-      throw new Error('afterEventId must be a non-negative integer');
-    }
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
-      throw new Error('limit must be an integer between 1 and 1000');
-    }
-    return (this.db.prepare(`
-      SELECT * FROM events
-      WHERE id > ?
-      ORDER BY id ASC
-      LIMIT ?
-    `).all(afterEventId, limit) as Record<string, unknown>[]).map(mapEvent);
-  }
-
   startAgentExecution(input: {
     runId: string; agentId: string; taskId?: string | undefined; role: string; backend: string; model?: string | undefined; logPath: string;
   }): void {
@@ -506,10 +438,6 @@ export class StateDatabase {
     sets.push('updated_at = ?');
     values.push(now(), runId, agentId);
     this.db.prepare(`UPDATE agent_executions SET ${sets.join(', ')} WHERE run_id = ? AND agent_id = ?`).run(...values);
-  }
-
-  listAgentExecutions(runId: string): AgentExecutionRecord[] {
-    return (this.db.prepare('SELECT * FROM agent_executions WHERE run_id = ? ORDER BY started_at, agent_id').all(runId) as Record<string, unknown>[]).map(mapAgentExecution);
   }
 
   getAgentExecution(runId: string, agentId: string): AgentExecutionRecord {

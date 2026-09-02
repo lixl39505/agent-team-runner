@@ -1,4 +1,5 @@
 import { test } from 'vitest';
+import { denialGuidance } from '../src/core/approval-collector.ts';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -82,7 +83,7 @@ test('Claude canUseTool reports all approval denial paths', async () => {
     requestApproval: async () => 'deny'
   });
   const userDenied = await denied.options.canUseTool('Bash', { command: 'pwd' }, context());
-  assert.deepEqual(userDenied, { behavior: 'deny', message: 'Denied by user.' });
+  assert.deepEqual(userDenied, { behavior: 'deny', message: denialGuidance });
   assert.equal(deniedEvents.at(-1).reason, 'denied by user');
   await denied.session.close();
 });
@@ -172,4 +173,19 @@ test('Claude sandbox protects regular and linked-worktree Git metadata', async (
     join(withCommon, '.git'), linkedGitDir, join(withCommon, 'metadata', 'common')
   ]);
   await commonSession.session.close();
+});
+
+test('Claude threads taskId from the session spec into permission requests', async () => {
+  const approvals = [];
+  const questions = [];
+  const { options, session } = await openFakeSession(fakeQuery(), {
+    taskId: 'T9',
+    requestApproval: async (request) => { approvals.push(request); return 'deny'; },
+    requestUserInput: async (request) => { questions.push(request); return {}; }
+  });
+  await options.canUseTool('Bash', { command: 'pwd' }, context());
+  await options.canUseTool('AskUserQuestion', { questions: [{ question: 'Continue?' }] }, context());
+  assert.deepEqual(approvals.map((request) => request.taskId), ['T9']);
+  assert.deepEqual(questions.map((request) => request.taskId), ['T9']);
+  await session.close();
 });

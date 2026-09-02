@@ -72,7 +72,7 @@ export async function runOrchestrator(input: {
   reportContractBlock?: (report: ContractBlockReport) => void | Promise<void>;
   signal?: AbortSignal | undefined;
   /** Test seam: production creates its own managed backend pool. */
-  backends?: Record<BackendId, AgentBackend> | BackendPool;
+  backends?: Record<BackendId, AgentBackend> | BackendPool | undefined;
 }): Promise<void> {
   const { config, db, runId } = input;
   let run = db.getRun(runId);
@@ -252,6 +252,7 @@ async function executeTask(input: {
     spec: {
       role: 'worker', cwd: worktreeInfo.path,
       label: `${runId} ${task.id} worker`,
+      taskId: task.id,
       prompt: workerPrompt({ task, startSha: worktreeInfo.startSha, runId, worktreePath: worktreeInfo.path, priorFeedback: record.lastError, retry, skills: taskSkills(record) }),
       schema: WORKER_SCHEMA,
       ...(workerBinding.model !== undefined ? { model: workerBinding.model } : {}),
@@ -327,13 +328,15 @@ async function executeTask(input: {
     spec: {
       role: 'reviewer', cwd: worktreeInfo.path,
       label: `${runId} ${task.id} reviewer`,
+      taskId: task.id,
       prompt: reviewerPrompt({
         task,
         startSha: worktreeInfo.startSha,
         worktreePath: worktreeInfo.path,
         workerResult,
         candidateDiff,
-        candidateFiles: verification.changedFiles
+        candidateFiles: verification.changedFiles,
+        skills: taskSkills(record)
       }),
       schema: REVIEW_SCHEMA,
       ...(reviewerBinding.model !== undefined ? { model: reviewerBinding.model } : {}),
@@ -533,7 +536,8 @@ async function integrateRun(input: {
       spec: {
         role: 'integrator', cwd: worktree,
         label: `${runId} integrator conflict ${task.id}`,
-        prompt: integrationPrompt({ manifest, worktreePath: worktree, conflictFiles: conflicts }),
+        taskId: task.id,
+        prompt: integrationPrompt({ manifest, worktreePath: worktree, conflictFiles: conflicts, skills: taskSkills(record) }),
         schema: INTEGRATION_SCHEMA,
         ...(integratorBinding.model !== undefined ? { model: integratorBinding.model } : {}),
         ...(integratorBinding.maxTurns !== undefined ? { maxTurns: integratorBinding.maxTurns } : {}),
