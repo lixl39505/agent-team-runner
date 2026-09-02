@@ -2,7 +2,7 @@ import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { StateDatabase } from '../src/core/db.ts';
@@ -126,6 +126,36 @@ test('AgentTeamDaemon stop is idempotent', async () => {
     assert.equal(existsSync(home.daemonLock), false);
     assert.equal(existsSync(home.daemonInfo), false);
     assert.equal(existsSync(home.socket), false);
+  });
+});
+
+test('AgentTeamDaemon renews controller leases on its periodic timer', async () => {
+  await withHome(async (home) => {
+    const store = new ControlPlaneStore(home.stateDb);
+    let released = 0;
+    let requeued = 0;
+    const releaseExpired = store.releaseExpiredControllerLeases.bind(store);
+    const requeueDisconnected = store.requeueDisconnectedControllerInteractions.bind(store);
+    store.releaseExpiredControllerLeases = () => {
+      released += 1;
+      return releaseExpired();
+    };
+    store.requeueDisconnectedControllerInteractions = () => {
+      requeued += 1;
+      return requeueDisconnected();
+    };
+    const daemon = new AgentTeamDaemon(home, { controlPlaneStore: store });
+    try {
+      await daemon.start();
+      assert.equal(released, 1);
+      assert.equal(requeued, 1);
+      daemon.controllerLeaseTimer._onTimeout();
+      assert.equal(released, 2);
+      assert.equal(requeued, 2);
+    } finally {
+      await daemon.stop();
+      store.close();
+    }
   });
 });
 
@@ -447,6 +477,9 @@ test('AgentTeamDaemon reads bounded agent log tails only from managed recorded p
     const daemon = new AgentTeamDaemon(home);
     const runId = 'log-run';
     const logPath = join(home.runsDir, runId, 'logs', 'agent.log');
+    const emptyPath = join(home.runsDir, runId, 'logs', 'empty.log');
+    const carriageReturnPath = join(home.runsDir, runId, 'logs', 'carriage-return.log');
+    const unreadablePath = join(home.runsDir, runId, 'logs', 'unreadable.log');
     const missingPath = join(home.runsDir, runId, 'logs', 'missing.log');
     const directoryPath = join(home.runsDir, runId, 'logs', 'directory');
     const outsidePath = join(home.root, 'outside.log');
@@ -457,10 +490,17 @@ test('AgentTeamDaemon reads bounded agent log tails only from managed recorded p
     await mkdir(dirname(logPath), { recursive: true });
     await mkdir(directoryPath);
     await writeFile(logPath, 'one\ntwo\nthree\n', 'utf8');
+    await writeFile(emptyPath, '', 'utf8');
+    await writeFile(carriageReturnPath, 'one\r\ntwo\r\n', 'utf8');
+    await writeFile(unreadablePath, 'private\n', 'utf8');
+    await chmod(unreadablePath, 0o000);
     await writeFile(outsidePath, 'outside\n', 'utf8');
     await symlink(outsidePath, escapedPath);
     for (const [agentId, recordedPath] of [
       ['agent', logPath],
+      ['empty', emptyPath],
+      ['carriage-return', carriageReturnPath],
+      ['unreadable', unreadablePath],
       ['missing', missingPath],
       ['directory', directoryPath],
       ['escaped', escapedPath],
@@ -479,6 +519,15 @@ test('AgentTeamDaemon reads bounded agent log tails only from managed recorded p
       assert.equal(byteLimited.byteCount, 8);
       assert.equal(byteLimited.truncated, true);
       assert.match(byteLimited.content, /three$/);
+      assert.deepEqual(await client.request('execution.agent_log', { runId, agentId: 'empty' }), {
+        runId, agentId: 'empty', content: '', lineCount: 0, byteCount: 0, truncated: false
+      });
+      assert.deepEqual(await client.request('execution.agent_log', { runId, agentId: 'carriage-return' }), {
+        runId, agentId: 'carriage-return', content: 'one\ntwo', lineCount: 2, byteCount: 10, truncated: false
+      });
+      if (process.getuid?.() !== 0) {
+        await assert.rejects(client.request('execution.agent_log', { runId, agentId: 'unreadable' }), /not readable: log-run\/unreadable/);
+      }
 
       await assert.rejects(client.request('execution.agent_log', { runId, agentId: 'missing' }), /does not exist: log-run\/missing/);
       await assert.rejects(client.request('execution.agent_log', { runId, agentId: 'directory' }), /not readable: log-run\/directory.*regular file/);
@@ -852,6 +901,7 @@ test('AgentTeamDaemon keeps paused runs unscheduled until execution.start restor
         firstExecutionStarted = true;
         await new Promise((resolve) => input.signal.addEventListener('abort', resolve, { once: true }));
         paused.resolve();
+        throw new Error('executor paused');
       }
     });
     await firstDaemon.start();
@@ -897,6 +947,165 @@ test('AgentTeamDaemon keeps paused runs unscheduled until execution.start restor
     } finally {
       secondClient.close();
       await secondDaemon.stop();
+    }
+  });
+});
+
+test('AgentTeamDaemon preserves a running run for recovery when stopping aborts a failing executor', async () => {
+  await withHome(async (home) => {
+    const { repoRoot, gitCommonDir } = await repository(dirname(home.root));
+    const observer = new StateDatabase(home.stateDb);
+    let executorStarted = false;
+    const daemon = new AgentTeamDaemon(home, {
+      runExecutor: async (input) => {
+        executorStarted = true;
+        await new Promise((resolve) => input.signal.addEventListener('abort', resolve, { once: true }));
+        throw new Error('executor interrupted by shutdown');
+      }
+    });
+    const client = new LocalIpcClient(home.socket);
+    try {
+      await daemon.start();
+      await client.connect();
+      const project = await client.request('project.register', {
+        gitCommonDir, repoRoot, displayName: 'Shutdown recovery', gitIdentity: {}, policy: projectPolicy()
+      });
+      await client.request('execution.submit', { contract: executionContract(project, repoRoot), runId: 'shutdown-recovery' });
+      await waitFor(() => executorStarted);
+      client.close();
+      await daemon.stop();
+      const run = observer.getRun('shutdown-recovery');
+      assert.equal(run.desiredState, 'running');
+      assert.equal(run.runtimeState, 'recovering');
+      assert.equal(eventTypes(observer, 'shutdown-recovery').includes('RUN_DAEMON_FAILED'), false);
+    } finally {
+      client.close();
+      await daemon.stop();
+      observer.close();
+    }
+  });
+});
+
+test('AgentTeamDaemon drops waiting runs that no longer meet scheduling requirements', async () => {
+  await withHome(async (home) => {
+    const daemon = new AgentTeamDaemon(home);
+    daemon.stateDatabase.createRun({
+      id: 'not-queued', repoRoot: '/repo', goalFile: 'goal.md', baseRef: 'HEAD', baseSha: 'base', adapter: 'cli'
+    });
+    try {
+      await daemon.start();
+      daemon.waitingRuns.add('not-queued');
+      daemon.scheduleWaitingRuns();
+      assert.equal(daemon.waitingRuns.has('not-queued'), false);
+    } finally {
+      await daemon.stop();
+    }
+  });
+});
+
+test('AgentTeamDaemon does not schedule inactive or paused runs and stops without a lease timer', async () => {
+  await withHome(async (home) => {
+    const daemon = new AgentTeamDaemon(home);
+    daemon.stateDatabase.createRun({
+      id: 'paused-run', repoRoot: '/repo', goalFile: 'goal.md', baseRef: 'HEAD', baseSha: 'base', adapter: 'test'
+    });
+    daemon.stateDatabase.updateRun('paused-run', { desiredState: 'paused', runtimeState: 'paused' });
+    try {
+      assert.equal(daemon.scheduleRun('paused-run'), false);
+      await daemon.start();
+      assert.equal(daemon.scheduleRun('paused-run'), false);
+      clearInterval(daemon.controllerLeaseTimer);
+      daemon.controllerLeaseTimer = undefined;
+      await daemon.stop();
+    } finally {
+      await daemon.stop();
+    }
+  });
+});
+
+test('AgentTeamDaemon covers optional registration metadata, nonfinal logs, primitive failures, and full queues', async () => {
+  await withHome(async (home) => {
+    const handlers = new Map();
+    const daemon = new AgentTeamDaemon(home, {
+      server: { register(method, handler) { handlers.set(method, handler); }, async start() {}, async stop() {} }
+    });
+    const runId = 'nonfinal-log';
+    const logPath = join(home.runsDir, runId, 'logs', 'agent.log');
+    daemon.stateDatabase.createRun({
+      id: runId, repoRoot: '/repo', goalFile: 'goal.md', baseRef: 'HEAD', baseSha: 'base', adapter: 'test'
+    });
+    await mkdir(dirname(logPath), { recursive: true });
+    await writeFile(logPath, 'one\ntwo', 'utf8');
+    daemon.stateDatabase.startAgentExecution({ runId, agentId: 'agent', role: 'worker', backend: 'codex', logPath });
+    try {
+      const project = await handlers.get('project.register')({
+        gitCommonDir: '/repos/metadata/.git', repoRoot: '/repos/metadata', displayName: 'Metadata', gitIdentity: {},
+        policy: projectPolicy(), createdBy: 'test-author', note: 'Coverage metadata'
+      });
+      const policy = daemon.projectRegistry.getProjectPolicy(project.id);
+      assert.equal(policy.createdBy, 'test-author');
+      assert.equal(policy.note, 'Coverage metadata');
+      assert.deepEqual(await daemon.readAgentLog(runId, 'agent', 100, 16 * 1024), {
+        runId, agentId: 'agent', content: 'one\ntwo', lineCount: 2, byteCount: 7, truncated: false
+      });
+      assert.match(daemon.agentLogReadError(runId, 'agent', 'read failed').message, /unavailable: nonfinal-log\/agent$/);
+      daemon.readAgentLog = async () => { throw 'read failed'; };
+      assert.deepEqual(await daemon.reconnectAgentLogs(runId, [{ agentId: 'agent' }]), [{
+        agentId: 'agent', status: 'unavailable', reason: 'Agent log is unavailable: nonfinal-log/agent'
+      }]);
+      daemon.daemonConfig.concurrency.maxActiveRuns = 1;
+      daemon.activeRuns.set('active', {});
+      daemon.waitingRuns.add('queued');
+      daemon.scheduleWaitingRuns();
+      assert.equal(daemon.waitingRuns.has('queued'), true);
+    } finally {
+      daemon.activeRuns.clear();
+      await daemon.stop();
+    }
+  });
+});
+
+test('AgentTeamDaemon maps agent log access and unexpected read failures', async () => {
+  await withHome(async (home) => {
+    const daemon = new AgentTeamDaemon(home);
+    try {
+      assert.match(daemon.agentLogReadError('run', 'agent', { code: 'EACCES' }).message, /not readable: run\/agent/);
+      assert.match(daemon.agentLogReadError('run', 'agent', { code: 'EPERM' }).message, /not readable: run\/agent/);
+      assert.match(daemon.agentLogReadError('run', 'agent', { code: 'EIO' }).message, /unavailable: run\/agent \(EIO\)/);
+    } finally {
+      await daemon.stop();
+    }
+  });
+});
+
+test('AgentTeamDaemon retains a run when its initial execution lease is unavailable', async () => {
+  await withHome(async (home) => {
+    const { repoRoot, gitCommonDir } = await repository(dirname(home.root));
+    const started = [];
+    const daemon = new AgentTeamDaemon(home, {
+      runExecutor: async (input) => { started.push(input.runId); }
+    });
+    await daemon.start();
+    const client = new LocalIpcClient(home.socket);
+    const acquireLease = daemon.stateDatabase.acquireExecutionLease.bind(daemon.stateDatabase);
+    try {
+      await client.connect();
+      const project = await client.request('project.register', {
+        gitCommonDir, repoRoot, displayName: 'Lease contention', gitIdentity: {}, policy: projectPolicy()
+      });
+      daemon.stateDatabase.acquireExecutionLease = () => false;
+      assert.deepEqual(await client.request('execution.submit', {
+        contract: executionContract(project, repoRoot), runId: 'lease-waiting'
+      }), { runId: 'lease-waiting', scheduled: false });
+      assert.equal(daemon.waitingRuns.has('lease-waiting'), true);
+
+      daemon.stateDatabase.acquireExecutionLease = acquireLease;
+      daemon.scheduleWaitingRuns();
+      await waitFor(() => started.includes('lease-waiting'));
+    } finally {
+      daemon.stateDatabase.acquireExecutionLease = acquireLease;
+      client.close();
+      await daemon.stop();
     }
   });
 });

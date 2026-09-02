@@ -63,6 +63,7 @@ export function startArguments(args: string[], resolveHome: typeof resolveAgentT
 }
 
 function spawnDaemon(home: AgentTeamHome): ChildProcess {
+  /* istanbul ignore next -- tests execute TypeScript; production executes the compiled JavaScript entry. */
   const daemonModule = import.meta.url.endsWith('.ts') ? './daemon-cli.ts' : './daemon-cli.js';
   const daemonEntry = fileURLToPath(new URL(daemonModule, import.meta.url));
   return nodeSpawn(process.execPath, [...process.execArgv, daemonEntry, '--home', home.root], {

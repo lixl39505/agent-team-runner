@@ -326,6 +326,7 @@ test('runMcpServer starts stdio while its daemon is unavailable', async () => {
 test('MCP gateway sends standard logging notifications from durable run events', async () => {
   const messages = [];
   const events = [
+    { id: 3, runId: 'run-1', eventType: 'RUN_CREATED', createdAt: '2026-01-01T00:00:00.000Z' },
     { id: 4, runId: 'run-1', eventType: 'RUN_STARTED', createdAt: '2026-01-01T00:00:00.000Z' },
     { id: 5, runId: 'run-1', eventType: 'RUN_HANDOFF_CREATED', createdAt: '2026-01-01T00:00:01.000Z' }
   ];
@@ -341,8 +342,12 @@ test('MCP gateway sends standard logging notifications from durable run events',
   });
 
   try {
-    await waitFor(() => messages.length === 2);
+    await waitFor(() => messages.length === 3);
     assert.deepEqual(messages, [
+      {
+        type: 'run.status', runId: 'run-1', status: 'planned', eventId: 3,
+        eventType: 'RUN_CREATED', createdAt: '2026-01-01T00:00:00.000Z'
+      },
       {
         type: 'run.status', runId: 'run-1', status: 'running', eventId: 4,
         eventType: 'RUN_STARTED', createdAt: '2026-01-01T00:00:00.000Z'
@@ -430,6 +435,213 @@ test('MCP gateway requeues an interaction when elicitation is cancelled', async 
     });
     await waitFor(() => calls.some((call) => call.method === 'interaction.requeue_client'));
     assert.equal(calls.filter((call) => call.method === 'interaction.claim').length, 1);
+  } finally {
+    await closeConnectedServer(connected);
+  }
+});
+
+test('MCP gateway submits an explicitly denied approval', async () => {
+  const calls = [];
+  const queued = { id: 'approval-1', status: 'queued', kind: 'approval', request: {} };
+  const connected = await createConnectedServer(async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'execution.events_since') return { events: [], lastEventId: params.afterEventId };
+    if (method === 'controller.attach' || method === 'interaction.claim') return {};
+    if (method === 'interaction.list') return [queued];
+    if (method === 'interaction.answer') return {};
+    if (method === 'interaction.requeue_client') return 0;
+    throw new Error(`unexpected IPC method: ${method}`);
+  }, { pollIntervalMs: 5 }, { capabilities: { elicitation: { form: {} } } }, (client) => {
+    client.setRequestHandler(ElicitRequestSchema, () => ({ action: 'accept', content: { decision: 'deny' } }));
+  });
+
+  try {
+    await connected.client.callTool({
+      name: 'agent_team_attach_controller', arguments: { runId: 'run-1', host: 'test', clientId: 'mcp-client' }
+    });
+    await waitFor(() => calls.some((call) => call.method === 'interaction.answer'));
+    assert.deepEqual(calls.find((call) => call.method === 'interaction.answer').params.response, 'deny');
+  } finally {
+    await closeConnectedServer(connected);
+  }
+});
+
+test('MCP gateway requeues declined and cancelled agent questions', async () => {
+  const callbacks = [];
+  const calls = [];
+  const queued = [
+    { id: 'question-declined', status: 'queued', kind: 'agent_question', request: { questions: [{ id: 'choice' }] } },
+    { id: 'question-cancelled', status: 'queued', kind: 'agent_question', request: { questions: [{ id: 'choice' }] } }
+  ];
+  const connected = await createConnectedServer(async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'execution.events_since') return { events: [], lastEventId: params.afterEventId };
+    if (method === 'controller.attach' || method === 'interaction.claim') return {};
+    if (method === 'interaction.list') return queued;
+    if (method === 'interaction.requeue_client') return 1;
+    throw new Error(`unexpected IPC method: ${method}`);
+  }, {
+    pollIntervalMs: 1,
+    setInterval(callback) {
+      callbacks.push(callback);
+      return { unref() {} };
+    },
+    clearInterval() {}
+  }, { capabilities: { elicitation: { form: {} } } }, (client) => {
+    let requests = 0;
+    client.setRequestHandler(ElicitRequestSchema, () => {
+      requests += 1;
+      return { action: requests === 1 ? 'decline' : 'cancel' };
+    });
+  });
+
+  try {
+    await connected.client.callTool({
+      name: 'agent_team_attach_controller', arguments: { runId: 'run-1', host: 'test', clientId: 'mcp-client' }
+    });
+    await waitFor(() => calls.filter((call) => call.method === 'interaction.requeue_client').length === 1);
+    callbacks[0]();
+    await waitFor(() => calls.filter((call) => call.method === 'interaction.requeue_client').length === 2);
+    assert.deepEqual(calls.filter((call) => call.method === 'interaction.claim').map((call) => call.params.id), [
+      'question-declined', 'question-cancelled'
+    ]);
+    assert.equal(calls.some((call) => call.method === 'interaction.answer'), false);
+  } finally {
+    await closeConnectedServer(connected);
+  }
+});
+
+test('MCP gateway leaves an agent question queued when another controller claims it', async () => {
+  const callbacks = [];
+  const calls = [];
+  const queued = { id: 'question-1', status: 'queued', kind: 'agent_question', request: { questions: [{ id: 'choice' }] } };
+  let elicitations = 0;
+  const connected = await createConnectedServer(async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'execution.events_since') return { events: [], lastEventId: params.afterEventId };
+    if (method === 'controller.attach') return {};
+    if (method === 'interaction.list') return [queued];
+    if (method === 'interaction.claim') throw new Error('already claimed');
+    if (method === 'interaction.requeue_client') return 0;
+    throw new Error(`unexpected IPC method: ${method}`);
+  }, {
+    pollIntervalMs: 1,
+    setInterval(callback) {
+      callbacks.push(callback);
+      return { unref() {} };
+    },
+    clearInterval() {}
+  }, { capabilities: { elicitation: { form: {} } } }, (client) => {
+    client.setRequestHandler(ElicitRequestSchema, () => {
+      elicitations += 1;
+      return { action: 'accept', content: { answer_1: 'yes' } };
+    });
+  });
+
+  try {
+    await connected.client.callTool({
+      name: 'agent_team_attach_controller', arguments: { runId: 'run-1', host: 'test', clientId: 'mcp-client' }
+    });
+    await waitFor(() => calls.some((call) => call.method === 'interaction.claim'));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(elicitations, 0);
+    assert.equal(calls.some((call) => call.method === 'interaction.requeue_client'), false);
+  } finally {
+    await closeConnectedServer(connected);
+  }
+});
+
+test('MCP gateway stops a refresh after the MCP connection closes', async () => {
+  let resolveEvents;
+  const eventsRequested = new Promise((resolve) => { resolveEvents = resolve; });
+  const calls = [];
+  const connected = await createConnectedServer(async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'execution.events_since') return eventsRequested;
+    if (method === 'controller.attach' || method === 'controller.disconnect') return {};
+    if (method === 'interaction.requeue_client') return 0;
+    if (method === 'interaction.list') throw new Error('refresh continued after close');
+    throw new Error(`unexpected IPC method: ${method}`);
+  }, { pollIntervalMs: 1_000 }, { capabilities: { elicitation: { form: {} } } });
+
+  try {
+    await connected.client.callTool({
+      name: 'agent_team_attach_controller', arguments: { runId: 'run-1', host: 'test', clientId: 'mcp-client' }
+    });
+    await waitFor(() => calls.some((call) => call.method === 'execution.events_since'));
+    await connected.server.server.onclose();
+    resolveEvents({ events: [], lastEventId: 0 });
+    await waitFor(() => calls.some((call) => call.method === 'controller.disconnect'));
+    assert.equal(calls.some((call) => call.method === 'interaction.list'), false);
+  } finally {
+    await closeConnectedServer(connected);
+  }
+});
+
+test('MCP gateway skips concurrent and closed refreshes', async () => {
+  const callbacks = [];
+  let resolveEvents;
+  const eventsRequested = new Promise((resolve) => { resolveEvents = resolve; });
+  const calls = [];
+  const connected = await createConnectedServer(async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'execution.events_since') return eventsRequested;
+    if (method === 'controller.attach' || method === 'controller.disconnect') return {};
+    if (method === 'interaction.requeue_client') return 0;
+    throw new Error(`unexpected IPC method: ${method}`);
+  }, {
+    pollIntervalMs: 1,
+    setInterval(callback) {
+      callbacks.push(callback);
+      return { unref() {} };
+    },
+    clearInterval() {}
+  }, { capabilities: { elicitation: { form: {} } } });
+
+  try {
+    await connected.client.callTool({
+      name: 'agent_team_attach_controller', arguments: { runId: 'run-1', host: 'test', clientId: 'mcp-client' }
+    });
+    await waitFor(() => calls.some((call) => call.method === 'execution.events_since'));
+    callbacks[0]();
+    assert.equal(calls.filter((call) => call.method === 'execution.events_since').length, 1);
+    await connected.server.server.onclose();
+    callbacks[0]();
+    assert.equal(calls.filter((call) => call.method === 'execution.events_since').length, 1);
+    resolveEvents({ events: [], lastEventId: 0 });
+  } finally {
+    await closeConnectedServer(connected);
+  }
+});
+
+test('MCP gateway requeues empty question answers and ignores non-array interactions', async () => {
+  const calls = [];
+  let lists = 0;
+  const connected = await createConnectedServer(async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'execution.events_since') return { events: [], lastEventId: params.afterEventId };
+    if (method === 'controller.attach') return {};
+    if (method === 'interaction.list') {
+      lists += 1;
+      return lists === 1
+        ? [{ id: 'question-1', status: 'queued', kind: 'agent_question', request: { questions: [{ id: 'choice' }] } }]
+        : {};
+    }
+    if (method === 'interaction.claim') return {};
+    if (method === 'interaction.requeue_client') return 1;
+    if (method === 'controller.disconnect') return {};
+    throw new Error(`unexpected IPC method: ${method}`);
+  }, { pollIntervalMs: 5 }, { capabilities: { elicitation: { form: {} } } }, (client) => {
+    client.setRequestHandler(ElicitRequestSchema, () => ({ action: 'accept', content: { answer_1: '   ' } }));
+  });
+
+  try {
+    await connected.client.callTool({
+      name: 'agent_team_attach_controller', arguments: { runId: 'run-1', host: 'test', clientId: 'mcp-client' }
+    });
+    await waitFor(() => calls.some((call) => call.method === 'interaction.requeue_client'));
+    await waitFor(() => lists >= 2);
+    assert.equal(calls.some((call) => call.method === 'interaction.answer'), false);
   } finally {
     await closeConnectedServer(connected);
   }

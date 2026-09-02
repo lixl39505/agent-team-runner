@@ -49,6 +49,23 @@ test('start uses the default detached daemon spawner after its first IPC probe f
   assert.deepEqual(attached, [['--home', '/agent-team']]);
 });
 
+test('start opens the default attachment after a daemon becomes available during retry', async () => {
+  attach.mockClear();
+  let probes = 0;
+  await runStartCli([], {
+    createClient: () => ({
+      async connect() {
+        probes += 1;
+        if (probes === 1) throw new Error('not ready');
+      },
+      close() {}
+    }),
+    sleep: async () => {},
+    spawnDaemon: () => ({ unref() {} })
+  });
+  assert.deepEqual(attach.mock.calls, [[['--home', '/agent-team']]]);
+});
+
 test('start accepts default arguments and dependencies for an already available daemon', async () => {
   attach.mockClear();
   await runStartCli();

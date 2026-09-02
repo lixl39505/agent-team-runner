@@ -48,6 +48,35 @@ test('migrate CLI accepts an explicit repository and reports dry-run scope', asy
   assert.match(output.join('\n'), /Worktrees were not migrated/);
 });
 
+test('migrate CLI accepts positional and current-directory repositories and rejects invalid argument combinations', async () => {
+  const output = [];
+  const log = vi.spyOn(console, 'log').mockImplementation((value = '') => output.push(String(value)));
+  const positionalRepo = fixture();
+  const currentDirectoryRepo = fixture();
+  const originalCwd = process.cwd();
+  const originalHome = process.env.AGENT_TEAM_HOME;
+  try {
+    await runCli(['migrate', positionalRepo, '--home', home().root]);
+    process.chdir(currentDirectoryRepo);
+    await runCli(['migrate', '--home', home().root, '--dry-run']);
+    process.env.AGENT_TEAM_HOME = home().root;
+    await runCli(['migrate', '--dry-run']);
+    await assert.rejects(
+      runCli(['migrate', '--repo', fixture(), 'also-a-repository']),
+      /accepts either \[repo\] or --repo PATH/
+    );
+    await assert.rejects(runCli(['migrate', 'repository', '--unknown']), /Unknown migrate option/);
+    await assert.rejects(runCli(['migrate', '--home']), /--home requires a value/);
+  } finally {
+    process.chdir(originalCwd);
+    if (originalHome === undefined) delete process.env.AGENT_TEAM_HOME;
+    else process.env.AGENT_TEAM_HOME = originalHome;
+    log.mockRestore();
+  }
+  assert.match(output.join('\n'), /Migrated 1 state run\(s\), 1 run artifact\(s\)/);
+  assert.match(output.join('\n'), /Migration preflight passed \(dry run\)/);
+});
+
 test('migration snapshots state and run artifacts without moving worktrees', async () => {
   const repo = fixture();
   const target = home();

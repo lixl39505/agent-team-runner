@@ -64,6 +64,7 @@ test('start validates its options before opening a client or child process', () 
   assert.equal(startArguments([], () => home), home);
   assert.throws(() => startArguments(['--unknown'], () => home), /Unknown start option/);
   assert.throws(() => startArguments(['--home'], () => home), /--home requires a value/);
+  assert.throws(() => startArguments(['--home', '--another-option'], () => home), /--home requires a value/);
   assert.throws(() => startArguments(['--home', '/home', '--extra'], () => home), /Unknown start option/);
 });
 
@@ -71,6 +72,11 @@ test('start rejects an invalid startup retry count before it probes or launches'
   await assert.rejects(runStartCli([], {
     resolveHome: () => home,
     startupAttempts: 0,
+    createClient: () => { throw new Error('must not create IPC client'); }
+  }), /startupAttempts/);
+  await assert.rejects(runStartCli([], {
+    resolveHome: () => home,
+    startupAttempts: 1.5,
     createClient: () => { throw new Error('must not create IPC client'); }
   }), /startupAttempts/);
 });

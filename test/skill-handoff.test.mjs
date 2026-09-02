@@ -161,6 +161,7 @@ test('rejects missing required skills, invalid requirements, and invalid roots',
     assert.throws(() => resolveTaskSkills([{ name: 'tdd', role: 'worker', required: true, source: 'project' }], [{ source: 'project', path: '' }]), /must have a path/);
     assert.throws(() => resolveTaskSkills([{ name: 'tdd', role: 'worker', required: true, source: 'project' }], [{ source: 'project', path: join(state.directory, 'missing-root') }]), /Cannot access project skill root/);
     assert.throws(() => resolveTaskSkills([{ name: 'tdd', role: 'worker', required: true, source: 'project' }], [{ source: 'project', path: state.project }, { source: 'project', path: state.user }]), /Duplicate project skill root/);
+    assert.deepEqual(resolveTaskSkills([{ name: 'tdd', role: 'worker', required: false, source: 'user' }], [{ source: 'project', path: state.project }]), []);
   } finally {
     state.cleanup();
   }
@@ -201,6 +202,10 @@ test('lists no skills without a local root and ignores unsafe directory entries'
   try {
     assert.deepEqual(listProjectSkills(state.directory), []);
     const root = join(state.directory, '.agents', 'skills');
+    mkdirSync(join(state.directory, '.agents'));
+    writeFileSync(root, 'not a directory');
+    assert.deepEqual(localSkillRoots(state.directory).filter((entry) => entry.source === 'project'), []);
+    rmSync(root);
     mkdirSync(root, { recursive: true });
     writeFileSync(join(root, 'plain-file'), 'not a skill');
     mkdirSync(join(root, 'invalid_name'));

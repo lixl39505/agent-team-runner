@@ -2,9 +2,38 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
+
+const configWriteRace = vi.hoisted(() => ({ active: false, code: 'EEXIST', parseFailure: false, path: '' }));
+
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    writeFileSync(path, ...args) {
+      if (configWriteRace.active && path === configWriteRace.path) {
+        if (configWriteRace.code === 'EEXIST') actual.writeFileSync(path, ...args);
+        const error = Object.assign(new Error('config was created concurrently'), { code: configWriteRace.code });
+        throw error;
+      }
+      return actual.writeFileSync(path, ...args);
+    }
+  };
+});
+
+vi.mock('yaml', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    parse(value) {
+      if (configWriteRace.parseFailure) throw 'non-Error YAML failure';
+      return actual.parse(value);
+    }
+  };
+});
 import {
   daemonBootstrapConfigPath,
+  ensureDaemonBootstrapConfig,
   loadDaemonBootstrapConfig
 } from '../src/core/daemon-config.ts';
 import { ensureAgentTeamHome, resolveAgentTeamHome } from '../src/core/home.ts';
@@ -42,6 +71,47 @@ tui:
     writeFileSync(path, custom, 'utf8');
     ensureAgentTeamHome(home);
     assert.equal(readFileSync(path, 'utf8'), custom);
+  });
+});
+
+test('daemon bootstrap config tolerates a concurrent default config creation', () => {
+  withHome((home) => {
+    mkdirSync(home.root, { recursive: true });
+    const path = daemonBootstrapConfigPath(home.root);
+    configWriteRace.path = path;
+    configWriteRace.active = true;
+    try {
+      assert.equal(ensureDaemonBootstrapConfig(home.root), path);
+    } finally {
+      configWriteRace.active = false;
+      configWriteRace.path = '';
+    }
+    assert.equal(existsSync(path), true);
+  });
+});
+
+test('daemon bootstrap config propagates non-race writes and formats non-Error parse failures', () => {
+  withHome((home) => {
+    mkdirSync(home.root, { recursive: true });
+    const path = daemonBootstrapConfigPath(home.root);
+    configWriteRace.path = path;
+    configWriteRace.code = 'EACCES';
+    configWriteRace.active = true;
+    try {
+      assert.throws(() => ensureDaemonBootstrapConfig(home.root), /config was created concurrently/);
+    } finally {
+      configWriteRace.active = false;
+      configWriteRace.code = 'EEXIST';
+      configWriteRace.path = '';
+    }
+
+    writeFileSync(path, 'version: 1\n', 'utf8');
+    configWriteRace.parseFailure = true;
+    try {
+      assert.throws(() => loadDaemonBootstrapConfig(home.root), /non-Error YAML failure/);
+    } finally {
+      configWriteRace.parseFailure = false;
+    }
   });
 });
 

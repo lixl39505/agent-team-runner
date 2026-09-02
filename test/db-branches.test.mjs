@@ -32,3 +32,24 @@ test('database refuses contract revisions for legacy runs', () => {
     db.close();
   }
 });
+
+test('database rolls back failed contract revisions and lease acquisitions', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'agent-team-db-rollback-'));
+  const db = new StateDatabase(join(directory, 'state.sqlite'));
+  try {
+    db.createRun({
+      id: 'contract-run', repoRoot: directory, goalFile: 'goal.md', baseRef: 'HEAD', baseSha: 'base',
+      executionContractJson: '{"version":1}', adapter: 'cli'
+    });
+    db.db.prepare(`
+      INSERT INTO execution_contract_revisions (run_id, revision, contract_json, created_at)
+      VALUES (?, ?, ?, ?)
+    `).run('contract-run', 2, '{"version":2}', '2026-01-01T00:00:00.000Z');
+
+    assert.throws(() => db.appendContractRevision('contract-run', '{"version":3}'), /UNIQUE constraint failed/);
+    assert.equal(db.getRun('contract-run').contractRevision, 1);
+    assert.throws(() => db.acquireExecutionLease('missing-run', 'epoch', 'daemon', 30_000), /FOREIGN KEY constraint failed/);
+  } finally {
+    db.close();
+  }
+});

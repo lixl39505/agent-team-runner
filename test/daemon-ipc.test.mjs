@@ -1,10 +1,31 @@
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile, access, stat } from 'node:fs/promises';
 import { createConnection } from 'node:net';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+const namedPipeMocks = vi.hoisted(() => ({
+  chmodPaths: [],
+  restrict: vi.fn()
+}));
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    chmod: async (...args) => {
+      namedPipeMocks.chmodPaths.push(args[0]);
+      return await actual.chmod(...args);
+    }
+  };
+});
+
+vi.mock('../src/daemon/windows-named-pipe.ts', () => ({
+  restrictWindowsNamedPipeToOwner: namedPipeMocks.restrict
+}));
+
 import { LocalIpcClient, LocalIpcServer } from '../src/daemon/ipc.ts';
 
 async function withSocket(run) {
@@ -70,6 +91,29 @@ test('LocalIpcServer and LocalIpcClient exchange requests and clean socket files
     if (process.platform !== 'win32') await assert.rejects(access(path));
     await server.stop();
   });
+});
+
+test('LocalIpcServer restricts named pipes without changing umask or chmodding them', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-team-ipc-named-pipe-'));
+  const previousDirectory = process.cwd();
+  const path = `\\\\.\\pipe\\agent-team-ipc-${process.pid}-${Date.now()}`;
+  const umask = vi.spyOn(process, 'umask');
+  namedPipeMocks.restrict.mockReset();
+  namedPipeMocks.chmodPaths.length = 0;
+  process.chdir(directory);
+  const server = new LocalIpcServer();
+  try {
+    await server.start(path);
+    assert.deepEqual(namedPipeMocks.restrict.mock.calls, [[path]]);
+    assert.deepEqual(namedPipeMocks.chmodPaths, []);
+    assert.equal(umask.mock.calls.length, 0);
+  } finally {
+    await server.stop();
+    process.chdir(previousDirectory);
+    umask.mockRestore();
+    await rm(join(directory, path), { force: true });
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 const windowsAccessTest = process.platform === 'win32'

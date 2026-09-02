@@ -163,6 +163,32 @@ test('replaces task specs and reads legacy task rows without resolved skills', (
   }
 });
 
+test('reads null resolved skills JSON from a legacy task row', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-team-db-null-skills-'));
+  const path = join(dir, 'state.sqlite');
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`
+    CREATE TABLE tasks (
+      run_id TEXT, task_id TEXT, title TEXT, spec_json TEXT, resolved_skills_json TEXT,
+      status TEXT, phase TEXT, branch TEXT, worktree TEXT, start_sha TEXT, commit_sha TEXT,
+      attempts INTEGER, review_cycles INTEGER, last_error TEXT, review_json TEXT,
+      created_at TEXT, updated_at TEXT, finished_at TEXT
+    );
+    INSERT INTO tasks VALUES (
+      'legacy', 'T001', 'task', '{}', NULL, 'pending', NULL, NULL, NULL, NULL, NULL,
+      0, 0, NULL, NULL, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', NULL
+    );
+  `);
+  legacy.close();
+
+  const db = new StateDatabase(path);
+  try {
+    assert.equal(db.getTask('legacy', 'T001').resolvedSkillsJson, '[]');
+  } finally {
+    db.close();
+  }
+});
+
 test('coordinates execution leases across acquisition, renewal, release, and expiry', () => {
   const dir = mkdtempSync(join(tmpdir(), 'agent-team-db-leases-'));
   const db = new StateDatabase(join(dir, 'state.sqlite'));

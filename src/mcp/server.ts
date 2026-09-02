@@ -283,6 +283,7 @@ class McpGateway {
   private async elicitQueuedInteractions(): Promise<void> {
     if (!this.supportsFormElicitation()) return;
     for (const [runId, clientId] of this.attached) {
+      /* istanbul ignore next -- close() clears attached before this synchronous loop can observe a closed gateway. */
       if (this.closed) return;
       const value = await this.ipc.request('interaction.list', { runId });
       const queued = Array.isArray(value) ? value.map(interaction).filter((item): item is Interaction => item?.status === 'queued') : [];

@@ -28,6 +28,7 @@ export function listProjectSkills(repoRoot: string): readonly ProjectSkill[] {
     const [skill] = resolveTaskSkills([
       { name: entry.name, role: 'worker', required: true, source: 'project' }
     ], [root]);
+    /* istanbul ignore else -- a required skill either resolves or resolveTaskSkills throws. */
     if (skill) skills.push(Object.freeze({ name: skill.name, source: 'project', path: skill.path, sha256: skill.sha256 }));
   }
   return Object.freeze(skills);
