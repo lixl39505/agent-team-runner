@@ -75,6 +75,12 @@ OpenCode 的显式 capability registry，分别记录 `logging`、`elicitation`�
 或 adapter 失败都返回 `fallback: "durable_context_and_tui"`，不会改写 controller、事件、
 handoff 或 interaction；改用 `agent-team attach` 与 durable event 工具。
 
+截至 Claude Code `2.1.251`、Codex `0.150.1` 与 OpenCode `1.18.25` 的 headless
+probe，三者均可发现并调用本 gateway 的 Tools，但均未声明 MCP form elicitation；排队的
+approval 会保留给 Inbox。三个 CLI 的 `resume`/`continue` 仅允许其自身启动或恢复会话，
+没有让 daemon 调用的外层 thread resume 或 review turn transport。因此这些 capability
+继续保持未声明，不能把内部 backend session resume 当作外层 Host adapter。
+
 ## MCP Notification 与 Elicitation
 
 MCP gateway 通过 stdio 连接本机 daemon。它的工具是固定控制面，不暴露 shutdown 或
