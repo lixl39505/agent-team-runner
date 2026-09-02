@@ -104,6 +104,50 @@ Host capability spike 不是已完成的真实 Host 验收。各 Host 对 notifi
 闲置会话事件、thread continuation、review turn 和断线的实际行为仍需分别验证；不要将本地
 fake/protocol 测试或 registry 中的 probe 结果视为 Host UI 兼容性证明。
 
+## 外部验收清单
+
+以下项目必须在真实、已登录的 Host 或 Windows runner 上执行，不能以伪造 MCP JSON、
+in-memory transport 或 mock 结果替代。每次验收记录 Host 版本、模型、OS、时间、MCP server
+配置与原始输出；通过 probe 不会自动声明 capability，仍须单独评审公开 API 与 adapter。
+
+### 交互式 Host TUI
+
+对 Claude Code、Codex、OpenCode 分别创建隔离的 `$AGENT_TEAM_HOME`、启动 daemon，并以
+真实 stdio MCP 配置加载 `agent-team-mcp --home <path>`。每个 Host 都要完成以下检查：
+
+- 调用 `agent_team_get_status`，确认 Tool discovery 与实际调用。
+- attach 一个带有新的 durable run event 的 run，确认 Host TUI 是否展示
+  `notifications/message`、logger `agent-team.run` 与安全的 `run.status`/`run.completed` payload。
+- attach 一个包含 approval 的 run，确认是否声明并渲染 `elicitation/create` form；分别验证
+  accept、decline、cancel 后的 claim、answer/requeue 与 idempotency 行为。
+- 让 Host 会话保持 idle，再产生 durable event；确认通知是否仍呈现，或明确记录 Host 没有
+  可消费的 idle event API。
+- 正常退出 Host，再模拟异常终止；确认正常关闭会 disconnect/requeue，异常关闭最多在
+  controller lease 到期后转为 disconnected 并 requeue。用 `agent_team_list_reconnectable_runs`
+  和 `agent_team_read_run_events` 验证恢复。
+- 查阅该版本 Host 的公开 API，确认 daemon 是否真的可以发起外层 thread resume 或 review turn。
+  没有公开、稳定 transport 时必须记录为不支持，且不能在 capability registry 中声明。
+
+当前仅完成 headless CLI 观察：Claude Code `2.1.251`、Codex `0.150.1`、OpenCode `1.18.25`
+都能发现并调用 Tool，但未声明 form elicitation，且未在 CLI 输出中呈现 logging notification。
+Claude Code print session 正常关闭会 disconnect；OpenCode 与 Codex headless session 依赖 daemon
+lease 回收。该结论不能外推到各自的交互式 TUI。
+
+### Windows IPC 安全
+
+在 `windows-latest` runner 执行 `.github/workflows/test.yml` 的 Windows job。该 job 会创建临时
+非特权本地用户，并通过 `test/daemon-ipc.test.mjs` 验证下列边界：
+
+- 当前用户可以连接 daemon 并完成 IPC request。
+- 独立本地用户对同一 named pipe 的连接失败。
+- Node 创建 pipe 后，`CreateFileW`、owner-only SDDL DACL 与 `SetSecurityInfo` 修补路径成功；
+  DACL 修补失败必须使 daemon 启动失败。
+- job 无论成功或失败都删除临时用户，且不泄露其密码。
+
+此实现的安全边界是不同的非特权本地用户。管理员、`LocalSystem` 等能取得 object ownership
+的特权主体不在隔离范围内；Node 不支持在创建 pipe 时直接传入 security descriptor，因此
+创建与 DACL 修补之间的短暂 TOCTOU 窗口也必须在验收记录中保留。
+
 ## Handoff
 
 成功完成的 run 写入 `runs/<run-id>/handoff.json` 与 `handoff.md`，并产生
