@@ -73,12 +73,13 @@ test('changedFiles handles porcelain v1 ordinary, rename, copy, and NUL-delimite
     'copy-from.txt',
     'copy-to.txt',
     'deleted.txt',
-    'rename-from.txt',
+    'rename-to.txt',
     'staged.txt',
     'tracked.txt',
     'untracked/nested file.txt'
   ]);
-  assert.deepEqual(await changedFilesFromPorcelain('C  copy-to.txt\0copy-from.txt\0'), ['copy-from.txt']);
+  // rename/copy 条目记录目标路径（实际写入位置），跳过源路径。
+  assert.deepEqual(await changedFilesFromPorcelain('C  copy-to.txt\0copy-from.txt\0'), ['copy-to.txt']);
 });
 
 test('Git helpers stage, unstage, commit, parse refs, and report command failures', async (t) => {

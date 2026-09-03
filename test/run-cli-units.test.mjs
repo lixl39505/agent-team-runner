@@ -1,6 +1,6 @@
 import { test, vi } from 'vitest';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { git } from '../src/core/git.ts';
@@ -31,7 +31,7 @@ import {
   writeBlockersFileSync,
   writePendingFileSync
 } from '../src/core/run-exit.ts';
-import { executeRunCommand, parseRunCommandArgs, readGrantDecisions } from '../src/core/run-execute.ts';
+import { executeRunCommand, parseRunCommandArgs, readGrantDecisions, withRunId } from '../src/core/run-execute.ts';
 
 function scratch(prefix) {
   return mkdtempSync(join(tmpdir(), `${prefix}-`));
@@ -408,6 +408,117 @@ test('contract revision rejects protected changes and accepts a valid revision',
   }
 });
 
+async function revisionFixture(prefix) {
+  const repoRoot = scratch(`${prefix}-repo-`);
+  writeFileSync(join(repoRoot, 'base.txt'), 'base\n', 'utf8');
+  await git(repoRoot, ['init', '-q']);
+  await git(repoRoot, ['config', 'user.email', 't@e.com']);
+  await git(repoRoot, ['config', 'user.name', 't']);
+  await git(repoRoot, ['add', '-A']);
+  await git(repoRoot, ['commit', '-q', '-m', 'base']);
+  const parent = scratch(`${prefix}-home-`);
+  const home = resolveAgentTeamHome({ env: { AGENT_TEAM_HOME: join(parent, 'home') } });
+  const registry = new ProjectRegistry(home.stateDb);
+  const project = registry.registerProject({
+    gitCommonDir: join(repoRoot, '.git'),
+    repoRoot,
+    displayName: 'rev',
+    gitIdentity: { root: repoRoot },
+    id: `${prefix}-project`,
+    policy: {
+      baseRef: 'HEAD',
+      verificationAllowedCommandPrefixes: ['pnpm test'],
+      baselinePathPolicy: {},
+      agentProfileMapping: { defaultAgent: 'default-claude', agents: { 'default-claude': { backend: 'claude' } }, roles: {} },
+      backendPolicy: {}
+    }
+  });
+  const policy = registry.getProjectPolicy(project.id);
+  const config = runnerConfigFromProjectPolicy(policy, project, home);
+  const db = new StateDatabase(home.stateDb);
+  const contract = {
+    version: 1,
+    project: { id: project.id, repoRoot, baseRef: 'HEAD' },
+    tasks: [
+      { id: 'T001', title: 't', description: 'd', dependsOn: [], allowedPaths: ['server/**'], blockedPaths: [], acceptance: ['first'], verificationCommands: [] },
+      { id: 'T002', title: 'u', description: 'e', dependsOn: ['T001'], allowedPaths: ['docs/**'], blockedPaths: [], acceptance: ['docs'], verificationCommands: [] }
+    ]
+  };
+  const runId = await createExecutionRun({ config, db, contract, projectPolicyRevisionId: policy.id });
+  db.updateTask(runId, 'T001', { status: 'blocked_on_contract', lastError: 'need more scope' });
+  return { home, registry, db, contract, runId };
+}
+
+test('contract revision updates downstream tasks whose dependency was removed', async () => {
+  const { home, registry, db, contract, runId } = await revisionFixture('agent-team-rev-unlink');
+  try {
+    // 合法修订：T002 不再依赖 blocked 的 T001，同时其内容按新契约变化。
+    const revised = JSON.parse(JSON.stringify(contract));
+    revised.tasks[1].dependsOn = [];
+    revised.tasks[1].acceptance = ['rewritten'];
+    const result = applyContractRevision({ db, projectRegistry: registry, home, runId, contract: revised });
+
+    assert.deepEqual(result.affectedTaskIds, ['T001', 'T002']);
+    const rewritten = JSON.parse(db.getTask(runId, 'T002').specJson);
+    assert.deepEqual(rewritten.acceptance, ['rewritten'], 'spec_json must follow the revised contract');
+    assert.equal(rewritten.dependsOn.length, 0);
+    assert.equal(db.getTask(runId, 'T002').status, 'pending');
+    const markdown = readFileSync(join(home.runsDir, runId, 'tasks', 'T002.md'), 'utf8');
+    assert.match(markdown, /rewritten/, 'task markdown must follow the revised contract');
+    const stored = JSON.parse(readFileSync(join(home.runsDir, runId, 'contract.json'), 'utf8'));
+    assert.deepEqual(stored.tasks[1].dependsOn, []);
+  } finally {
+    db.close();
+  }
+});
+
+test('contract revision is atomic: a mid-flight failure leaves DB and files untouched', async () => {
+  const { home, registry, db, contract, runId } = await revisionFixture('agent-team-rev-atomic');
+  try {
+    const exploding = Object.create(db);
+    exploding.replaceTaskSpec = () => { throw new Error('boom: staged failure'); };
+
+    const revised = JSON.parse(JSON.stringify(contract));
+    revised.tasks[0].acceptance = ['changed'];
+    revised.tasks[1].acceptance = ['changed too'];
+
+    assert.throws(
+      () => applyContractRevision({ db: exploding, projectRegistry: registry, home, runId, contract: revised }),
+      /boom: staged failure/
+    );
+
+    // DB 未留下半套状态：spec 与修订号保持原值。
+    assert.deepEqual(JSON.parse(db.getTask(runId, 'T001').specJson).acceptance, ['first']);
+    assert.deepEqual(JSON.parse(db.getTask(runId, 'T002').specJson).acceptance, ['docs']);
+    assert.equal(db.getRun(runId).contractRevision, 1);
+
+    // 磁盘未留下半套状态：contract.json 与任务 Markdown 仍是旧版，且无临时文件残留。
+    const stored = JSON.parse(readFileSync(join(home.runsDir, runId, 'contract.json'), 'utf8'));
+    assert.deepEqual(stored.tasks[0].acceptance, ['first']);
+    const runDir = join(home.runsDir, runId);
+    const leftovers = [];
+    const visit = (dir) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (entry.isDirectory()) visit(join(dir, entry.name));
+        else if (/\.tmp-\d+$/.test(entry.name)) leftovers.push(entry.name);
+      }
+    };
+    visit(runDir);
+    assert.deepEqual(leftovers, []);
+  } finally {
+    db.close();
+  }
+});
+
+test('withRunId annotates failures so outer controllers can locate the run', () => {
+  const cause = new Error('integration blew up');
+  const annotated = withRunId(cause, 'run-42');
+  assert.match(annotated.message, /^Run run-42: integration blew up$/);
+  assert.equal(annotated.runId, 'run-42');
+  assert.equal(annotated.cause, cause);
+  assert.equal(withRunId('plain string failure', 'run-7').message, 'Run run-7: plain string failure');
+});
+
 test('handoff reads and writes completed runs only', () => {
   const parent = scratch('agent-team-handoff-');
   const home = resolveAgentTeamHome({ env: { AGENT_TEAM_HOME: join(parent, 'home') } });
@@ -581,5 +692,36 @@ test('ApprovalCollector records undefined tool input as unknown', async () => {
     input: undefined, allowSession: false
   });
   assert.match(collector.pending[0].subject, /Unknown: unknown input/);
+  collector.dispose();
+});
+
+test('ApprovalCollector re-checks dangerous arguments even when the prefix is allowlisted', async () => {
+  const dir = scratch('agent-team-collector-unsafe-');
+  const collector = new ApprovalCollector({
+    runId: 'r1', pendingPath: join(dir, 'pending.json'), debounceMs: 0, exitMode: 'quiescence',
+    allowedPrefixes: ['git status', 'npm run'], onEagerAbort: () => {}
+  });
+  const requests = [
+    // 批准过 `git status` 不等于批准 `git status --ext-diff`（helper 执行）
+    { command: 'git status --ext-diff' },
+    // 批准过 `npm run` 不等于批准携带路径/配置覆盖的变体
+    { command: 'npm run build --prefix /elsewhere' }
+  ];
+  for (const input of requests) {
+    const decision = await collector.requestApproval({
+      backend: 'claude', role: 'worker', cwd: '/w', kind: 'command', tool: 'Bash',
+      input, allowSession: false
+    });
+    assert.equal(decision, 'deny', input.command);
+  }
+  assert.equal(collector.pending.length, requests.length);
+
+  // 前缀命中且无危险参数的命令仍然直接放行（grant 沉淀后的重放路径）。
+  const safe = await collector.requestApproval({
+    backend: 'claude', role: 'worker', cwd: '/w', kind: 'command', tool: 'Bash',
+    input: { command: 'git status --porcelain' }, allowSession: false
+  });
+  assert.equal(safe, 'once');
+  assert.equal(collector.pending.length, requests.length);
   collector.dispose();
 });

@@ -1,6 +1,6 @@
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { AgentBackend, AgentEvent, AgentRunOutcome, AgentSession, SessionSpec } from './types.js';
+import type { AgentBackend, AgentRunOutcome, AgentSession, SessionSpec } from './types.js';
 import { writeJson } from '../core/files.js';
 
 /** interrupt 之后等待 completion 自然结算的宽限期，超时则强 close */

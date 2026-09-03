@@ -1,5 +1,5 @@
 import { basename, join, dirname } from 'node:path';
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import type { RunRecord, TaskRecord } from './types.js';
 
 export type RunExitKind = 'done' | 'needs_approval' | 'contract_blocked' | 'failed' | 'interrupted';

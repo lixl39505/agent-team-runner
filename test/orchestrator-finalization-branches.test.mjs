@@ -148,7 +148,7 @@ test('orchestrator records outer-signal aborts without setting the process exit 
   }
 });
 
-test('orchestrator handles an already aborted daemon signal without opening a session', async () => {
+test('orchestrator handles an already aborted outer signal without opening a session', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
   const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));

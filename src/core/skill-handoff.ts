@@ -18,7 +18,7 @@ export function localSkillRoots(repoRoot: string, userHome = homedir()): readonl
   return Object.freeze(candidates.filter((root) => isSafeLocalRoot(root.path, root.source === 'project' ? repoRoot : userHome)));
 }
 
-/** List safe project-local Skill metadata without exposing a daemon or MCP surface. */
+/** List safe project-local Skill metadata. */
 export function listProjectSkills(repoRoot: string): readonly ProjectSkill[] {
   const root = localSkillRoots(repoRoot).find((entry) => entry.source === 'project');
   if (!root) return Object.freeze([]);

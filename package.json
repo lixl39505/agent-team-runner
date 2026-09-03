@@ -8,6 +8,7 @@
   },
   "files": [
     "dist",
+    "!dist/agent/codex/protocol",
     "skills",
     "README.md",
     "LICENSE"

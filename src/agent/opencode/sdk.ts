@@ -2,7 +2,7 @@ import type { ChildProcess } from 'node:child_process';
 import spawn from 'cross-spawn';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { createOpencodeClient, type OpencodeClient } from '@opencode-ai/sdk/client';
 import {
   createOpencodeClient as createOpencodeV2Client,
@@ -12,7 +12,6 @@ import {
 import { assertSessionCapabilities } from '../types.js';
 import type {
   AgentBackend,
-  AgentEvent,
   AgentRunOutcome,
   AgentSession,
   DiscoveryResult,
@@ -584,8 +583,14 @@ ${JSON.stringify(this.spec.schema)}`;
   async answerPermission(permissionId: string, request: { type: string; pattern?: string | Array<string> | undefined }): Promise<void> {
     const hardDenied = this.compiled.access === 'read-only' && ['bash', 'edit'].includes(request.type);
     const kind = openCodeApprovalKind(request.type);
+    // workspace-write 的 edit 不能只信服务端归类：本地再校验一次目标路径确实落在
+    // 会话工作区内，越界路径（如 ../outside.txt）必须走审批通道（headless 下即拒绝）。
+    const editInsideWorkspace = !hardDenied
+      && this.compiled.access === 'workspace-write'
+      && request.type === 'edit'
+      && editPatternWithinWorkspace(request.pattern, this.spec.cwd);
     let response: 'once' | 'always' | 'reject' = 'reject';
-    if (!hardDenied && this.compiled.access === 'workspace-write' && request.type === 'edit') {
+    if (editInsideWorkspace) {
       response = 'once';
     } else if (!hardDenied && this.spec.requestApproval) {
       try {
@@ -607,12 +612,17 @@ ${JSON.stringify(this.spec.schema)}`;
         response = 'reject';
       }
     }
+    const denyReason = hardDenied
+      ? 'read-only role'
+      : request.type === 'edit' && !editPatternWithinWorkspace(request.pattern, this.spec.cwd)
+        ? 'edit target outside the session workspace'
+        : denialGuidance;
     this.spec.onEvent?.({
       type: 'permission-check',
       tool: request.type,
       input: { ...(request.pattern !== undefined ? { pattern: request.pattern } : {}) },
       allowed: response !== 'reject',
-      ...(response === 'reject' ? { reason: hardDenied ? 'read-only role' : denialGuidance } : {})
+      ...(response === 'reject' ? { reason: denyReason } : {})
     });
     try {
       await this.client.postSessionIdPermissionsPermissionId({
@@ -692,6 +702,26 @@ export function mapOpenCodeSessionStatus(status: unknown): 'idle' | 'busy' | 'er
   const type = (status as { type?: unknown }).type;
   if (type === 'idle') return 'idle';
   return type === 'busy' || type === 'retry' ? 'busy' : 'error';
+}
+
+const GLOB_META = /[*?[\]{}]/;
+
+/**
+ * 判定 edit 权限的目标 pattern 是否落在会话工作区内。
+ * pattern 是 glob：取首段不含 glob 元字符的字面前缀作为锚点判定——前缀解析后
+ * 越出工作区（如 ../outside.txt、越界绝对路径）即视为越界；空 pattern 无法证明
+ * 在工作区内，一律交给审批通道。
+ */
+export function editPatternWithinWorkspace(pattern: string | Array<string> | undefined, workspaceRoot: string): boolean {
+  const patterns = pattern === undefined ? [] : Array.isArray(pattern) ? pattern : [pattern];
+  if (patterns.length === 0) return false;
+  return patterns.every((entry) => {
+    if (entry.length === 0) return false;
+    const literalEnd = entry.search(GLOB_META);
+    const literalPrefix = literalEnd < 0 ? entry : entry.slice(0, literalEnd);
+    const rel = relative(workspaceRoot, resolve(workspaceRoot, literalPrefix));
+    return !rel.startsWith('..') && !isAbsolute(rel);
+  });
 }
 
 function openCodeApprovalKind(type: string): 'command' | 'file-change' | 'network' | 'external-directory' | 'tool' {

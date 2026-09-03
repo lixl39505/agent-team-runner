@@ -54,6 +54,16 @@ export function assertAllowedCommand(command: string, prefixes: string[], platfo
   }
 }
 
+/** 布尔形态的安全前缀校验：危险参数或未命中前缀都视为不允许（审批收集器用，不抛错）。 */
+export function isSafeAllowlistedCommand(command: string, prefixes: readonly string[], platform: NodeJS.Platform = process.platform): boolean {
+  try {
+    assertAllowedCommand(command, [...prefixes], platform);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** 前缀令牌匹配：命令与任一 allowlist 前缀逐令牌一致即视为放行。 */
 export function isAllowlistedCommand(command: string, prefixes: readonly string[], platform: NodeJS.Platform = process.platform): boolean {
   const tokens = splitCommand(command, platform);

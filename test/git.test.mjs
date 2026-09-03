@@ -71,3 +71,23 @@ test('runner Git operations preserve configured global commit identity', async (
     else process.env.GIT_CONFIG_GLOBAL = previous;
   }
 });
+
+test('changedFiles records rename/copy targets so path policy sees the destination', async () => {
+  const { repoRoot } = await tempRepo();
+  mkdirSync(join(repoRoot, 'src'), { recursive: true });
+  writeFileSync(join(repoRoot, 'src', 'a.ts'), 'export {};\n', 'utf8');
+  writeFileSync(join(repoRoot, 'keep.txt'), 'keep\n', 'utf8');
+  await git(repoRoot, ['add', '-A']);
+  await git(repoRoot, ['commit', '-q', '-m', 'seed']);
+
+  // rename 到未授权目录 + 从未跟踪来源复制：策略必须看到目标路径
+  mkdirSync(join(repoRoot, 'unauthorized'), { recursive: true });
+  await git(repoRoot, ['mv', 'src/a.ts', 'unauthorized/b.ts']);
+  writeFileSync(join(repoRoot, 'leak.txt'), 'copied out\n', 'utf8');
+  await git(repoRoot, ['add', '-A']);
+
+  const files = await changedFiles(repoRoot);
+  assert.ok(files.includes('unauthorized/b.ts'), `rename target should be listed, got: ${files.join(', ')}`);
+  assert.ok(files.includes('leak.txt'));
+  assert.ok(!files.includes('src/a.ts'), 'rename source must not shadow the target path');
+});

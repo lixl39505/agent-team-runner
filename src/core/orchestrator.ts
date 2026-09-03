@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import type {
   BackendId,
@@ -32,7 +32,6 @@ import {
   cherryPick,
   commit,
   conflictedFiles,
-  continueCherryPick,
   createWorktree,
   currentHead,
   git,
@@ -81,11 +80,11 @@ export async function runOrchestrator(input: {
   signal?: AbortSignal | undefined;
   /** Test seam: production creates its own managed backend pool. */
   backends?: Record<BackendId, AgentBackend> | BackendPool | undefined;
-}): Promise<void> {
+}): Promise<{ interrupted: boolean; signalInterrupted: boolean }> {
   const { config, db, runId } = input;
   let run = db.getRun(runId);
   if (!['planned', 'running', 'needs_attention', 'failed'].includes(run.status)) {
-    if (run.status === 'done') return;
+    if (run.status === 'done') return { interrupted: false, signalInterrupted: false };
     throw new Error(`Run ${runId} cannot start from status ${run.status}`);
   }
   db.resetInterrupted(runId);
@@ -98,12 +97,16 @@ export async function runOrchestrator(input: {
   const active = new Map<string, Promise<void>>();
   const interruptedTasks = new Set<string>();
   let interrupted = false;
+  // 信号中断（SIGINT 等）才把 run 分类为 interrupted(130)；外层 abort（eager 收集器）保留
+  // needs_approval 语义，并且回报限定在本次 run，不读进程全局 exitCode。
+  let signalInterrupted = false;
   let interruptionMessage = 'Interrupted by user; run again to resume.';
-  const interruptRun = (message: string, setExitCode: boolean): void => {
+  const interruptRun = (message: string, bySignal: boolean): void => {
     if (interrupted) return;
     interrupted = true;
+    signalInterrupted = bySignal;
     interruptionMessage = message;
-    if (setExitCode) process.exitCode = 130;
+    if (bySignal) process.exitCode = 130;
     for (const taskId of active.keys()) interruptedTasks.add(taskId);
     db.addEvent(runId, null, 'RUN_INTERRUPTED');
     db.updateRun(runId, { status: 'running', error: message });
@@ -118,13 +121,13 @@ export async function runOrchestrator(input: {
   if (input.signal?.aborted) onAbort();
   try {
     while (true) {
-      if (interrupted) return;
+      if (interrupted) return { interrupted: true, signalInterrupted };
       const tasks = db.listTasks(runId);
       const approved = new Set(tasks.filter((task) => task.status === 'approved').map((task) => task.taskId));
       const terminalProblem = tasks.find((task) => ['blocked', 'blocked_on_contract', 'failed'].includes(task.status));
       if (terminalProblem) {
         db.updateRun(runId, { status: 'needs_attention', error: `${terminalProblem.taskId}: ${terminalProblem.lastError ?? terminalProblem.status}` });
-        return;
+        return { interrupted, signalInterrupted };
       }
       if (tasks.length > 0 && tasks.every((task) => task.status === 'approved')) break;
 
@@ -158,14 +161,14 @@ export async function runOrchestrator(input: {
         const blockedByGraph = db.listTasks(runId).filter((task) => !['approved', 'failed', 'blocked', 'blocked_on_contract'].includes(task.status));
         if (blockedByGraph.length > 0) {
           db.updateRun(runId, { status: 'needs_attention', error: 'No runnable tasks remain; inspect dependency and task states.' });
-          return;
+          return { interrupted, signalInterrupted };
         }
       } else {
         await Promise.race(active.values());
       }
     }
 
-    if (interrupted) return;
+    if (interrupted) return { interrupted: true, signalInterrupted };
     await integrateRun({
       config, db, runId, backends,
       isInterrupted: () => interrupted,
@@ -175,7 +178,7 @@ export async function runOrchestrator(input: {
       ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {})
     });
   } catch (error) {
-    if (interrupted) return;
+    if (interrupted) return { interrupted: true, signalInterrupted };
     db.updateRun(runId, { status: 'failed', error: String(error), finishedAt: new Date().toISOString() });
     db.addEvent(runId, null, 'RUN_FAILED', { error: String(error) });
     throw error;
@@ -188,7 +191,7 @@ export async function runOrchestrator(input: {
         db.updateTask(runId, taskId, {
           status: 'changes_requested', phase: 'interrupted',
           attempts: Math.max(0, task.attempts - 1),
-          lastError: `${interruptionMessage.replace('; run again to resume.', '')}; the next run will discard this attempt and start a clean session.`, finishedAt: null
+          lastError: `${interruptionMessage.replace('; run again to resume.', '')}; the next run will discard this attempt's worktree changes and resume the task session.`, finishedAt: null
         });
       }
     }
@@ -200,6 +203,7 @@ export async function runOrchestrator(input: {
     run = db.getRun(runId);
     if (run.status === 'done') db.addEvent(runId, null, 'RUN_COMPLETED');
   }
+  return { interrupted, signalInterrupted };
 }
 
 async function executeTask(input: {
@@ -234,8 +238,13 @@ async function executeTask(input: {
 
   const outputPath = join(runDir, 'results', `${task.id}-worker-${attempts}.json`);
   const logPath = join(runDir, 'logs', `${task.id}-worker-${attempts}.log`);
+  // session resume 仅限中断恢复（phase interrupted/recovered）：普通重试保持全新会话，
+  // 上下文经下方厚重试注入，避免上下文腐烂，也避免后端拒绝已结束的会话。
+  const resumeSessionId = record.phase === 'interrupted' || record.phase === 'recovered'
+    ? latestWorkerSession(db, runId, task.id)
+    : undefined;
   // 厚重试上下文：worktree 是记忆载体——重试时把 diff、reviewer 原文、上次 summary 注入 prompt，
-  // 会话本身保持全新（避免上下文腐烂与跨任务污染）
+  // 会话本身保持全新（中断恢复除外：恢复时 resume 原会话）
   const retry = record.attempts > 0 || record.reviewCycles > 0
     ? {
         diff: await collectWorktreeDiff(worktreeInfo.path),
@@ -244,7 +253,7 @@ async function executeTask(input: {
       }
     : undefined;
   let lastHeartbeatWrite = 0;
-  const onEvent = (event: AgentEvent): void => {
+  const onEvent = (_event: AgentEvent): void => {
     if (Date.now() - lastHeartbeatWrite > 3000) {
       lastHeartbeatWrite = Date.now();
       db.updateTask(runId, task.id, { phase: 'worker-active' });
@@ -261,9 +270,7 @@ async function executeTask(input: {
       role: 'worker', cwd: worktreeInfo.path,
       label: `${runId} ${task.id} worker`,
       taskId: task.id,
-      ...(latestWorkerSession(db, runId, task.id) !== undefined
-        ? { resumeSessionId: latestWorkerSession(db, runId, task.id) }
-        : {}),
+      ...(resumeSessionId !== undefined ? { resumeSessionId } : {}),
       prompt: workerPrompt({ task, startSha: worktreeInfo.startSha, runId, worktreePath: worktreeInfo.path, priorFeedback: record.lastError, retry, skills: taskSkills(record) }),
       schema: WORKER_SCHEMA,
       ...(workerBinding.model !== undefined ? { model: workerBinding.model } : {}),

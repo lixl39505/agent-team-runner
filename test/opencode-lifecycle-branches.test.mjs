@@ -111,7 +111,7 @@ test('OpenCode session contains permission and question failures', async () => {
     {},
     { permission: async () => { throw new Error('session gone'); } }
   );
-  await postFailure.session.answerPermission('permission-edit', { type: 'edit' });
+  await postFailure.session.answerPermission('permission-edit', { type: 'edit', pattern: 'src/in-workspace.ts' });
   assert.equal(postFailure.calls.permissions[0].body.response, 'once');
 
   const missingHandler = await open(

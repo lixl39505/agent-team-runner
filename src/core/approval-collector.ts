@@ -1,6 +1,6 @@
-import type { ApprovalDecision, ApprovalHandler, UserInputAnswers, UserInputHandler } from '../agent/approval.js';
+import type { ApprovalHandler, UserInputHandler } from '../agent/approval.js';
 import { readPendingFileSync, writePendingFileSync, type PendingFile, type PendingItem } from './run-exit.js';
-import { isAllowlistedCommand } from './shell.js';
+import { isSafeAllowlistedCommand } from './shell.js';
 
 export type RunExitMode = 'eager' | 'quiescence';
 
@@ -48,7 +48,9 @@ export class ApprovalCollector {
   requestApproval: ApprovalHandler = async (request) => {
     const commands = extractCommands(request.input);
     // grant 沉淀过的命令已进入项目 allowlist：重放时直接放行，避免 approve 后仍无限 exit 10。
-    if (commands.length > 0 && commands.every((command) => isAllowlistedCommand(command, this.options.allowedPrefixes))) {
+    // 沿用验证命令的同一安全边界：命中前缀但携带危险参数（git status --ext-diff 等）
+    // 不允许凭前缀放行，必须重新走审批。
+    if (commands.length > 0 && commands.every((command) => isSafeAllowlistedCommand(command, this.options.allowedPrefixes))) {
       return 'once';
     }
     this.record({

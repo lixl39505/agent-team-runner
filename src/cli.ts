@@ -68,8 +68,15 @@ async function main(): Promise<void> {
         ...(home === undefined ? {} : { home })
       });
     } catch (error) {
-      // 崩溃也要有机器可读终态：外层控制器依据 JSON 决定重试/上报。
-      console.error(JSON.stringify({ kind: 'failed', exit: 1, error: String(error) }));
+      // 崩溃也要有机器可读终态：外层控制器依据 JSON 决定重试/上报；
+      // runId（若 run 已创建）用于定位残留的 run 与 runs/<id>/ 下的退出产物。
+      const runId = (error as { runId?: string }).runId;
+      console.error(JSON.stringify({
+        kind: 'failed',
+        exit: 1,
+        error: String(error),
+        ...(runId !== undefined ? { runId } : {})
+      }));
       process.exitCode = 1;
       return;
     }

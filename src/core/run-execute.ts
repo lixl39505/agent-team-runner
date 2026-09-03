@@ -6,13 +6,12 @@ import { applyContractRevision } from './contract-revision.js';
 import { StateDatabase } from './db.js';
 import { DEFAULT_CONFIG } from './defaults.js';
 import { createExecutionRun } from './execution-run.js';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { readJson } from './files.js';
 import { git } from './git.js';
 import { ensureAgentTeamHome, resolveAgentTeamHome, type AgentTeamHome } from './home.js';
 import { writeHandoff } from './handoff.js';
 import { runOrchestrator } from './orchestrator.js';
-import { isAllowlistedCommand } from './shell.js';
 import { ProjectRegistry, type JsonValue, type ProjectRecord } from './project-registry.js';
 import { runnerConfigFromProjectPolicy } from './project-runtime.js';
 import {
@@ -126,6 +125,8 @@ export async function executeRunCommand(options: RunCommandOptions): Promise<Run
   const db = new StateDatabase(home.stateDb);
   const registry = new ProjectRegistry(home.stateDb);
   let lockedRunId: string | undefined;
+  let runId = options.runId;
+  let collector: ApprovalCollector | undefined;
   try {
     let project: ProjectRecord;
     try {
@@ -137,7 +138,6 @@ export async function executeRunCommand(options: RunCommandOptions): Promise<Run
     let config = runnerConfigFromProjectPolicy(policy, project, home);
     if (options.maxParallel !== undefined) config.concurrency = options.maxParallel;
 
-    let runId = options.runId;
     if (runId === undefined) {
       runId = await createExecutionRun({ config, db, contract: rawContract, projectPolicyRevisionId: policy.id });
     } else {
@@ -150,7 +150,7 @@ export async function executeRunCommand(options: RunCommandOptions): Promise<Run
     }
     const pendingPath = pendingItemPath(home.runsDir, runId);
 
-    // 同一 runId 的进程互斥：锁目录写入存活 pid；崩溃残留（pid 不存活）可接管。
+    // 同一 runId 的进程互斥：锁文件写入存活 pid；崩溃残留（pid 不存活）可原子接管。
     acquireRunLock(home, runId);
     lockedRunId = runId;
 
@@ -178,7 +178,7 @@ export async function executeRunCommand(options: RunCommandOptions): Promise<Run
     if (run.status === 'queued') db.updateRun(runId, { status: 'planned' });
 
     const controller = new AbortController();
-    const collector = new ApprovalCollector({
+    collector = new ApprovalCollector({
       runId,
       pendingPath,
       debounceMs: options.debounceMs ?? DEFAULT_EAGER_DEBOUNCE_MS,
@@ -187,8 +187,11 @@ export async function executeRunCommand(options: RunCommandOptions): Promise<Run
       onEagerAbort: () => controller.abort()
     });
     pending = collector.pending;
+    let signalInterrupted = false;
     try {
-      await runOrchestrator({
+      // 编排器回报本次 run 是否被信号中断：限定在本次 run，不读进程全局 exitCode。
+      // eager 收集器触发的 abort 不算中断，保留 needs_approval 语义。
+      ({ signalInterrupted } = await runOrchestrator({
         config,
         db,
         runId,
@@ -196,7 +199,7 @@ export async function executeRunCommand(options: RunCommandOptions): Promise<Run
         requestUserInput: collector.requestUserInput,
         signal: controller.signal,
         backends: options.backends
-      });
+      }));
     } finally {
       collector.dispose();
     }
@@ -213,7 +216,7 @@ export async function executeRunCommand(options: RunCommandOptions): Promise<Run
       run,
       tasks,
       pending,
-      interrupted: process.exitCode === 130
+      interrupted: signalInterrupted
     });
     writeBlockersFileSync(blockersPath(home.runsDir, runId), blockers);
     writePendingFileSync(pendingPath, { runId, pending });
@@ -231,11 +234,48 @@ export async function executeRunCommand(options: RunCommandOptions): Promise<Run
       pendingPath,
       handoffPath: handoffWritten ? handoffPath(home.runsDir, runId) : null
     };
+  } catch (error) {
+    // runId 已确定后的异常同样要有文件化终态：先落盘 pending/blockers，
+    // 再让错误携带 runId 抛出，外层才能定位已创建的 run。
+    if (runId !== undefined) {
+      persistCrashExitArtifacts({ home, runId, db, collector });
+      throw withRunId(error, runId);
+    }
+    throw error;
   } finally {
     if (lockedRunId !== undefined) releaseRunLock(home, lockedRunId);
     db.close();
     registry.close();
   }
+}
+
+/** 崩溃兜底：把 pending/blockers 尽力落盘（DB 也可能已不可用，忽略次生错误）。 */
+function persistCrashExitArtifacts(input: {
+  home: AgentTeamHome;
+  runId: string;
+  db: StateDatabase;
+  collector: ApprovalCollector | undefined;
+}): void {
+  const pendingPath = pendingItemPath(input.home.runsDir, input.runId);
+  try {
+    const pending = input.collector?.pending ?? readPendingFileSync(pendingPath)?.pending ?? [];
+    writePendingFileSync(pendingPath, { runId: input.runId, pending });
+  } catch {
+    // 主错误更有诊断价值。
+  }
+  try {
+    writeBlockersFileSync(blockersPath(input.home.runsDir, input.runId), contractBlockers(input.db.listTasks(input.runId)));
+  } catch {
+    // 主错误更有诊断价值。
+  }
+}
+
+/** 给错误附上 runId：CLI 的失败 JSON 依赖它让外层定位已创建的 run。 */
+export function withRunId(error: unknown, runId: string): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  const annotated = new Error(`Run ${runId}: ${message}`, { cause: error }) as Error & { runId: string };
+  annotated.runId = runId;
+  return annotated;
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -250,25 +290,54 @@ function isProcessAlive(pid: number): boolean {
 /** 同一 runId 的进程互斥锁：runs/<id>/lock/pid 记录持有者，崩溃残留可被接管。 */
 function acquireRunLock(home: AgentTeamHome, runId: string): void {
   const lockDir = join(home.runsDir, runId, 'lock');
-  try {
-    mkdirSync(lockDir);
-  } catch {
-    const pidFile = join(lockDir, 'pid');
-    let holder: number | undefined;
+  const pidFile = join(lockDir, 'pid');
+  mkdirSync(lockDir, { recursive: true });
+  // 抢占上限：锁文件只在「判定残留 → 原子拿走」之间有限轮转，不可能无限竞争。
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    // 独占创建（wx）是唯一的所有权判定点：两个进程同时创建只会有一个成功。
     try {
-      holder = Number(readFileSync(pidFile, 'utf8'));
-    } catch {
-      holder = undefined;
+      writeFileSync(pidFile, String(process.pid), { flag: 'wx' });
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     }
-    if (holder !== undefined && Number.isSafeInteger(holder) && isProcessAlive(holder)) {
-      console.error('LOCKDEBUG holder alive:', holder);
+    const holder = readLockPid(pidFile);
+    if (holder !== undefined && isProcessAlive(holder)) {
       throw new Error(`Run ${runId} is already executing in another process (pid ${holder})`);
     }
-    console.error('LOCKDEBUG taking over, holder:', holder);
-    rmSync(lockDir, { recursive: true, force: true });
-    mkdirSync(lockDir);
+    // 原子接管：rename 拿走残留锁文件，输家得到 ENOENT 回到重试。
+    // 竞争者因此不可能删掉我们刚创建的锁（TOCTOU：读到的 pid 已死 ≠ 现在的文件还是它）。
+    const stolen = `${pidFile}.steal-${process.pid}`;
+    try {
+      renameSync(pidFile, stolen);
+    } catch {
+      continue; // 锁已被其他接管者拿走：按最新状态重新判定。
+    }
+    try {
+      const stolenPid = readLockPid(stolen);
+      if (stolenPid !== holder) {
+        // 判死之后锁已被并发接管者刷新：把锁还回去，按新持有者重新判定。
+        try {
+          renameSync(stolen, pidFile);
+        } catch {
+          // 还回失败（新持有者已重建锁文件）：按最新状态重新判定。
+        }
+        continue;
+      }
+    } finally {
+      rmSync(stolen, { force: true });
+    }
   }
-  writeFileSync(join(lockDir, 'pid'), String(process.pid), 'utf8');
+  throw new Error(`Run ${runId} lock is contended by concurrent takeover attempts`);
+}
+
+function readLockPid(pidFile: string): number | undefined {
+  try {
+    const parsed = Number(readFileSync(pidFile, 'utf8'));
+    return Number.isSafeInteger(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function releaseRunLock(home: AgentTeamHome, runId: string): void {

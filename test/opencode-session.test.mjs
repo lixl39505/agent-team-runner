@@ -1,6 +1,6 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { OpenCodeBackend, mapOpenCodeSessionStatus } from '../src/agent/opencode/sdk.ts';
+import { OpenCodeBackend, editPatternWithinWorkspace, mapOpenCodeSessionStatus } from '../src/agent/opencode/sdk.ts';
 
 function sessionSpec(overrides = {}) {
   return {
@@ -170,8 +170,36 @@ test('OpenCode permissions enforce role policy and map approvals', async () => {
   assert.equal(approved.calls.events.at(-1).allowed, true);
 
   const edit = await open({ data: { info: { structured: {} } } });
-  await edit.session.answerPermission('p3', { type: 'edit' });
+  await edit.session.answerPermission('p3', { type: 'edit', pattern: 'src/feature.ts' });
   assert.equal(edit.calls.permissions[0].body.response, 'once');
+
+  // 越界/无 pattern 的 edit 不再自动放行：无审批处理器时 fail-closed 拒绝。
+  const outsideEdit = await open({ data: { info: { structured: {} } } });
+  await outsideEdit.session.answerPermission('p4', { type: 'edit', pattern: '../outside.txt' });
+  assert.equal(outsideEdit.calls.permissions[0].body.response, 'reject');
+  assert.equal(outsideEdit.calls.events.at(-1).reason, 'edit target outside the session workspace');
+
+  const missingPattern = await open({ data: { info: { structured: {} } } });
+  await missingPattern.session.answerPermission('p5', { type: 'edit' });
+  assert.equal(missingPattern.calls.permissions[0].body.response, 'reject');
+});
+
+test('OpenCode routes out-of-workspace edits through the approval channel', async () => {
+  let approval;
+  const routed = await open({ data: { info: { structured: {} } } }, {
+    requestApproval: async (request) => {
+      approval = request;
+      return 'once';
+    }
+  });
+  await routed.session.answerPermission('p6', { type: 'edit', pattern: '/etc/passwd' });
+  assert.equal(routed.calls.permissions[0].body.response, 'once');
+  assert.equal(approval.kind, 'file-change');
+  assert.equal(approval.title, 'OpenCode requests edit: /etc/passwd');
+
+  const glob = await open({ data: { info: { structured: {} } } });
+  await glob.session.answerPermission('p7', { type: 'edit', pattern: ['src/**', '../escape.md'] });
+  assert.equal(glob.calls.permissions[0].body.response, 'reject');
 });
 
 test('OpenCode questions reject without a handler and reply with normalized answers', async () => {
@@ -186,4 +214,16 @@ test('OpenCode questions reject without a handler and reply with normalized answ
   await answered.session.answerQuestion('q2', [{ question: 'Pick', options: [{ label: 'One' }] }]);
   assert.deepEqual(answered.calls.replies, [{ requestID: 'q2', directory: '/workspace', answers: [['One']] }]);
   assert.equal(answered.calls.events.at(-1).type, 'activity');
+});
+
+test('editPatternWithinWorkspace judges literal prefixes and rejects unknown targets', () => {
+  assert.equal(editPatternWithinWorkspace(['src/**', 'docs/a.md'], '/workspace'), true);
+  assert.equal(editPatternWithinWorkspace('*.ts', '/workspace'), true);
+  assert.equal(editPatternWithinWorkspace('/workspace/src/a.ts', '/workspace'), true);
+  assert.equal(editPatternWithinWorkspace('../outside.txt', '/workspace'), false);
+  assert.equal(editPatternWithinWorkspace(['/etc/passwd'], '/workspace'), false);
+  assert.equal(editPatternWithinWorkspace(undefined, '/workspace'), false);
+  assert.equal(editPatternWithinWorkspace([], '/workspace'), false);
+  assert.equal(editPatternWithinWorkspace([''], '/workspace'), false);
+  assert.equal(editPatternWithinWorkspace('src/**', '/workspace'), true);
 });

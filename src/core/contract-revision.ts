@@ -1,9 +1,9 @@
 import { basename, dirname, join } from 'node:path';
-import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import type { AgentTeamHome } from './home.js';
 import { StateDatabase } from './db.js';
 import { agentList } from './agent-config.js';
-import type { ExecutionContract, RunManifest, TaskSpec } from './types.js';
+import type { ExecutionContract, RunManifest } from './types.js';
 import { validateExecutionContract } from './validation.js';
 import { assertExecutionContractFields } from './validation.js';
 import { assertAllowedCommand } from './shell.js';
@@ -95,52 +95,77 @@ export function applyContractRevision(input: ApplyContractRevisionInput): Contra
       throw new Error(`Contract revision can only change blocked tasks or their downstream tasks: ${task.id}`);
     }
   }
+  // 验证通过后再扩大写入集合：spec 实际变化的既有任务与新增任务也必须重写。
+  // 修订可能移除旧图下游对 blocked 的依赖：该任务不在上面的新图闭包内，但其内容
+  // 已按新契约变化（上一步已保证变化只落在旧图下游），若不更新就会留下
+  // 「contract.json 已是新版、tasks.spec_json 与任务 Markdown 仍是旧版」的偏差。
+  for (const task of contract.tasks) {
+    const current = currentById.get(task.id);
+    if (current === undefined || current.specJson !== JSON.stringify(task)) affected.add(task.id);
+  }
   const skillRoots = localSkillRoots(config.workspace.repoRoot);
   const revisedSkills = new Map(
     contract.tasks
       .filter((task) => affected.has(task.id) && currentById.get(task.id)?.status !== 'approved')
       .map((task) => [task.id, snapshotTaskSkills(task, skillRoots)])
   );
-  for (const task of contract.tasks) {
-    const current = currentById.get(task.id);
-    if (!current) {
-      db.insertTask(runId, task, revisedSkills.get(task.id));
-      affected.add(task.id);
-      continue;
-    }
-    if (affected.has(task.id) && current.status !== 'approved') {
-      db.replaceTaskSpec(runId, task, revisedSkills.get(task.id));
-    }
-  }
-  // 先把全部文件写到临时位置，DB 提交成功后再原子就位：磁盘失败不会留下
-  // 「DB 已提交而 contract.json/任务 Markdown 仍是旧版」的半套状态。
+  // 阶段一：全部产物先写入临时文件并备份旧内容——磁盘错误在任何 DB 变更之前暴露。
   const runDir = join(home.runsDir, runId);
-  const staged: Array<{ tmp: string; final: string }> = [];
+  const staged: Array<{ tmp: string; final: string; previous: string | null }> = [];
   const stage = (final: string, content: string): void => {
     mkdirSync(dirname(final), { recursive: true });
     const tmp = join(dirname(final), `.${basename(final)}.tmp-${process.pid}`);
     writeFileSync(tmp, content, 'utf8');
-    staged.push({ tmp, final });
+    staged.push({ tmp, final, previous: existsSync(final) ? readFileSync(final, 'utf8') : null });
   };
   stage(join(runDir, 'contract.json'), `${JSON.stringify(contract, null, 2)}\n`);
-  for (const taskId of affected) {
+  for (const taskId of [...affected].sort()) {
     const task = proposedById.get(taskId)!;
     stage(join(runDir, 'tasks', `${task.id}.md`), taskMarkdownContent(task, run.baseSha));
   }
 
-  const revision = db.appendContractRevision(runId, JSON.stringify(contract));
-  const manifest: RunManifest = {
-    version: 1,
-    title: `External execution run ${runId}`,
-    summary: `Execution contract revision ${revision} for run ${runId}.`,
-    tasks: contract.tasks
-  };
-  db.updateRun(runId, {
-    status: 'queued',
-    error: null, finishedAt: null, manifestJson: JSON.stringify(manifest)
-  });
-  for (const { tmp, final } of staged) renameSync(tmp, final);
-  db.addEvent(runId, null, 'EXECUTION_CONTRACT_UPDATED', { revision, affectedTaskIds: [...affected].sort() });
+  // 阶段二：DB 变更、文件就位与事件在同一临界区提交——DB 用事务回滚，文件用备份恢复，
+  // 任一步失败都不会留下 DB、contract.json、任务 Markdown 互相矛盾的半套状态。
+  let revision = 0;
+  try {
+    db.transaction(() => {
+      for (const task of contract.tasks) {
+        const current = currentById.get(task.id);
+        if (current === undefined) {
+          db.insertTask(runId, task, revisedSkills.get(task.id));
+          continue;
+        }
+        if (affected.has(task.id) && current.status !== 'approved') {
+          db.replaceTaskSpec(runId, task, revisedSkills.get(task.id));
+        }
+      }
+      revision = db.appendContractRevision(runId, JSON.stringify(contract));
+      const manifest: RunManifest = {
+        version: 1,
+        title: `External execution run ${runId}`,
+        summary: `Execution contract revision ${revision} for run ${runId}.`,
+        tasks: contract.tasks
+      };
+      db.updateRun(runId, {
+        status: 'queued',
+        error: null, finishedAt: null, manifestJson: JSON.stringify(manifest)
+      });
+      for (const { tmp, final } of staged) renameSync(tmp, final);
+      db.addEvent(runId, null, 'EXECUTION_CONTRACT_UPDATED', { revision, affectedTaskIds: [...affected].sort() });
+    });
+  } catch (error) {
+    // 文件回滚尽力而为：恢复旧内容或删除新增文件，并清理残留的临时文件。
+    for (const { tmp, final, previous } of staged) {
+      try {
+        if (previous === null) rmSync(final, { force: true });
+        else if (existsSync(final)) writeFileSync(final, previous, 'utf8');
+      } catch {
+        // 原始错误更有诊断价值。
+      }
+      rmSync(tmp, { force: true });
+    }
+    throw error;
+  }
   return { runId, revision, affectedTaskIds: [...affected].sort() };
 }
 

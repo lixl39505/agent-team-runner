@@ -5,7 +5,6 @@ import { join } from 'node:path';
 import { assertSessionCapabilities } from '../types.js';
 import type {
   AgentBackend,
-  AgentEvent,
   AgentRunOutcome,
   AgentSession,
   DiscoveryResult,

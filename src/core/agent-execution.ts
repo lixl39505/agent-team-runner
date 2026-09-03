@@ -15,14 +15,14 @@ export interface AgentExecutionInfo {
 
 export type AgentEventSink = (info: AgentExecutionInfo, event: AgentEvent) => void;
 
-export interface RunTrackedAgentInput<T> extends RunAgentInput {
+export interface RunTrackedAgentInput extends RunAgentInput {
   db: StateDatabase;
   execution: AgentExecutionInfo;
   onAgentEvent?: AgentEventSink | undefined;
 }
 
-/** Runs an agent while maintaining the durable execution index used by the TUI and logs command. */
-export async function runTrackedAgent<T = unknown>(input: RunTrackedAgentInput<T>): Promise<AgentRunOutcome<T>> {
+/** Runs an agent while maintaining the durable execution index backing the status and log commands. */
+export async function runTrackedAgent<T = unknown>(input: RunTrackedAgentInput): Promise<AgentRunOutcome<T>> {
   const { db, execution, spec, onAgentEvent, ...runInput } = input;
   const executionDb = db as StateDatabase & {
     startAgentExecution?: (value: AgentExecutionInfo) => void;

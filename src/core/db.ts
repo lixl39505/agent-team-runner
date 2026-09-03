@@ -80,6 +80,7 @@ function mapAgentExecution(row: Record<string, unknown>): AgentExecutionRecord {
 
 export class StateDatabase {
   readonly db: DatabaseSync;
+  private txDepth = 0;
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
@@ -92,6 +93,36 @@ export class StateDatabase {
 
   close(): void {
     this.db.close();
+  }
+
+  /**
+   * 事务助手：最外层 BEGIN IMMEDIATE，嵌套调用退化为 SAVEPOINT。
+   * body 抛错（包括 COMMIT 前的任何一步）时整体回滚，保证多语句写入的原子性。
+   */
+  transaction<T>(body: () => T): T {
+    const nested = this.txDepth > 0;
+    const name = `agent_team_sp_${this.txDepth}`;
+    this.db.exec(nested ? `SAVEPOINT ${name};` : 'BEGIN IMMEDIATE;');
+    this.txDepth += 1;
+    let settled = false;
+    try {
+      const result = body();
+      this.txDepth -= 1;
+      this.db.exec(nested ? `RELEASE SAVEPOINT ${name};` : 'COMMIT;');
+      settled = true;
+      return result;
+    } finally {
+      if (!settled) {
+        this.txDepth -= 1;
+        try {
+          this.db.exec(nested
+            ? `ROLLBACK TO SAVEPOINT ${name}; RELEASE SAVEPOINT ${name};`
+            : 'ROLLBACK;');
+        } catch {
+          // 回滚失败时保留原始错误：它比回滚自身的失败更有诊断价值。
+        }
+      }
+    }
   }
 
   private migrate(): void {
@@ -108,8 +139,6 @@ export class StateDatabase {
         contract_revision INTEGER NOT NULL DEFAULT 0,
         adapter TEXT NOT NULL,
         status TEXT NOT NULL,
-        runtime_state TEXT NOT NULL DEFAULT 'recovering',
-        desired_state TEXT NOT NULL DEFAULT 'running',
         manifest_json TEXT,
         roles_json TEXT,
         integration_branch TEXT,
@@ -189,8 +218,6 @@ export class StateDatabase {
     this.addColumnIfMissing('runs', 'project_policy_revision_id', 'TEXT');
     this.addColumnIfMissing('runs', 'execution_contract_json', 'TEXT');
     this.addColumnIfMissing('runs', 'contract_revision', 'INTEGER NOT NULL DEFAULT 0');
-    this.addColumnIfMissing('runs', 'runtime_state', "TEXT NOT NULL DEFAULT 'recovering'");
-    this.addColumnIfMissing('runs', 'desired_state', "TEXT NOT NULL DEFAULT 'running'");
     this.addColumnIfMissing('tasks', 'resolved_skills_json', "TEXT NOT NULL DEFAULT '[]'");
   }
 
@@ -259,8 +286,8 @@ export class StateDatabase {
     if (run.executionContractJson === null) throw new Error(`Run ${runId} has no execution contract`);
     const revision = run.contractRevision + 1;
     const timestamp = now();
-    this.db.exec('BEGIN IMMEDIATE;');
-    try {
+    // 事务由调用方（或本方法）开启：嵌套进更大的修订事务时退化为 SAVEPOINT。
+    return this.transaction(() => {
       this.db.prepare(`
         INSERT INTO execution_contract_revisions (run_id, revision, contract_json, created_at)
         VALUES (?, ?, ?, ?)
@@ -268,12 +295,8 @@ export class StateDatabase {
       this.db.prepare(`
         UPDATE runs SET execution_contract_json = ?, contract_revision = ?, updated_at = ? WHERE id = ?
       `).run(contractJson, revision, timestamp, runId);
-      this.db.exec('COMMIT;');
-    } catch (error) {
-      this.db.exec('ROLLBACK;');
-      throw error;
-    }
-    return revision;
+      return revision;
+    });
   }
 
   updateRun(id: string, patch: Partial<{

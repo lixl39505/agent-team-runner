@@ -8,7 +8,7 @@ import { resolveAgentTeamHome } from '../src/core/home.ts';
 import { ProjectRegistry } from '../src/core/project-registry.ts';
 import { StateDatabase } from '../src/core/db.ts';
 import { executeRunCommand } from '../src/core/run-execute.ts';
-import { blockersPath } from '../src/core/run-exit.ts';
+import { blockersPath, pendingItemPath } from '../src/core/run-exit.ts';
 
 async function repository(prefix) {
   const repoRoot = mkdtempSync(join(tmpdir(), `${prefix}-`));
@@ -173,14 +173,10 @@ test('run collects denied approvals, exits 10, and a grant sediments the allowli
 
   assert.equal(second.exitCode, 0);
   assert.equal(second.kind, 'done');
-  // 重放时在途任务带上旧 session，验证 resume 接线。
+  // 普通重放（grant 后重跑）不复用旧 session：上下文经厚重试注入，会话保持全新。
   const workerSpecs = replayBackend.specs.filter((spec) => spec.role === 'worker');
-  console.log('DBG workerSpecs:', JSON.stringify(workerSpecs.map((spec) => ({ resume: spec.resumeSessionId, task: spec.taskId, session: spec.sessionId }))));
-  const dbdbg = new StateDatabase(home.stateDb);
-  console.log('DBG exec:', JSON.stringify(dbdbg.db.prepare('SELECT agent_id, session_id FROM agent_executions WHERE run_id=?').all(first.runId)));
-  dbdbg.close();
   assert.ok(workerSpecs.length >= 1);
-  assert.equal(workerSpecs.at(-1).resumeSessionId !== undefined, true);
+  assert.equal(workerSpecs.at(-1).resumeSessionId, undefined);
   assert.equal(workerSpecs.at(-1).taskId, 'T001');
   const registry = new ProjectRegistry(home.stateDb);
   const policy = registry.getProjectPolicy('e2e-project');
@@ -280,9 +276,80 @@ test('SIGINT during a run exits 130 and the run stays resumable', async () => {
   assert.equal(first.exitCode, 130);
   assert.equal(first.kind, 'interrupted');
 
+  // 中断后的 run 保持可重放：同进程内紧接的重放按本次运行的真实状态分类，不再误判 130。
   const second = await executeRunCommand({
     contractPath, runId: first.runId, home, backends: pool(workerHandler({ approvals: 0 })), exitMode: 'quiescence'
   });
   assert.equal(second.exitCode, 0);
   assert.equal(second.kind, 'done');
+});
+
+test('a task interrupted mid-flight resumes its previous worker session on replay', async () => {
+  const repoRoot = await repository('agent-team-run-resume-');
+  const home = tempHome();
+  const contractPath = join(repoRoot, 'contract.json');
+  writeFileSync(contractPath, JSON.stringify(contractFor(repoRoot)));
+
+  const first = await executeRunCommand({
+    contractPath, home, backends: pool(workerHandler({ approvals: 0 })), exitMode: 'quiescence'
+  });
+  assert.equal(first.exitCode, 0);
+
+  // 把任务置回「中断待恢复」状态：phase interrupted + 保留 worktree + 上次 worker session。
+  const db = new StateDatabase(home.stateDb);
+  db.updateTask(first.runId, 'T001', {
+    status: 'changes_requested', phase: 'interrupted', commitSha: null, finishedAt: null
+  });
+  db.startAgentExecution({
+    runId: first.runId, agentId: 'T001-worker-1', taskId: 'T001', role: 'worker', backend: 'claude',
+    logPath: join(home.runsDir, first.runId, 'logs', 'T001-worker-1.log')
+  });
+  db.updateAgentExecution(first.runId, 'T001-worker-1', { sessionId: 'sess-run1' });
+  db.updateRun(first.runId, { status: 'failed', error: null, finishedAt: null, integrationCommit: null });
+  db.close();
+
+  const replayBackend = scriptBackend(workerHandler({ approvals: 0 }));
+  const second = await executeRunCommand({
+    contractPath, runId: first.runId, home,
+    backends: { claude: replayBackend, codex: replayBackend, opencode: replayBackend }, exitMode: 'quiescence'
+  });
+  assert.equal(second.exitCode, 0);
+  assert.equal(second.kind, 'done');
+  // 中断恢复是唯一允许 resume worker 会话的场景。
+  const resumedSpec = replayBackend.specs.filter((spec) => spec.role === 'worker').at(-1);
+  assert.equal(resumedSpec.taskId, 'T001');
+  assert.equal(resumedSpec.resumeSessionId, 'sess-run1');
+});
+
+test('a failure after run creation persists exit artifacts and reports the runId', async () => {
+  const repoRoot = await repository('agent-team-run-crash-');
+  const home = tempHome();
+  const contractPath = join(repoRoot, 'contract.json');
+  writeFileSync(contractPath, JSON.stringify(contractFor(repoRoot)));
+
+  const first = await executeRunCommand({
+    contractPath, home, backends: pool(workerHandler({ approvals: 0, contractBlock: true })), exitMode: 'quiescence'
+  });
+  assert.equal(first.exitCode, 11);
+
+  // 重放携带冲突契约：runId 已存在后的异常路径也要留下文件化终态。
+  const conflicting = contractFor(repoRoot);
+  conflicting.project.baseRef = 'refs/heads/other';
+  const conflictingPath = join(repoRoot, 'contract-conflict.json');
+  writeFileSync(conflictingPath, JSON.stringify(conflicting));
+
+  await assert.rejects(
+    executeRunCommand({ contractPath: conflictingPath, runId: first.runId, home, backends: pool(workerHandler({ approvals: 0 })), exitMode: 'quiescence' }),
+    (error) => {
+      assert.match(error.message, new RegExp(`^Run ${first.runId}: Contract revision cannot change`));
+      assert.equal(error.runId, first.runId);
+      return true;
+    }
+  );
+
+  const pending = JSON.parse(readFileSync(pendingItemPath(home.runsDir, first.runId), 'utf8'));
+  assert.equal(pending.runId, first.runId);
+  assert.deepEqual(pending.pending, []);
+  const blockers = JSON.parse(readFileSync(blockersPath(home.runsDir, first.runId), 'utf8'));
+  assert.deepEqual(blockers.blockers.map((blocker) => blocker.taskId), ['T001']);
 });

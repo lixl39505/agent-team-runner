@@ -162,8 +162,10 @@ test('OpenCode captures model routing and string transport failures', async () =
 
   const missingInfo = await open({ data: {} });
   assert.match((await missingInfo.session.completion()).error, /no final message/);
+  // 无 pattern 的 edit 无法证明在工作区内：转交审批通道而不是自动放行。
   await missingInfo.session.answerPermission('edit', { type: 'edit' });
-  assert.equal(missingInfo.calls.approvals.length, 0);
+  assert.equal(missingInfo.calls.approvals.length, 1);
+  assert.equal(missingInfo.calls.approvals[0].kind, 'file-change');
 
   const nullData = await open({ data: null });
   assert.match((await nullData.session.completion()).error, /no final message/);
