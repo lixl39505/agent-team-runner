@@ -226,13 +226,23 @@ export function parseSnapshot(rolesJson: string | null): AgentSnapshot | null {
 
 /** 全量快照（roles 绑定 + agents 注册表），创建运行时写入 runs.roles_json。 */
 export function snapshotAgents(config: RunnerConfig): AgentSnapshot {
+  const roles = {
+    worker: resolveAgent('worker', config),
+    reviewer: resolveAgent('reviewer', config),
+    integrator: resolveAgent('integrator', config)
+  };
+  // 跨厂商强制验收是 ADR 0002 保留的核心差异化：创建 run 时即 fail-fast，
+  // 而不是让所有任务跑到 reviewer 阶段才逐一失败。
+  if (config.crossVendorReview !== false && roles.worker.backend === roles.reviewer.backend) {
+    throw new Error(
+      `Cross-vendor review is enforced: the reviewer backend "${roles.reviewer.backend}" must differ ` +
+      `from the worker backend "${roles.worker.backend}". Configure agentProfileMapping.roles.reviewer ` +
+      'with an agent on another backend, or set backendPolicy.crossVendorReview to false.'
+    );
+  }
   return {
     version: 2,
-    roles: {
-      worker: resolveAgent('worker', config),
-      reviewer: resolveAgent('reviewer', config),
-      integrator: resolveAgent('integrator', config)
-    },
+    roles,
     agents: { ...config.agents }
   };
 }

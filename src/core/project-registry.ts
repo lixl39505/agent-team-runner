@@ -8,7 +8,6 @@ export type JsonValue = boolean | null | number | string | JsonValue[] | { [key:
 export interface ProjectPolicyInput {
   baseRef: string;
   verificationAllowedCommandPrefixes: string[];
-  baselinePathPolicy: JsonValue;
   agentProfileMapping: JsonValue;
   backendPolicy: JsonValue;
 }
@@ -43,7 +42,6 @@ export interface ProjectPolicyRevision {
   revision: number;
   baseRef: string;
   verificationAllowedCommandPrefixes: string[];
-  baselinePathPolicy: JsonValue;
   agentProfileMapping: JsonValue;
   backendPolicy: JsonValue;
   createdBy: string;
@@ -80,7 +78,6 @@ function mapPolicyRevision(row: Record<string, unknown>): ProjectPolicyRevision 
     revision: Number(row.revision),
     baseRef: String(row.base_ref),
     verificationAllowedCommandPrefixes: JSON.parse(String(row.verification_allowed_command_prefixes_json)) as string[],
-    baselinePathPolicy: JSON.parse(String(row.baseline_path_policy_json)) as JsonValue,
     agentProfileMapping: JSON.parse(String(row.agent_profile_mapping_json)) as JsonValue,
     backendPolicy: JSON.parse(String(row.backend_policy_json)) as JsonValue,
     createdBy: String(row.created_by),
@@ -107,7 +104,6 @@ function policyFingerprint(policy: ProjectPolicyInput): string {
   return serialize({
     baseRef: policy.baseRef,
     verificationAllowedCommandPrefixes: policy.verificationAllowedCommandPrefixes,
-    baselinePathPolicy: policy.baselinePathPolicy,
     agentProfileMapping: policy.agentProfileMapping,
     backendPolicy: policy.backendPolicy
   });
@@ -117,7 +113,6 @@ function policyFromRevision(revision: ProjectPolicyRevision): ProjectPolicyInput
   return {
     baseRef: revision.baseRef,
     verificationAllowedCommandPrefixes: revision.verificationAllowedCommandPrefixes,
-    baselinePathPolicy: revision.baselinePathPolicy,
     agentProfileMapping: revision.agentProfileMapping,
     backendPolicy: revision.backendPolicy
   };
@@ -305,7 +300,9 @@ export class ProjectRegistry {
       revision,
       policy.baseRef,
       serialize(policy.verificationAllowedCommandPrefixes),
-      serialize(policy.baselinePathPolicy),
+      // baseline_path_policy_json 是历史列（该字段从未参与路径策略判断，已随 API 删除）：
+      // 列保持 NOT NULL，恒写空对象，不再读取。
+      serialize({}),
       serialize(policy.agentProfileMapping),
       serialize(policy.backendPolicy),
       createdBy,
@@ -354,14 +351,13 @@ export function parseProjectPolicyInput(params: Record<string, unknown>): Projec
   }
   const policy = policyValue as Record<string, unknown>;
   for (const field of Object.keys(policy)) {
-    if (!['baseRef', 'verificationAllowedCommandPrefixes', 'baselinePathPolicy', 'agentProfileMapping', 'backendPolicy'].includes(field)) {
+    if (!['baseRef', 'verificationAllowedCommandPrefixes', 'agentProfileMapping', 'backendPolicy'].includes(field)) {
       throw new Error(`project.register params.policy contains unknown field: ${field}`);
     }
   }
   return {
     baseRef: requiredStringField(policy, 'baseRef', 'project.register params.policy.baseRef'),
     verificationAllowedCommandPrefixes: requiredStringArrayField(policy, 'verificationAllowedCommandPrefixes', 'project.register params.policy.verificationAllowedCommandPrefixes'),
-    baselinePathPolicy: requiredJsonValueField(policy.baselinePathPolicy, 'project.register params.policy.baselinePathPolicy'),
     agentProfileMapping: requiredJsonValueField(policy.agentProfileMapping, 'project.register params.policy.agentProfileMapping'),
     backendPolicy: requiredJsonValueField(policy.backendPolicy, 'project.register params.policy.backendPolicy')
   };

@@ -11,7 +11,7 @@ import { ensureGitRepo, git } from './git.js';
 import { assertHomeOutsideRepo, ensureAgentTeamHome, resolveAgentTeamHome, type AgentTeamHome } from './home.js';
 import { writeHandoff } from './handoff.js';
 import { runOrchestrator } from './orchestrator.js';
-import { ProjectRegistry, type JsonValue, type ProjectRecord } from './project-registry.js';
+import { ProjectRegistry, type JsonValue, type ProjectPolicyRevision, type ProjectRecord } from './project-registry.js';
 import { runnerConfigFromProjectPolicy } from './project-runtime.js';
 import { acquireRunLock, releaseRunLock } from './run-lock.js';
 import {
@@ -135,50 +135,80 @@ export async function executeRunCommand(options: RunCommandOptions): Promise<Run
   let runId = options.runId;
   let collector: ApprovalCollector | undefined;
   try {
+    // 重放隔离：--run-id 必须钉住 run 持久化的项目与策略修订。先读 run 记录，
+    // 契约声明的 project.id 与 run 记录不一致时直接拒绝——绝不用另一个项目的
+    // 策略/仓库配置执行旧 run。只有新建 run 才按契约解析（或自动注册）项目。
     let project: ProjectRecord;
-    try {
-      project = registry.getProject(contract.project.id);
-    } catch {
-      project = await registerContractProject(registry, contract);
+    let policy: ProjectPolicyRevision;
+    if (runId === undefined) {
+      try {
+        project = registry.getProject(contract.project.id);
+      } catch {
+        project = await registerContractProject(registry, contract);
+      }
+      policy = registry.getProjectPolicy(project.id);
+    } else {
+      const existing = db.getRun(runId);
+      if (existing.projectId === null) {
+        throw new Error(`Run ${runId} has no persisted project; only runs created from an execution contract can be replayed`);
+      }
+      if (existing.projectId !== contract.project.id) {
+        throw new Error(
+          `Run ${runId} belongs to project "${existing.projectId}"; ` +
+          `the contract declares project "${contract.project.id}"`
+        );
+      }
+      project = registry.getProject(existing.projectId);
+      policy = existing.projectPolicyRevisionId !== null
+        ? registry.getProjectPolicyRevision(existing.projectId, existing.projectPolicyRevisionId)
+        : registry.getProjectPolicy(existing.projectId);
     }
-    let policy = registry.getProjectPolicy(project.id);
     let config = runnerConfigFromProjectPolicy(policy, project, home);
     if (options.maxParallel !== undefined) config.concurrency = options.maxParallel;
 
     if (runId === undefined) {
       runId = await createExecutionRun({ config, db, contract: rawContract, projectPolicyRevisionId: policy.id });
-    } else {
-      const existing = db.getRun(runId);
-      if (existing.status === 'planning') {
-        // 上次进程在「创建 run 之后、写任务之前」崩溃：残留记录不可直接编排，重建后重放。
-        db.deleteRun(runId);
-        runId = await createExecutionRun({ config, db, contract: rawContract, projectPolicyRevisionId: policy.id, runId });
-      }
     }
     const pendingPath = pendingItemPath(home.runsDir, runId);
     const grantsPath = grantsItemPath(home.runsDir, runId);
 
     // 同一 runId 的进程互斥：锁文件写入存活 pid；崩溃残留（pid 不存活）可原子接管。
+    // 必须先于任何状态重建持有：planning 重建也在锁内，避免并发重放竞态。
     acquireRunLock(home, runId);
     lockedRunId = runId;
 
     let run = db.getRun(runId);
-    const existingTasks = db.listTasks(runId);
+    if (options.runId !== undefined && run.status === 'planning') {
+      // 上次进程在「创建 run 之后、写任务之前」崩溃：残留记录不可直接编排，重建后重放。
+      // 重建沿用 run 已钉住的策略修订，保持创建时的 hermetic 配置。
+      db.deleteRun(runId);
+      await createExecutionRun({ config, db, contract: rawContract, projectPolicyRevisionId: policy.id, runId });
+      run = db.getRun(runId);
+    }
     let pending: PendingItem[] = [];
 
     if (options.grantPath !== undefined) {
       const decisions = readGrantDecisions(options.grantPath);
       const carried = readPendingFileSync(pendingPath)?.pending ?? [];
-      pending = applyGrants({ db, registry, project, policy, runId, pendingPath, grantsPath, pending: carried, decisions });
-      project = registry.getProject(project.id);
-      policy = registry.getProjectPolicy(project.id);
+      pending = applyGrants({ db, registry, runId, pendingPath, grantsPath, pending: carried, decisions });
+      // 沉淀可能推进了策略修订：以 run 记录里新的钉住值为准，而不是项目当前策略。
+      run = db.getRun(runId);
+      project = registry.getProject(run.projectId!);
+      policy = registry.getProjectPolicyRevision(project.id, run.projectPolicyRevisionId!);
       config = runnerConfigFromProjectPolicy(policy, project, home);
       if (options.maxParallel !== undefined) config.concurrency = options.maxParallel;
     }
 
     if (options.runId !== undefined && run.executionContractJson !== null
-      && existingTasks.some((task) => task.status === 'blocked_on_contract')
       && canonicalJson(JSON.parse(run.executionContractJson)) !== canonicalJson(rawContract)) {
+      // 契约内容有差异：只有 blocked_on_contract 的 run 允许修订重入；其余情况说明
+      // 外层传入了不匹配的契约，必须显式拒绝而不是静默忽略后按旧 run 继续执行。
+      if (!db.listTasks(runId).some((task) => task.status === 'blocked_on_contract')) {
+        throw new Error(
+          `Run ${runId} is not contract-blocked; replay requires the persisted contract. ` +
+          'Only a run with blocked_on_contract tasks accepts a revised contract.'
+        );
+      }
       applyContractRevision({ db, projectRegistry: registry, home, runId, contract: rawContract });
       run = db.getRun(runId);
     }
@@ -306,8 +336,6 @@ export function readGrantDecisions(grantPath: string): GrantDecisionMap {
 function applyGrants(input: {
   db: StateDatabase;
   registry: ProjectRegistry;
-  project: ProjectRecord;
-  policy: ReturnType<ProjectRegistry['getProjectPolicy']>;
   runId: string;
   pendingPath: string;
   grantsPath: string;
@@ -322,8 +350,13 @@ function applyGrants(input: {
       );
     }
   }
+  const run = input.db.getRun(input.runId);
+  const project = input.registry.getProject(run.projectId!);
+  // 沉淀基于项目当前策略（而非 run 钉住的旧修订）：其他 run 的沉淀已经推进过策略，
+  // 从旧修订出发生成新修订会把那些变更回退掉。批准后 run 的钉住值随之推进到新修订。
+  const current = input.registry.getProjectPolicy(project.id);
   const { approved, denied, unresolved } = partitionGrants(input.pending, input.decisions);
-  const prefixes = new Set(input.policy.verificationAllowedCommandPrefixes);
+  const prefixes = new Set(current.verificationAllowedCommandPrefixes);
   let allowlistChanged = false;
   const grants = [...(readGrantsFileSync(input.grantsPath)?.grants ?? [])];
   let grantsChanged = false;
@@ -371,16 +404,15 @@ function applyGrants(input: {
   }
   if (allowlistChanged) {
     const updated = input.registry.registerProject({
-      gitCommonDir: input.project.gitCommonDir,
-      repoRoot: input.project.repoRoot,
-      displayName: input.project.displayName,
-      gitIdentity: input.project.gitIdentity,
+      gitCommonDir: project.gitCommonDir,
+      repoRoot: project.repoRoot,
+      displayName: project.displayName,
+      gitIdentity: project.gitIdentity,
       policy: {
-        baseRef: input.policy.baseRef,
+        baseRef: current.baseRef,
         verificationAllowedCommandPrefixes: [...prefixes],
-        baselinePathPolicy: input.policy.baselinePathPolicy,
-        agentProfileMapping: input.policy.agentProfileMapping,
-        backendPolicy: input.policy.backendPolicy
+        agentProfileMapping: current.agentProfileMapping,
+        backendPolicy: current.backendPolicy
       }
     });
     input.db.updateRun(input.runId, { projectPolicyRevisionId: updated.currentPolicyRevisionId });
@@ -415,11 +447,15 @@ async function registerContractProject(registry: ProjectRegistry, contract: Exec
     policy: {
       baseRef: contract.project.baseRef,
       verificationAllowedCommandPrefixes: [...DEFAULT_CONFIG.verification.allowedCommandPrefixes],
-      baselinePathPolicy: {},
       agentProfileMapping: {
         defaultAgent: DEFAULT_CONFIG.defaultAgent,
-        agents: { 'default-claude': { backend: 'claude' } },
-        roles: {}
+        // 跨厂商强制验收是 Runner 的核心差异化：默认 reviewer 落在另一个后端（codex），
+        // worker/integrator 走 defaultAgent。单后端环境必须显式配置策略降级。
+        agents: {
+          'default-claude': { backend: 'claude' },
+          'default-codex': { backend: 'codex' }
+        },
+        roles: { reviewer: 'default-codex' }
       },
       backendPolicy: {}
     }

@@ -30,7 +30,10 @@ function configFor(repoRoot) {
     concurrency: 1,
     retry: { ...DEFAULT_CONFIG.retry, maxWorkerAttempts: 2, maxReviewCycles: 2 },
     integration: { ...DEFAULT_CONFIG.integration },
-    verification: { ...DEFAULT_CONFIG.verification }
+    verification: { ...DEFAULT_CONFIG.verification },
+    // 跨厂商强制验收：reviewer 落在 codex（测试池把所有 backend id 指到同一个假后端）。
+    agents: { ...DEFAULT_CONFIG.agents, 'default-codex': { backend: 'codex' } },
+    roles: { reviewer: 'default-codex' }
   };
 }
 
@@ -246,6 +249,135 @@ test('orchestrator blocks out-of-scope worker changes before review', async () =
     assert.equal(record.commitSha, null);
     assert.match(record.lastError, /Outside allowed paths: outside\.txt/);
     assert.equal(eventTypes(db, 'run').includes('REVIEW_STARTED'), false);
+  } finally {
+    db.close();
+  }
+});
+
+test('orchestrator turns an unanswered reviewer question into a contract block', async () => {
+  const repoRoot = await repository();
+  const config = configFor(repoRoot);
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
+  const manifest = { version: 1, title: 'Run', summary: 'test run', tasks: [task()] };
+  const backend = new ScriptBackend((spec) => {
+    if (spec.role === 'worker') {
+      writeFileSync(join(spec.cwd, 'src', 'feature.txt'), 'changed\n', 'utf8');
+      return workerResult('did it');
+    }
+    if (spec.role === 'reviewer') {
+      // reviewer 先提问再自报 approved：headless 下问题不可能被真实回答。
+      return Promise.resolve(spec.requestUserInput({
+        backend: 'codex', role: 'reviewer', cwd: spec.cwd, taskId: spec.taskId,
+        questions: [{ id: 'q1', question: 'Which semantics apply?' }]
+      }).then(() => approvedReview()));
+    }
+    throw new Error(`unexpected role: ${spec.role}`);
+  });
+  try {
+    await createPlannedRun(db, config, manifest);
+    // headless 收集器只会上报问题并返回空答案（见 runOrchestrator 的 requestUserInput 缝）。
+    await runOrchestrator({
+      config, db, runId: 'run', backends: backendPool(backend),
+      requestUserInput: async () => ({})
+    });
+
+    const record = db.getTask('run', 'T001');
+    assert.equal(db.getRun('run').status, 'needs_attention');
+    assert.equal(record.status, 'blocked_on_contract');
+    assert.equal(record.phase, 'review');
+    assert.equal(record.commitSha, null);
+    const block = JSON.parse(record.contractBlockJson);
+    assert.equal(block.code, 'missing_requirement');
+    assert.match(block.message, /Which semantics apply\?/);
+    assert.equal(eventTypes(db, 'run').includes('TASK_APPROVED'), false);
+  } finally {
+    db.close();
+  }
+});
+
+test('orchestrator fails a task whose worker and reviewer resolve to the same backend', async () => {
+  const repoRoot = await repository();
+  // 创建时以 crossVendorReview=false 固化同后端快照；执行时强制开启 → 任务被拦下。
+  const creationConfig = { ...configFor(repoRoot), crossVendorReview: false, roles: {} };
+  const db = new StateDatabase(join(creationConfig.workspace.stateDir, 'state.sqlite'));
+  const manifest = { version: 1, title: 'Run', summary: 'test run', tasks: [task()] };
+  const backend = new ScriptBackend(() => {
+    throw new Error('no agent may run when cross-vendor review is violated');
+  });
+  try {
+    await createPlannedRun(db, creationConfig, manifest);
+    await runOrchestrator({ config: configFor(repoRoot), db, runId: 'run', backends: backendPool(backend) });
+
+    const record = db.getTask('run', 'T001');
+    assert.equal(db.getRun('run').status, 'needs_attention');
+    assert.equal(record.status, 'failed');
+    assert.equal(record.phase, 'cross-vendor-check');
+    assert.match(record.lastError, /Cross-vendor review is enforced/);
+    assert.equal(backend.specs.length, 0);
+    assert.equal(eventTypes(db, 'run').includes('CROSS_VENDOR_REVIEW_VIOLATED'), true);
+  } finally {
+    db.close();
+  }
+});
+
+test('orchestrator allows an explicit crossVendorReview=false same-backend pairing', async () => {
+  const repoRoot = await repository();
+  const config = { ...configFor(repoRoot), crossVendorReview: false, roles: {} };
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
+  const manifest = { version: 1, title: 'Run', summary: 'test run', tasks: [task()] };
+  const backend = new ScriptBackend((spec) => {
+    if (spec.role === 'worker') {
+      writeFileSync(join(spec.cwd, 'src', 'feature.txt'), 'changed\n', 'utf8');
+      return workerResult('did it');
+    }
+    if (spec.role === 'reviewer') return approvedReview();
+    throw new Error(`unexpected role: ${spec.role}`);
+  });
+  try {
+    await createPlannedRun(db, config, manifest);
+    await runOrchestrator({ config, db, runId: 'run', backends: backendPool(backend) });
+
+    assert.equal(db.getRun('run').status, 'done');
+    assert.equal(db.getTask('run', 'T001').status, 'approved');
+  } finally {
+    db.close();
+  }
+});
+
+test('orchestrator reports a run without any tasks at the natural stop point', async () => {
+  const repoRoot = await repository();
+  const config = configFor(repoRoot);
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
+  const backend = new ScriptBackend(() => {
+    throw new Error('no agent may start for an empty run');
+  });
+  try {
+    await createPlannedRun(db, config, { version: 1, title: 'Run', summary: 'empty', tasks: [] });
+    await runOrchestrator({ config, db, runId: 'run', backends: backendPool(backend) });
+
+    assert.equal(db.getRun('run').status, 'needs_attention');
+    assert.match(db.getRun('run').error, /No runnable tasks remain/);
+    assert.equal(backend.specs.length, 0);
+  } finally {
+    db.close();
+  }
+});
+
+test('orchestrator reports a failed task without a stored error at the stop point', async () => {
+  const repoRoot = await repository();
+  const config = configFor(repoRoot);
+  const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
+  const backend = new ScriptBackend(() => {
+    throw new Error('no agent may start');
+  });
+  try {
+    await createPlannedRun(db, config, { version: 1, title: 'Run', summary: 'failed', tasks: [task()] });
+    db.updateTask('run', 'T001', { status: 'failed', lastError: null, finishedAt: new Date().toISOString() });
+    await runOrchestrator({ config, db, runId: 'run', backends: backendPool(backend) });
+
+    assert.equal(db.getRun('run').status, 'needs_attention');
+    assert.match(db.getRun('run').error, /failed: T001: failed/);
+    assert.equal(backend.specs.length, 0);
   } finally {
     db.close();
   }

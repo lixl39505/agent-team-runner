@@ -19,5 +19,11 @@ export function killProcessTree(child: ChildProcess, signal: 'SIGTERM' | 'SIGKIL
     }
     return;
   }
-  process.kill(-pid, signal);
+  // 子进程不再以 detached 启动（避免 CLI 被杀后 serve/app-server 残留为孤儿会话首，
+  // 违反「run 生命周期等于 CLI 进程生命周期」），多数情况下没有独立进程组可杀。
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    try { child.kill(signal); } catch { /* already exited */ }
+  }
 }

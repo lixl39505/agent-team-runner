@@ -92,6 +92,9 @@ export class ApprovalCollector {
       reason: 'Outer interaction is unavailable in headless mode; proceed from the contract guidance.',
       questions: request.questions.map((question) => ({ id: question.id, question: question.question }))
     });
+    // 返回空答案并不代表放行：编排器会对发生过提问的任务尝试强制
+    // blocked_on_contract（见 orchestrator.trackUserInput/blockOnUnansweredQuestions），
+    // 问题经 pending.json（exit 10）上报，由外层以契约修订作答。
     return {};
   };
 

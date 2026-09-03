@@ -1,5 +1,5 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { TaskSpec } from './types.js';
 
@@ -15,9 +15,16 @@ export function ensureDir(path: string): void {
   mkdirSync(path, { recursive: true });
 }
 
-export function writeJson(path: string, value: unknown): void {
+/** 原子写：先写同目录临时文件，再 rename 覆盖，中断不会留下半截内容。 */
+export function writeTextAtomic(path: string, content: string): void {
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  const tmp = join(dirname(path), `.${basename(path)}.tmp-${process.pid}`);
+  writeFileSync(tmp, content, 'utf8');
+  renameSync(tmp, path);
+}
+
+export function writeJson(path: string, value: unknown): void {
+  writeTextAtomic(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 export function readJson<T>(path: string): T {

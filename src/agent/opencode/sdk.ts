@@ -333,8 +333,9 @@ export class OpenCodeBackend implements AgentBackend {
           permission: compileOpenCodeBasePermission()
         })
       },
-      stdio: ['ignore', 'pipe', 'pipe'],
-      detached: this.platform !== 'win32'
+      stdio: ['ignore', 'pipe', 'pipe']
+      // 不用 detached：子进程跟随 CLI 的进程组/会话，终端挂断或 CLI 被杀时
+      // serve 不会被遗留为孤儿（run 生命周期等于 CLI 进程生命周期）。
     });
     this.serverChild = child;
     const url = await new Promise<string>((resolve, reject) => {

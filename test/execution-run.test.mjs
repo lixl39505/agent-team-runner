@@ -32,6 +32,9 @@ function configFor(repoRoot, overrides = {}) {
       ...workspace
     },
     verification: { ...DEFAULT_CONFIG.verification, ...verification },
+    // 跨厂商强制验收：默认 reviewer 落在另一个后端。
+    agents: { ...DEFAULT_CONFIG.agents, 'default-codex': { backend: 'codex' } },
+    roles: { reviewer: 'default-codex' },
     ...rest
   };
 }

@@ -11,7 +11,8 @@ const BACKEND_POLICY_KEYS = [
   'concurrency',
   'staleAfterMs',
   'taskTimeoutMs',
-  'retry'
+  'retry',
+  'crossVendorReview'
 ] as const;
 
 function isJsonObject(value: JsonValue | undefined): value is JsonObject {
@@ -150,6 +151,12 @@ export function runnerConfigFromProjectPolicy(
   if (backendPolicy.concurrency !== undefined) config.concurrency = positiveInteger(backendPolicy.concurrency, 'backendPolicy.concurrency');
   if (backendPolicy.staleAfterMs !== undefined) config.staleAfterMs = positiveInteger(backendPolicy.staleAfterMs, 'backendPolicy.staleAfterMs');
   if (backendPolicy.taskTimeoutMs !== undefined) config.taskTimeoutMs = positiveInteger(backendPolicy.taskTimeoutMs, 'backendPolicy.taskTimeoutMs');
+  if (backendPolicy.crossVendorReview !== undefined) {
+    if (typeof backendPolicy.crossVendorReview !== 'boolean') {
+      throw new Error('backendPolicy.crossVendorReview must be a boolean');
+    }
+    config.crossVendorReview = backendPolicy.crossVendorReview;
+  }
   if (backendPolicy.retry !== undefined) {
     const retry = object(backendPolicy.retry, 'backendPolicy.retry');
     allowedKeys(retry, ['maxWorkerAttempts', 'maxReviewCycles'], 'backendPolicy.retry');

@@ -60,6 +60,8 @@ function mapTask(row: Record<string, unknown>): TaskRecord {
     attempts: Number(row.attempts),
     reviewCycles: Number(row.review_cycles),
     lastError: row.last_error === null ? null : String(row.last_error),
+    contractBlockJson: row.contract_block_json === null || row.contract_block_json === undefined
+      ? null : String(row.contract_block_json),
     reviewJson: row.review_json === null ? null : String(row.review_json),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
@@ -165,6 +167,7 @@ export class StateDatabase {
         attempts INTEGER NOT NULL DEFAULT 0,
         review_cycles INTEGER NOT NULL DEFAULT 0,
         last_error TEXT,
+        contract_block_json TEXT,
         review_json TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -219,6 +222,7 @@ export class StateDatabase {
     this.addColumnIfMissing('runs', 'execution_contract_json', 'TEXT');
     this.addColumnIfMissing('runs', 'contract_revision', 'INTEGER NOT NULL DEFAULT 0');
     this.addColumnIfMissing('tasks', 'resolved_skills_json', "TEXT NOT NULL DEFAULT '[]'");
+    this.addColumnIfMissing('tasks', 'contract_block_json', 'TEXT');
   }
 
   private addColumnIfMissing(table: string, column: string, type: string): void {
@@ -391,6 +395,7 @@ export class StateDatabase {
     attempts: number;
     reviewCycles: number;
     lastError: string | null;
+    contractBlockJson: string | null;
     reviewJson: string | null;
     finishedAt: string | null;
   }>): void {
@@ -406,6 +411,7 @@ export class StateDatabase {
       attempts: 'attempts',
       reviewCycles: 'review_cycles',
       lastError: 'last_error',
+      contractBlockJson: 'contract_block_json',
       reviewJson: 'review_json',
       finishedAt: 'finished_at'
     };

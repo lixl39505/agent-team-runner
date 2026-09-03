@@ -12,7 +12,7 @@ import { parseRunCommandArgs, executeRunCommand } from './core/run-execute.js';
 import { cleanRunArtifacts } from './core/run-clean.js';
 import { DEFAULT_AGENT_LOG_BYTES, DEFAULT_AGENT_LOG_LINES, readAgentLog } from './core/agent-log.js';
 import { renderMachineSummary, renderRunSummary } from './core/run-exit.js';
-import { resolveAgentTeamHome, type AgentTeamHome } from './core/home.js';
+import { assertHomeOutsideProcessRepo, resolveAgentTeamHome, type AgentTeamHome } from './core/home.js';
 
 let argv: string[] = [];
 let command: string | undefined;
@@ -109,6 +109,8 @@ async function main(): Promise<void> {
 
   if (command === 'status') {
     const home = homeOption() ?? resolveAgentTeamHome();
+    // 查询/清理命令同样会创建 state.sqlite：home 落在 cwd 所在项目仓库内时拒绝。
+    await assertHomeOutsideProcessRepo(home);
     const runId = argv.shift();
     if (argv.length > 0) throw new Error(`Unknown status argument: ${argv[0]}`);
     withStateDatabase(home, (db) => {
@@ -121,6 +123,7 @@ async function main(): Promise<void> {
 
   if (command === 'log') {
     const home = homeOption() ?? resolveAgentTeamHome();
+    await assertHomeOutsideProcessRepo(home);
     const runId = argv.shift();
     const agentId = argv.shift();
     if (!runId || !agentId) throw new Error('Usage: agent-team log RUN_ID AGENT_ID [--lines N]');
@@ -135,6 +138,7 @@ async function main(): Promise<void> {
 
   if (command === 'clean') {
     const home = homeOption() ?? resolveAgentTeamHome();
+    await assertHomeOutsideProcessRepo(home);
     const runId = argv.shift();
     if (!runId) throw new Error('Usage: agent-team clean RUN_ID');
     if (argv.length > 0) throw new Error(`Unknown clean argument: ${argv[0]}`);

@@ -79,7 +79,7 @@ test('OpenCode server launch handles output, exit, error, and timeout without a 
   assert.deepEqual(calls[0].slice(0, 2), [
     'fake-opencode', ['serve', '--hostname=localhost', '--port=4567']
   ]);
-  assert.equal(calls[0][2].detached, false);
+  assert.equal(calls[0][2].detached, undefined); // 不再以 detached 启动
   assert.equal(listeningChild.stdout.encoding, 'utf8');
   assert.equal(listeningChild.stderr.encoding, 'utf8');
 

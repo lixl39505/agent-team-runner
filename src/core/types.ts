@@ -71,6 +71,11 @@ export interface RunnerConfig {
   version: 3;
   /** 缺省 agent（agents 注册表名），未配置的角色回退到它 */
   defaultAgent: string;
+  /**
+   * 跨厂商强制验收：reviewer 的后端必须与 worker 不同（backendPolicy.crossVendorReview
+   * 可显式置 false 降级）。这是 Runner 保留的核心差异化能力，默认强制。
+   */
+  crossVendorReview: boolean;
   concurrency: number;
   staleAfterMs: number;
   taskTimeoutMs: number;
@@ -101,7 +106,6 @@ export interface TaskSpec {
   externalId?: string;
   title: string;
   description: string;
-  role?: string;
   /** agents 注册表名；缺省继承 worker 角色。 */
   agent?: string;
   dependsOn: string[];
@@ -279,6 +283,8 @@ export interface TaskRecord {
   attempts: number;
   reviewCycles: number;
   lastError: string | null;
+  /** blocked_on_contract 任务固化的结构化契约阻塞原因；其余任务为 null。 */
+  contractBlockJson: string | null;
   reviewJson: string | null;
   createdAt: string;
   updatedAt: string;

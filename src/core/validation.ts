@@ -67,7 +67,6 @@ export function validateTaskSpec(value: unknown, index: number, validAgentNames?
     if (!Array.isArray(value.implementationSkills)) throw new Error(`Task ${id}.implementationSkills must be an array`);
     result.implementationSkills = value.implementationSkills.map((skill, skillIndex) => validateSkillRequirement(skill, id, skillIndex));
   }
-  if (typeof value.role === 'string') result.role = value.role;
   if (typeof agent === 'string' && agent) result.agent = agent;
   if (typeof value.allowNoChanges === 'boolean') result.allowNoChanges = value.allowNoChanges;
   return result;
@@ -257,7 +256,7 @@ export function validateWorkerResult(value: unknown): WorkerResult {
   return { ...fields, status: status as 'completed' | 'blocked' | 'failed' };
 }
 
-function validateContractBlockReason(value: unknown): ContractBlockReason {
+export function validateContractBlockReason(value: unknown): ContractBlockReason {
   assertObject(value, 'contractBlock');
   const allowedKeys = new Set(['code', 'message', 'requestedContractChanges', 'affectedPaths']);
   if (Object.keys(value).some((key) => !allowedKeys.has(key))) throw new Error('contractBlock contains unknown fields');
@@ -384,7 +383,7 @@ export function assertExecutionContractFields(
   const tasks = Array.isArray(contract.tasks) ? contract.tasks : [];
   for (let index = 0; index < tasks.length; index += 1) {
     const taskInput = strictObjectFields(tasks[index], `${label}.tasks[${index}]`, [
-      'id', 'externalId', 'title', 'description', 'role', 'agent', 'dependsOn', 'allowedPaths', 'blockedPaths',
+      'id', 'externalId', 'title', 'description', 'agent', 'dependsOn', 'allowedPaths', 'blockedPaths',
       'acceptance', 'verificationCommands', 'implementationSkills', 'implementationGuidance', 'allowNoChanges'
     ]);
     if (Array.isArray(taskInput.implementationSkills)) {

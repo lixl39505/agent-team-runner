@@ -32,8 +32,7 @@ function basePolicy() {
   return {
     baseRef: 'HEAD',
     verificationAllowedCommandPrefixes: ['pnpm test'],
-    baselinePathPolicy: {},
-    agentProfileMapping: { defaultAgent: 'default-claude', agents: { 'default-claude': { backend: 'claude' } }, roles: {} },
+    agentProfileMapping: { defaultAgent: 'default-claude', agents: { 'default-claude': { backend: 'claude' }, 'default-codex': { backend: 'codex' } }, roles: { reviewer: 'default-codex' } },
     backendPolicy: {}
   };
 }
@@ -148,6 +147,8 @@ test('parseProjectPolicyInput validates every field and value shape', () => {
   assert.throws(() => parseProjectPolicyInput({ policy: 'x' }), /policy must be an object/);
   assert.throws(() => parseProjectPolicyInput({ policy: [] }), /policy must be an object/);
   assert.throws(() => parseProjectPolicyInput({ policy: { ...basePolicy(), nope: 1 } }), /unknown field/);
+  // baselinePathPolicy 从未参与路径策略判断，已从策略面删除：传入即拒绝。
+  assert.throws(() => parseProjectPolicyInput({ policy: { ...basePolicy(), baselinePathPolicy: {} } }), /unknown field: baselinePathPolicy/);
   assert.throws(() => parseProjectPolicyInput({ policy: { ...basePolicy(), baseRef: 7 } }), /baseRef must be a non-empty string/);
   assert.throws(() => parseProjectPolicyInput({ policy: { ...basePolicy(), baseRef: '' } }), /baseRef must be a non-empty string/);
   assert.throws(() => parseProjectPolicyInput({ policy: { ...basePolicy(), verificationAllowedCommandPrefixes: ['pnpm test', 7] } }), /must be an array of strings/);
@@ -155,15 +156,19 @@ test('parseProjectPolicyInput validates every field and value shape', () => {
     policy: {
       baseRef: 'main',
       verificationAllowedCommandPrefixes: ['pnpm test'],
-      baselinePathPolicy: { allowed: true, nested: [1, 'two', null, { deep: 0.5 }] },
-      agentProfileMapping: 'flat',
-      backendPolicy: { concurrency: 4 }
+      agentProfileMapping: { defaultAgent: 'a', agents: { a: { backend: 'claude' } }, roles: {} },
+      backendPolicy: { concurrency: 4, crossVendorReview: false }
     }
   });
   assert.equal(parsed.baseRef, 'main');
-  assert.equal(parsed.baselinePathPolicy.allowed, true);
-  assert.throws(() => parseProjectPolicyInput({ policy: { ...basePolicy(), baselinePathPolicy: undefined } }), /must be a JSON value/);
-  assert.throws(() => parseProjectPolicyInput({ policy: { ...basePolicy(), baselinePathPolicy: Number.NaN } }), /must be a JSON value/);
+  assert.deepEqual(parsed.backendPolicy, { concurrency: 4, crossVendorReview: false });
+  assert.throws(() => parseProjectPolicyInput({ policy: { ...basePolicy(), agentProfileMapping: Number.NaN } }), /must be a JSON value/);
+  // undefined（或嵌套位置上的 undefined）不是合法 JSON 值。
+  assert.throws(() => parseProjectPolicyInput({ policy: { ...basePolicy(), backendPolicy: undefined } }), /must be a JSON value/);
+  assert.throws(
+    () => parseProjectPolicyInput({ policy: { ...basePolicy(), agentProfileMapping: { nested: [undefined] } } }),
+    /agentProfileMapping\.nested\[0\] must be a JSON value/
+  );
 });
 
 test('handoff read surfaces non-missing read errors', () => {
@@ -274,12 +279,25 @@ test('run enforces a per-run process lock and rebuilds crashed planning runs', a
   await git(repoRoot, ['commit', '-q', '-m', 'base']);
   const home = resolveAgentTeamHome({ env: { AGENT_TEAM_HOME: join(scratch('agent-team-cov-lock-home-'), 'home') } });
   const contractPath = join(repoRoot, 'contract.json');
-  writeFileSync(contractPath, JSON.stringify(contractFor(repoRoot, (c) => {
+  const contract = contractFor(repoRoot, (c) => {
     c.tasks[0].allowedPaths = ['**'];
-  })));
+  });
+  writeFileSync(contractPath, JSON.stringify(contract));
+
+  // 重放钉住 run 持久化的项目：先注册项目，run 记录引用其当前策略修订。
+  const registry0 = new ProjectRegistry(home.stateDb);
+  const registered = registry0.registerProject({
+    gitCommonDir: join(repoRoot, '.git'), repoRoot, displayName: 'lock',
+    gitIdentity: { root: repoRoot }, id: 'cov-project', policy: basePolicy()
+  });
+  registry0.close();
 
   const db0 = new StateDatabase(home.stateDb);
-  db0.createRun({ id: 'lock-run', repoRoot, goalFile: 'g', baseRef: 'HEAD', baseSha: 'base', adapter: 'external', projectId: 'cov-project', executionContractJson: JSON.stringify(contractFor(repoRoot)) });
+  db0.createRun({
+    id: 'lock-run', repoRoot, goalFile: 'g', baseRef: 'HEAD', baseSha: 'base', adapter: 'external',
+    projectId: 'cov-project', projectPolicyRevisionId: registered.currentPolicyRevisionId,
+    executionContractJson: JSON.stringify(contract)
+  });
   db0.close();
 
   // 同进程持有锁 → 拒绝启动。
@@ -325,7 +343,7 @@ test('run enforces a per-run process lock and rebuilds crashed planning runs', a
   assert.ok(!existsSync(join(home.runsDir, 'lock-run', 'lock')));
 });
 
-test('granting a question pending item is rejected in favour of contract revision', async () => {
+test('questions block the task for contract revision instead of an empty-answer pass-through', async () => {
   const repoRoot = scratch('agent-team-cov-question-repo-');
   writeFileSync(join(repoRoot, 'base.txt'), 'base\n', 'utf8');
   await git(repoRoot, ['init', '-q']);
@@ -337,6 +355,7 @@ test('granting a question pending item is rejected in favour of contract revisio
   const contractPath = join(repoRoot, 'contract.json');
   writeFileSync(contractPath, JSON.stringify(contractFor(repoRoot, (c) => { c.tasks[0].allowedPaths = ['**']; })));
 
+  let asked = false;
   const backend = {
     id: 'claude', capabilities: { maxTurns: true, resumeSession: true },
     async discover() { return { backend: 'claude', installed: true, authed: true }; },
@@ -349,7 +368,9 @@ test('granting a question pending item is rejected in favour of contract revisio
         completion: async () => {
           if (spec.role === 'worker') {
             writeFileSync(join(spec.cwd, 'base.txt'), 'changed\n', 'utf8');
-            if (spec.requestUserInput) {
+            if (!asked && spec.requestUserInput) {
+              asked = true;
+              // headless 收集器只会返回空答案：worker 自称完成也必须被 Runner 拦下。
               await spec.requestUserInput({
                 backend: 'claude', role: 'worker', cwd: spec.cwd, taskId: spec.taskId,
                 questions: [{ id: 'q1', question: 'Which shape?' }]
@@ -367,21 +388,42 @@ test('granting a question pending item is rejected in favour of contract revisio
   };
   const backends = { claude: backend, codex: backend, opencode: backend };
 
+  // 提问 = 结构化退出（exit 10 + pending.json），任务转为 blocked_on_contract，绝不空答案放行。
   const first = await executeRunCommand({ contractPath, home, backends, exitMode: 'quiescence' });
-  assert.equal(first.exitCode, 0);
+  assert.equal(first.exitCode, 10);
+  assert.equal(first.kind, 'needs_approval');
+  assert.equal(first.pending[0].kind, 'question');
+  assert.deepEqual(first.pending[0].questions, [{ id: 'q1', question: 'Which shape?' }]);
+  const db = new StateDatabase(home.stateDb);
+  try {
+    const task = db.getTask(first.runId, 'T001');
+    assert.equal(task.status, 'blocked_on_contract');
+    assert.equal(JSON.parse(task.contractBlockJson).code, 'missing_requirement');
+  } finally {
+    db.close();
+  }
+  const blockers = JSON.parse(readFileSync(join(home.runsDir, first.runId, 'blockers.json'), 'utf8')).blockers;
+  assert.equal(blockers[0].code, 'missing_requirement');
+  assert.deepEqual(blockers[0].requestedContractChanges.length > 0, true);
 
-  // 外层对已完成 run 的 question 授权被协议拒绝：回答通道是契约修订。
-  const pendingPath = join(home.runsDir, first.runId, 'pending.json');
-  writeFileSync(pendingPath, JSON.stringify({
-    runId: first.runId,
-    pending: [{ id: 'p1', kind: 'question', taskId: 'T001', agentId: 'worker:claude', subject: 'Which shape?', reason: 'r' }]
-  }), 'utf8');
+  // 回答通道是契约修订，不是 --grant：对 question 的授权被协议拒绝。
   const decisionsPath = join(repoRoot, 'decisions.json');
-  writeFileSync(decisionsPath, JSON.stringify({ p1: 'approve' }), 'utf8');
+  writeFileSync(decisionsPath, JSON.stringify({ [first.pending[0].id]: 'approve' }), 'utf8');
   await assert.rejects(
     executeRunCommand({ contractPath, runId: first.runId, grantPath: decisionsPath, home, backends }),
-    /Pending item p1 is a question/
+    /is a question/
   );
+
+  // 以修订契约（implementationGuidance）作答后重入：任务重跑并完成。
+  const revised = contractFor(repoRoot, (c) => {
+    c.tasks[0].allowedPaths = ['**'];
+    c.tasks[0].implementationGuidance = ['The shape is a circle.'];
+  });
+  const revisedPath = join(repoRoot, 'contract-v2.json');
+  writeFileSync(revisedPath, JSON.stringify(revised));
+  const second = await executeRunCommand({ contractPath: revisedPath, runId: first.runId, home, backends, exitMode: 'quiescence' });
+  assert.equal(second.exitCode, 0);
+  assert.equal(second.runStatus, 'done');
 });
 
 test('granting an already-allowlisted command leaves the policy untouched', async () => {
@@ -437,71 +479,6 @@ test('granting an already-allowlisted command leaves the policy untouched', asyn
   const registry = new ProjectRegistry(home.stateDb);
   const policy = registry.getProjectPolicy('cov-project');
   assert.ok(policy.verificationAllowedCommandPrefixes.includes('pnpm test'));
-});
-
-test('granting a question pending item is rejected in favour of contract revision', async () => {
-  const repoRoot = scratch('agent-team-cov-question-repo-');
-  writeFileSync(join(repoRoot, 'base.txt'), 'base\n', 'utf8');
-  await git(repoRoot, ['init', '-q']);
-  await git(repoRoot, ['config', 'user.email', 't@e.com']);
-  await git(repoRoot, ['config', 'user.name', 't']);
-  await git(repoRoot, ['add', '-A']);
-  await git(repoRoot, ['commit', '-q', '-m', 'base']);
-  const home = resolveAgentTeamHome({ env: { AGENT_TEAM_HOME: join(scratch('agent-team-cov-question-home-'), 'home') } });
-  const contractPath = join(repoRoot, 'contract.json');
-  writeFileSync(contractPath, JSON.stringify(contractFor(repoRoot, (c) => { c.tasks[0].allowedPaths = ['**']; })));
-
-  const backend = {
-    id: 'claude', capabilities: { maxTurns: true, resumeSession: true },
-    async discover() { return { backend: 'claude', installed: true, authed: true }; },
-    async listModels() { return []; },
-    async probe() { return { ok: true, latencyMs: 1 }; },
-    async openSession(spec) {
-      return {
-        async interrupt() {},
-        async close() {},
-        completion: async () => {
-          if (spec.role === 'worker') {
-            writeFileSync(join(spec.cwd, 'base.txt'), 'changed\n', 'utf8');
-            if (spec.requestUserInput) {
-              await spec.requestUserInput({
-                backend: 'claude', role: 'worker', cwd: spec.cwd, taskId: spec.taskId,
-                questions: [{ id: 'q1', question: 'Which shape?' }]
-              });
-            }
-            return { ok: true, output: { status: 'completed', summary: 'done anyway', testsRun: [], knownRisks: [] }, timedOut: false, stalled: false };
-          }
-          if (spec.role === 'reviewer') {
-            return { ok: true, output: { decision: 'approved', summary: 'ok', findings: [], requiredChanges: [] }, timedOut: false, stalled: false };
-          }
-          return { ok: true, output: { status: 'completed', summary: 'int', testsRun: [], knownRisks: [] }, timedOut: false, stalled: false };
-        }
-      };
-    }
-  };
-  const backends = { claude: backend, codex: backend, opencode: backend };
-
-  const first = await executeRunCommand({ contractPath, home, backends, exitMode: 'quiescence' });
-  if (first.exitCode !== 0) {
-    const ddbg = new StateDatabase(home.stateDb);
-    console.log('DBG', ddbg.getRun(first.runId).status, ddbg.getRun(first.runId).error);
-    for (const t of ddbg.listTasks(first.runId)) console.log('DBG', t.taskId, t.status, t.lastError);
-    ddbg.close();
-  }
-  assert.equal(first.exitCode, 0); // question 被记录但 worker 以契约指引完成
-  // 外层仍然可以对已完成的 run 提交 question 授权，但协议明确拒绝：
-  // 问题的回答通道是契约修订（implementationGuidance），不是 --grant。
-  const pendingPath = join(home.runsDir, first.runId, 'pending.json');
-  writeFileSync(pendingPath, JSON.stringify({
-    runId: first.runId,
-    pending: [{ id: 'p1', kind: 'question', taskId: 'T001', agentId: 'worker:claude', subject: 'Which shape?', reason: 'r' }]
-  }), 'utf8');
-  const decisionsPath = join(repoRoot, 'decisions.json');
-  writeFileSync(decisionsPath, JSON.stringify({ p1: 'approve' }), 'utf8');
-  await assert.rejects(
-    executeRunCommand({ contractPath, runId: first.runId, grantPath: decisionsPath, home, backends }),
-    /Pending item p1 is a question/
-  );
 });
 
 test('auto-registration rejects a contract id that collides with an existing project', async () => {

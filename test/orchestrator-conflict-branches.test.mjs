@@ -33,6 +33,9 @@ function configFor(repoRoot, overrides = {}) {
     status: { ...DEFAULT_CONFIG.status, ...status },
     integration: { ...DEFAULT_CONFIG.integration },
     verification: { ...DEFAULT_CONFIG.verification },
+    // 跨厂商强制验收：reviewer 落在另一个后端（测试池把所有 backend id 指到同一个假后端）。
+    agents: { ...DEFAULT_CONFIG.agents, 'default-codex': { backend: 'codex' } },
+    roles: { reviewer: 'default-codex' },
     ...rest
   };
 }
@@ -236,6 +239,34 @@ test('orchestrator aborts a cherry-pick when the conflict resolver backend fails
     await assert.rejects(
       runOrchestrator({ config: setup.config, db: setup.db, runId: 'run', backends: backendPool(setup.backend) }),
       /Integrator failed to resolve conflict for T002/
+    );
+
+    const run = setup.db.getRun('run');
+    assert.equal(run.status, 'failed');
+    assert.equal((await git(run.integrationWorktree, ['diff', '--name-only', '--diff-filter=U'])).stdout, '');
+    assert.equal((await git(run.integrationWorktree, ['status', '--porcelain'])).stdout, '');
+  } finally {
+    setup.db.close();
+  }
+});
+
+test('orchestrator aborts integration when the conflict resolver asks an unanswered question', async () => {
+  const setup = await createApprovedConflictRun(async (spec) => {
+    assert.equal(spec.role, 'integrator');
+    // headless 收集器只会上报问题并返回空答案；集成结果不可据此采纳。
+    await spec.requestUserInput({
+      backend: 'codex', role: 'integrator', cwd: spec.cwd, taskId: spec.taskId,
+      questions: [{ id: 'q1', question: 'Keep which side?' }]
+    }, undefined);
+    return integrationResult();
+  });
+  try {
+    await assert.rejects(
+      runOrchestrator({
+        config: setup.config, db: setup.db, runId: 'run', backends: backendPool(setup.backend),
+        requestUserInput: async () => ({})
+      }),
+      /Integrator questions await outer answers via contract revision: Keep which side\?/
     );
 
     const run = setup.db.getRun('run');

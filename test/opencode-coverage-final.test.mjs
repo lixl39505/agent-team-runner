@@ -367,6 +367,6 @@ test('OpenCode launches a non-detached Windows server and releases its reconnect
   await launch;
   backend.reconnectTimer = setTimeout(() => {}, 10_000);
   child.emit('exit', 0);
-  assert.equal(options.detached, false);
+  assert.equal(options.detached, undefined); // 不再以 detached 启动
   assert.equal(backend.reconnectTimer, null);
 });

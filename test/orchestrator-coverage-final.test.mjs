@@ -33,6 +33,9 @@ function configFor(repoRoot, overrides = {}) {
     status: { ...DEFAULT_CONFIG.status, ...status },
     integration: { ...DEFAULT_CONFIG.integration },
     verification: { ...DEFAULT_CONFIG.verification },
+    // 跨厂商强制验收：reviewer 落在另一个后端（测试池把所有 backend id 指到同一个假后端）。
+    agents: { ...DEFAULT_CONFIG.agents, 'default-codex': { backend: 'codex' } },
+    roles: { reviewer: 'default-codex' },
     ...rest
   };
 }

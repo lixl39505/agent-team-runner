@@ -1,7 +1,7 @@
 import { join } from 'node:path';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { StateDatabase } from './db.js';
-import { writeJson } from './files.js';
+import { writeJson, writeTextAtomic } from './files.js';
 
 export function readHandoff(runsDir: string, runId: string): unknown | undefined {
   try {
@@ -12,9 +12,20 @@ export function readHandoff(runsDir: string, runId: string): unknown | undefined
   }
 }
 
-export function writeHandoff(db: StateDatabase, runsDir: string, runId: string): void {
+/**
+ * 写 run 交接产物（handoff.json + handoff.md），两个文件都原子落盘。
+ * 默认只在 run 已 done 时写入（重放修复路径）；`pendingDone` 供集成阶段在
+ * 标记 done 之前调用——handoff 完整落盘先于 done 状态，崩溃不会留下
+ * 「done 却没有 handoff」的不可判定状态。
+ */
+export function writeHandoff(
+  db: StateDatabase,
+  runsDir: string,
+  runId: string,
+  options: { pendingDone?: boolean } = {}
+): void {
   const run = db.getRun(runId);
-  if (run.status !== 'done') return;
+  if (run.status !== 'done' && options.pendingDone !== true) return;
   const tasks = db.listTasks(runId);
   const handoff = {
     version: 1,
@@ -23,7 +34,7 @@ export function writeHandoff(db: StateDatabase, runsDir: string, runId: string):
       projectId: run.projectId,
       projectPolicyRevisionId: run.projectPolicyRevisionId,
       contractRevision: run.contractRevision,
-      status: run.status,
+      status: 'done',
       baseRef: run.baseRef,
       baseSha: run.baseSha,
       integrationBranch: run.integrationBranch,
@@ -45,7 +56,7 @@ export function writeHandoff(db: StateDatabase, runsDir: string, runId: string):
   const lines = [
     `# Run Handoff: ${runId}`,
     '',
-    `- Status: ${run.status}`,
+    '- Status: done',
     `- Integration branch: ${run.integrationBranch ?? 'none'}`,
     `- Integration commit: ${run.integrationCommit ?? 'none'}`,
     `- Contract revision: ${run.contractRevision}`,
@@ -53,6 +64,6 @@ export function writeHandoff(db: StateDatabase, runsDir: string, runId: string):
     '## Tasks',
     ...tasks.map((task) => `- ${task.taskId}: ${task.status}${task.commitSha ? ` (${task.commitSha})` : ''}`)
   ];
-  writeFileSync(join(runDir, 'handoff.md'), `${lines.join('\n')}\n`, 'utf8');
+  writeTextAtomic(join(runDir, 'handoff.md'), `${lines.join('\n')}\n`);
   db.addEvent(runId, null, 'RUN_HANDOFF_CREATED', { path: join(runDir, 'handoff.json') });
 }

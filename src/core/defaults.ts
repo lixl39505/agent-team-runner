@@ -7,6 +7,8 @@ import type { RunnerConfig } from './types.js';
 export const DEFAULT_CONFIG: RunnerConfig = {
   version: 3,
   defaultAgent: 'default-claude',
+  // 跨厂商强制验收默认开启：reviewer 必须与 worker 使用不同后端。
+  crossVendorReview: true,
   concurrency: 3,
   staleAfterMs: 10 * 60 * 1000,
   taskTimeoutMs: 2 * 60 * 60 * 1000,

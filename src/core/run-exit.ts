@@ -1,6 +1,8 @@
-import { basename, join, dirname } from 'node:path';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import type { RunRecord, TaskRecord } from './types.js';
+import { join } from 'node:path';
+import { readFileSync, renameSync } from 'node:fs';
+import type { ContractBlockReason, RunRecord, TaskRecord } from './types.js';
+import { writeJson } from './files.js';
+import { validateContractBlockReason } from './validation.js';
 
 export type RunExitKind = 'done' | 'needs_approval' | 'contract_blocked' | 'failed' | 'interrupted';
 
@@ -47,6 +49,10 @@ export interface ContractBlocker {
   title: string;
   attempts: number;
   reason: string;
+  /** 结构化契约阻塞（worker 上报的 contractBlock）；旧 run 或缺失时缺省。 */
+  code?: ContractBlockReason['code'];
+  requestedContractChanges?: string[];
+  affectedPaths?: string[];
 }
 
 export interface RunExitClassification {
@@ -62,6 +68,9 @@ export function classifyRunExit(input: {
 }): RunExitClassification {
   if (input.interrupted) return { code: 130, kind: 'interrupted' };
   if (input.run.status === 'done') return { code: 0, kind: 'done' };
+  // 提问优先于任务级契约阻塞：提问的回答通道同样是契约修订（implementationGuidance），
+  // 外层从 pending.json（exit 10）读取问题清单。
+  if (input.pending.some((item) => item.kind === 'question')) return { code: 10, kind: 'needs_approval' };
   if (input.tasks.some((task) => task.status === 'blocked_on_contract')) return { code: 11, kind: 'contract_blocked' };
   if (input.pending.length > 0) return { code: 10, kind: 'needs_approval' };
   return { code: 1, kind: 'failed' };
@@ -70,12 +79,30 @@ export function classifyRunExit(input: {
 export function contractBlockers(tasks: readonly TaskRecord[]): ContractBlocker[] {
   return tasks
     .filter((task) => task.status === 'blocked_on_contract')
-    .map((task) => ({
-      taskId: task.taskId,
-      title: task.title,
-      attempts: task.attempts,
-      reason: task.lastError ?? 'Worker requested a contract revision without a reason.'
-    }));
+    .map((task) => {
+      const block = parseStoredContractBlock(task.contractBlockJson);
+      return {
+        taskId: task.taskId,
+        title: task.title,
+        attempts: task.attempts,
+        reason: block?.message ?? task.lastError ?? 'Worker requested a contract revision without a reason.',
+        ...(block ? {
+          code: block.code,
+          requestedContractChanges: block.requestedContractChanges,
+          ...(block.affectedPaths !== undefined ? { affectedPaths: block.affectedPaths } : {})
+        } : {})
+      };
+    });
+}
+
+/** 解析任务上固化的 contractBlock：缺失或损坏时返回 undefined（回退纯文本 reason）。 */
+function parseStoredContractBlock(json: string | null): ContractBlockReason | undefined {
+  if (json === null) return undefined;
+  try {
+    return validateContractBlockReason(JSON.parse(json));
+  } catch {
+    return undefined;
+  }
 }
 
 export function readPendingFileSync(path: string): PendingFile | undefined {
@@ -85,7 +112,34 @@ export function readPendingFileSync(path: string): PendingFile | undefined {
 function isValidPendingFile(value: unknown): value is PendingFile {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const file = value as { runId?: unknown; pending?: unknown };
-  return typeof file.runId === 'string' && Array.isArray(file.pending);
+  return typeof file.runId === 'string' && Array.isArray(file.pending)
+    && file.pending.every(isValidPendingItem);
+}
+
+/** 逐条目深度校验：伪造/损坏的条目按整个文件不存在处理，不让 --grant 崩溃或错误沉淀。 */
+function isValidPendingItem(value: unknown): value is PendingItem {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  if (typeof item.id !== 'string' || item.id.length === 0) return false;
+  if (item.kind !== 'approval' && item.kind !== 'question') return false;
+  if (item.taskId !== null && typeof item.taskId !== 'string') return false;
+  if (typeof item.agentId !== 'string' || typeof item.subject !== 'string' || typeof item.reason !== 'string') return false;
+  if (item.tool !== undefined && typeof item.tool !== 'string') return false;
+  if (item.commands !== undefined && !isStringArray(item.commands)) return false;
+  if (item.questions !== undefined) {
+    if (!Array.isArray(item.questions)) return false;
+    for (const question of item.questions) {
+      if (!question || typeof question !== 'object' || Array.isArray(question)) return false;
+      const record = question as Record<string, unknown>;
+      if (typeof record.id !== 'string' || typeof record.question !== 'string') return false;
+    }
+  }
+  // input 是任意 JSON 值（文件本身已经过 JSON.parse），无需再校验形状。
+  return true;
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === 'string');
 }
 
 export function readGrantsFileSync(path: string): GrantedPermissionsFile | undefined {
@@ -121,22 +175,15 @@ function readRunJsonFileSync<T>(path: string, isValid: (value: unknown) => value
 
 /** 原子写：先写同目录临时文件，再 rename 覆盖，中断不会留下半截 JSON。 */
 export function writePendingFileSync(path: string, file: PendingFile): void {
-  writeJsonAtomically(path, file);
+  writeJson(path, file);
 }
 
 export function writeGrantsFileSync(path: string, file: GrantedPermissionsFile): void {
-  writeJsonAtomically(path, file);
+  writeJson(path, file);
 }
 
 export function writeBlockersFileSync(path: string, blockers: readonly ContractBlocker[]): void {
-  writeJsonAtomically(path, { blockers });
-}
-
-function writeJsonAtomically(path: string, value: unknown): void {
-  mkdirSync(dirname(path), { recursive: true });
-  const tmp = join(dirname(path), `.${basename(path)}.tmp-${process.pid}`);
-  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  renameSync(tmp, path);
+  writeJson(path, { blockers });
 }
 
 function quarantine(path: string): void {

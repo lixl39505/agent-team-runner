@@ -103,10 +103,25 @@ project-local `.agent-team` directory and no project-local configuration.
 ## Roles and skills
 
 The supported execution roles are `worker`, `reviewer`, and `integrator`.
+Cross-vendor acceptance is enforced: the reviewer must run on a different
+backend than the worker (the runner fails a run fast at creation and each task
+before execution otherwise). A project registered automatically gets
+`worker`/`integrator` on Claude and `reviewer` on Codex; set
+`backendPolicy.crossVendorReview` to `false` in the project policy to opt out,
+or configure `agentProfileMapping.roles.reviewer` with an agent on any other
+backend. Task-level `agent` selections cannot bypass the check — it applies to
+the bindings actually resolved for each task.
+
 Projects may declare local implementation skills under `<repoRoot>/.agents/skills`;
 required skills are resolved, snapshotted with a SHA-256 digest, and injected
 into the matching Worker, Reviewer, or Integrator prompt. There is no Lead role
 and no goal-file planning command.
+
+Agent questions are contract gaps too: a worker, reviewer, or integrator
+question is recorded in `pending.json` and blocks the task as
+`blocked_on_contract` (`missing_requirement`) — the answer channel is a contract
+revision (`implementationGuidance`), and the run exits `10` with the question
+list. `--grant` cannot answer questions.
 
 ## Development
 

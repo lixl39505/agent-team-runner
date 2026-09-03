@@ -15,7 +15,6 @@ function projectInput(overrides = {}) {
     policy: {
       baseRef: 'main',
       verificationAllowedCommandPrefixes: ['npm test'],
-      baselinePathPolicy: { allowed: ['src/**'] },
       agentProfileMapping: { worker: 'codex.gpt-5' },
       backendPolicy: { codex: { network: false } }
     },

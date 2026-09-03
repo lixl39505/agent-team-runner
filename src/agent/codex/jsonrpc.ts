@@ -57,8 +57,9 @@ export class JsonRpcConnection {
     this.child = spawn(command, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       env,
-      ...(cwd ? { cwd } : {}),
-      detached: process.platform !== 'win32'
+      ...(cwd ? { cwd } : {})
+      // 不用 detached：app-server 跟随 CLI 进程组，CLI 死亡/终端挂断时随之终止，
+      // 不会残留孤儿 server（run 生命周期等于 CLI 进程生命周期）。
     });
     this.child.stdout!.setEncoding('utf8');
     this.child.stdout!.on('data', (chunk: string) => this.receive(chunk));

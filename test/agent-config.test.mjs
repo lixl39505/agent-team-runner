@@ -90,7 +90,8 @@ test('task.agent resolves with its model (fixes the task.adapter model-drop bug)
 test('snapshot keeps runs hermetic and parses legacy v1 snapshots', () => {
   const config = runnerConfig({
     defaultAgent: 'default-agent',
-    agents: { 'default-agent': { backend: 'codex', model: 'gpt-5.6-terra' } }
+    agents: { 'default-agent': { backend: 'codex', model: 'gpt-5.6-terra' }, 'review-agent': { backend: 'claude' } },
+    roles: { reviewer: 'review-agent' }
   });
   const snapshot = snapshotAgents(config);
   assert.equal(snapshot.version, 2);

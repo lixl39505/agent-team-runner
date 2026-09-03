@@ -350,8 +350,8 @@ test('contract revision requires a materialized external contract', async () => 
       gitIdentity: { root: parent },
       id: 'bare-project',
       policy: {
-        baseRef: 'HEAD', verificationAllowedCommandPrefixes: ['pnpm test'], baselinePathPolicy: {},
-        agentProfileMapping: { defaultAgent: 'default-claude', agents: { 'default-claude': { backend: 'claude' } }, roles: {} },
+        baseRef: 'HEAD', verificationAllowedCommandPrefixes: ['pnpm test'],
+        agentProfileMapping: { defaultAgent: 'default-claude', agents: { 'default-claude': { backend: 'claude' }, 'default-codex': { backend: 'codex' } }, roles: { reviewer: 'default-codex' } },
         backendPolicy: {}
       }
     });
@@ -395,8 +395,7 @@ test('contract revision rejects protected changes and accepts a valid revision',
       policy: {
         baseRef: 'HEAD',
         verificationAllowedCommandPrefixes: ['pnpm test'],
-        baselinePathPolicy: {},
-        agentProfileMapping: { defaultAgent: 'default-claude', agents: { 'default-claude': { backend: 'claude' } }, roles: {} },
+        agentProfileMapping: { defaultAgent: 'default-claude', agents: { 'default-claude': { backend: 'claude' }, 'default-codex': { backend: 'codex' } }, roles: { reviewer: 'default-codex' } },
         backendPolicy: {}
       }
     });
@@ -484,8 +483,7 @@ async function revisionFixture(prefix) {
     policy: {
       baseRef: 'HEAD',
       verificationAllowedCommandPrefixes: ['pnpm test'],
-      baselinePathPolicy: {},
-      agentProfileMapping: { defaultAgent: 'default-claude', agents: { 'default-claude': { backend: 'claude' } }, roles: {} },
+      agentProfileMapping: { defaultAgent: 'default-claude', agents: { 'default-claude': { backend: 'claude' }, 'default-codex': { backend: 'codex' } }, roles: { reviewer: 'default-codex' } },
       backendPolicy: {}
     }
   });

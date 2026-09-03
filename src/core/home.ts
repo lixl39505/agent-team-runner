@@ -1,7 +1,8 @@
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { isWithinDirectory } from './files.js';
+import { git } from './git.js';
 
 export interface AgentTeamHome {
   root: string;
@@ -37,13 +38,42 @@ export function ensureAgentTeamHome(home: AgentTeamHome = resolveAgentTeamHome()
  * state.sqlite、runs/、worktrees/ 会全部写进项目目录，必须在创建任何目录之前拒绝。
  */
 export function assertHomeOutsideRepo(home: AgentTeamHome, repoRoot: string): void {
-  const root = resolve(home.root);
-  const repo = resolve(repoRoot);
-  if (isWithinDirectory(root, repo)) {
+  // 符号链接会让词法比较失真（如 macOS 的 /var → /private/var），且任一侧可能尚不存在、
+  // 无法 realpath：对两侧的「词法形式 + 规范形式」做全组合判断，任一命中即拒绝。
+  const rootVariants = pathVariants(home.root);
+  const repoVariants = pathVariants(repoRoot);
+  const inside = rootVariants.some((root) => repoVariants.some((repo) => isWithinDirectory(root, repo)));
+  if (inside) {
     throw new Error(
-      `Agent-team home ${root} is inside the project repository ${repo}; ` +
+      `Agent-team home ${home.root} is inside the project repository ${repoRoot}; ` +
       'runner state (state.sqlite, runs/, worktrees/) must never live inside the repository. ' +
       'Choose another AGENT_TEAM_HOME.'
     );
+  }
+}
+
+/** 路径的词法形式 + realpath 规范形式（路径不存在时只有词法形式）。 */
+function pathVariants(path: string): string[] {
+  const lexical = resolve(path);
+  try {
+    const canonical = realpathSync(lexical);
+    return canonical === lexical ? [lexical] : [lexical, canonical];
+  } catch {
+    return [lexical];
+  }
+}
+
+/**
+ * status/log/clean 不经过 run 路径的 contract repoRoot 防护，而它们同样会创建
+ * state.sqlite。以进程 cwd 所在仓库（工作树根 + git 公共目录，覆盖 linked worktree）
+ * 为界做同样的拒绝；cwd 不在任何 Git 仓库内时无需防护。
+ */
+export async function assertHomeOutsideProcessRepo(home: AgentTeamHome, cwd: string = process.cwd()): Promise<void> {
+  for (const args of [['rev-parse', '--show-toplevel'], ['rev-parse', '--git-common-dir']]) {
+    const result = await git(cwd, args, true);
+    const output = result.stdout.trim();
+    // 不在 Git 仓库内（code≠0、无输出）：没有需要防护的仓库边界。
+    if (result.code !== 0 || output === '') continue;
+    assertHomeOutsideRepo(home, resolve(cwd, output));
   }
 }

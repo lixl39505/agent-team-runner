@@ -1,7 +1,8 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import type {
   BackendId,
+  ContractBlockReason,
   IntegrationResult,
   ReviewResult,
   ResolvedSkill,
@@ -39,6 +40,8 @@ import {
   unstageAll
 } from './git.js';
 import { integrationPrompt, reviewFeedback, reviewerPrompt, workerPrompt } from './prompts.js';
+import { writeHandoff } from './handoff.js';
+import { writeTextAtomic } from './files.js';
 import { checkPaths } from './path-policy.js';
 import { verifyTaskWorktree } from './verifier.js';
 
@@ -123,11 +126,6 @@ export async function runOrchestrator(input: {
       if (interrupted) return { interrupted: true, signalInterrupted };
       const tasks = db.listTasks(runId);
       const approved = new Set(tasks.filter((task) => task.status === 'approved').map((task) => task.taskId));
-      const terminalProblem = tasks.find((task) => ['blocked', 'blocked_on_contract', 'failed'].includes(task.status));
-      if (terminalProblem) {
-        db.updateRun(runId, { status: 'needs_attention', error: `${terminalProblem.taskId}: ${terminalProblem.lastError ?? terminalProblem.status}` });
-        return { interrupted, signalInterrupted };
-      }
       if (tasks.length > 0 && tasks.every((task) => task.status === 'approved')) break;
 
       const slots = Math.max(0, config.concurrency - active.size);
@@ -155,14 +153,25 @@ export async function runOrchestrator(input: {
       }
 
       if (active.size === 0) {
-        const blockedByGraph = db.listTasks(runId).filter((task) => !['approved', 'failed', 'blocked', 'blocked_on_contract'].includes(task.status));
-        if (blockedByGraph.length > 0) {
-          db.updateRun(runId, { status: 'needs_attention', error: 'No runnable tasks remain; inspect dependency and task states.' });
-          return { interrupted, signalInterrupted };
-        }
-      } else {
-        await Promise.race(active.values());
+        // 自然停止点：没有在途任务也没有可调度任务。blocked/blocked_on_contract 在等待
+        // 外层输入（审批重放 / 契约修订），failed 及其依赖下游已无路可走；其余任务都是
+        // 依赖未满足（上游停在上述状态）。编排不在这里提前退出——eager 由防抖 abort、
+        // quiescence 跑到本点，保证独立任务在停止前被批量调度（审批批量收集）。
+        const waiting = tasks.filter((task) => ['blocked', 'blocked_on_contract'].includes(task.status));
+        const failed = tasks.find((task) => task.status === 'failed');
+        const details = [
+          ...(failed ? [`failed: ${failed.taskId}: ${failed.lastError ?? 'failed'}`] : []),
+          ...waiting.map((task) => `${task.taskId}: ${task.lastError ?? task.status}`)
+        ];
+        db.updateRun(runId, {
+          status: 'needs_attention',
+          error: details.length === 0
+            ? 'No runnable tasks remain; inspect dependency and task states.'
+            : `Waiting on outer input or a failed task — ${details.join('; ')}`
+        });
+        return { interrupted, signalInterrupted };
       }
+      await Promise.race(active.values());
     }
 
     if (interrupted) return { interrupted: true, signalInterrupted };
@@ -202,6 +211,51 @@ export async function runOrchestrator(input: {
   return { interrupted, signalInterrupted };
 }
 
+/** 本次任务尝试中已发出、未被真实回答的提问。 */
+interface AskedQuestion {
+  id: string;
+  question: string;
+}
+
+/**
+ * 包装 UserInputHandler：先记录问题再透传。headless 收集器不会给出真实回答，
+ * 发生过提问的任务尝试不允许静默完成——调用方据此强制 blocked_on_contract。
+ */
+function trackUserInput(handler: UserInputHandler | undefined, sink: AskedQuestion[]): UserInputHandler | undefined {
+  if (handler === undefined) return undefined;
+  return async (request, signal) => {
+    sink.push(...request.questions.map((question) => ({ id: question.id, question: question.question })));
+    return await handler(request, signal);
+  };
+}
+
+/** 未回答的提问 = 契约缺口（missing_requirement）：唯一出路是外层以修订契约作答。 */
+function blockOnUnansweredQuestions(input: {
+  db: StateDatabase;
+  runId: string;
+  taskId: string;
+  phase: string;
+  questions: AskedQuestion[];
+  summary: string;
+  affectedPaths: readonly string[];
+}): void {
+  const contractBlock: ContractBlockReason = {
+    code: 'missing_requirement',
+    message: `Unanswered agent questions await outer answers via contract revision: ${input.questions.map((question) => question.question).join(' | ')}`,
+    requestedContractChanges: ['Answer the questions listed in pending.json by revising implementationGuidance, then replay the run.'],
+    // 契约校验保证 allowedPaths 非空：受影响路径即任务的可写路径。
+    affectedPaths: [...input.affectedPaths]
+  };
+  input.db.updateTask(input.runId, input.taskId, {
+    status: 'blocked_on_contract', phase: input.phase,
+    lastError: contractBlock.message, contractBlockJson: JSON.stringify(contractBlock),
+    finishedAt: new Date().toISOString()
+  });
+  input.db.addEvent(input.runId, input.taskId, 'WORKER_BLOCKED_ON_CONTRACT', {
+    status: 'blocked_on_contract', summary: input.summary, contractBlock
+  });
+}
+
 async function executeTask(input: {
   config: RunnerConfig;
   db: StateDatabase;
@@ -219,6 +273,18 @@ async function executeTask(input: {
   const runDir = join(config.workspace.stateDir, 'runs', runId);
   // Worker：任务的 task.agent 优先（连带 model），否则用创建运行时固化的角色快照（回退当前 config）。
   const workerBinding = resolveTaskAgent(task, config, run.rolesJson);
+  // Reviewer 绑定提前解析：跨厂商校验发生在任何执行投入（worktree/会话）之前，
+  // 并且校验的是实际解析出的绑定——任务级 task.agent 无法绕开角色配置。
+  const reviewerBinding = resolveAgentWithSnapshot('reviewer', config, run.rolesJson);
+  if (config.crossVendorReview !== false && reviewerBinding.backend === workerBinding.backend) {
+    const error = 'Cross-vendor review is enforced: task ' + `${task.id} worker backend "${workerBinding.backend}" (${workerBinding.agent}) matches reviewer backend "${reviewerBinding.backend}" (${reviewerBinding.agent}); configure a reviewer on another backend or set backendPolicy.crossVendorReview=false.`;
+    db.updateTask(runId, task.id, { status: 'failed', phase: 'cross-vendor-check', lastError: error, finishedAt: new Date().toISOString() });
+    db.addEvent(runId, task.id, 'CROSS_VENDOR_REVIEW_VIOLATED', {
+      workerBackend: workerBinding.backend,
+      reviewerBackend: reviewerBinding.backend
+    });
+    return;
+  }
   const worktreeInfo = await ensureTaskWorktree({ config, db, runId, record, task, manifest: parseManifest(run.manifestJson) });
   record = db.getTask(runId, task.id);
   const attempts = record.attempts + 1;
@@ -254,6 +320,7 @@ async function executeTask(input: {
     }
   };
   const workerExecution = executionInfo(runId, `${task.id}-worker-${attempts}`, 'worker', workerBinding.backend, logPath, workerBinding.model, task.id);
+  const workerQuestions: AskedQuestion[] = [];
   const worker = await runTrackedAgent<WorkerResult>({
     db,
     execution: workerExecution,
@@ -270,7 +337,7 @@ async function executeTask(input: {
       ...(workerBinding.maxTurns !== undefined ? { maxTurns: workerBinding.maxTurns } : {}),
       access: 'workspace-write',
       requestApproval: input.requestApproval,
-      requestUserInput: input.requestUserInput,
+      requestUserInput: trackUserInput(input.requestUserInput, workerQuestions),
       timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs,
       onEvent
     },
@@ -281,6 +348,15 @@ async function executeTask(input: {
     return;
   }
   const workerResult = validateWorkerResult(worker.output);
+  // 提问优先于 worker 自报结果：只要本次尝试发生过提问，任务就不允许以任何
+  // 结构化结果「完成」——空答案放行会让 run 以 exit 0 收尾并清空 pending。
+  if (workerQuestions.length > 0) {
+    blockOnUnansweredQuestions({
+      db, runId, taskId: task.id, phase: 'worker',
+      questions: workerQuestions, summary: workerResult.summary, affectedPaths: task.allowedPaths
+    });
+    return;
+  }
   if (workerResult.status === 'blocked') {
     db.updateTask(runId, task.id, { status: 'blocked', phase: 'worker', lastError: workerResult.blockedReason ?? workerResult.summary, finishedAt: new Date().toISOString() });
     db.addEvent(runId, task.id, 'WORKER_BLOCKED', workerResult);
@@ -288,7 +364,10 @@ async function executeTask(input: {
   }
   if (workerResult.status === 'blocked_on_contract') {
     const finishedAt = new Date().toISOString();
-    db.updateTask(runId, task.id, { status: 'blocked_on_contract', phase: 'worker', lastError: workerResult.contractBlock!.message, finishedAt });
+    db.updateTask(runId, task.id, {
+      status: 'blocked_on_contract', phase: 'worker', lastError: workerResult.contractBlock!.message,
+      contractBlockJson: JSON.stringify(workerResult.contractBlock), finishedAt
+    });
     db.addEvent(runId, task.id, 'WORKER_BLOCKED_ON_CONTRACT', workerResult);
     return;
   }
@@ -316,8 +395,8 @@ async function executeTask(input: {
   const reviewStatusBefore = (await git(worktreeInfo.path, ['status', '--porcelain=v1', '-z'])).stdout;
   const candidateDiff = (await git(worktreeInfo.path, ['diff', '--cached', '--binary'])).stdout;
   // Reviewer 独立解析角色绑定（运行快照优先），不复用 Worker 的会话。
-  const reviewerBinding = resolveAgentWithSnapshot('reviewer', config, run.rolesJson);
   const reviewLogPath = join(runDir, 'logs', `${task.id}-review-${reviewCycle}.log`);
+  const reviewQuestions: AskedQuestion[] = [];
   const reviewRun = await runTrackedAgent<ReviewResult>({
     db,
     execution: executionInfo(runId, `${task.id}-reviewer-${reviewCycle}`, 'reviewer', reviewerBinding.backend, reviewLogPath, reviewerBinding.model, task.id),
@@ -341,7 +420,7 @@ async function executeTask(input: {
       ...(reviewerBinding.maxTurns !== undefined ? { maxTurns: reviewerBinding.maxTurns } : {}),
       access: 'read-only',
       requestApproval: input.requestApproval,
-      requestUserInput: input.requestUserInput,
+      requestUserInput: trackUserInput(input.requestUserInput, reviewQuestions),
       timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs
     },
     logPath: reviewLogPath,
@@ -361,6 +440,15 @@ async function executeTask(input: {
   }
   const review = validateReviewResult(reviewRun.output);
   db.updateTask(runId, task.id, { reviewCycles: reviewCycle, reviewJson: JSON.stringify(review) });
+  // Reviewer 的提问同样是契约缺口：批准必须以无未答提问为前提。
+  if (reviewQuestions.length > 0) {
+    await unstageAll(worktreeInfo.path);
+    blockOnUnansweredQuestions({
+      db, runId, taskId: task.id, phase: 'review',
+      questions: reviewQuestions, summary: review.summary, affectedPaths: task.allowedPaths
+    });
+    return;
+  }
   if (review.decision === 'changes_requested') {
     await unstageAll(worktreeInfo.path);
     if (reviewCycle >= config.retry.maxReviewCycles) {
@@ -522,6 +610,7 @@ async function integrateRun(input: {
     const integratorBinding = resolveAgentWithSnapshot('integrator', config, run.rolesJson);
     const integratorBackend = await getBackend(input.backends, integratorBinding);
     const conflictLogPath = join(runDir, 'logs', `integration-conflict-${task.id}.log`);
+    const integratorQuestions: AskedQuestion[] = [];
     const conflictResult = await runTrackedAgent<IntegrationResult>({
       db,
       execution: executionInfo(runId, `integrator-conflict-${task.id}`, 'integrator', integratorBinding.backend, conflictLogPath, integratorBinding.model, task.id),
@@ -537,7 +626,7 @@ async function integrateRun(input: {
         ...(integratorBinding.maxTurns !== undefined ? { maxTurns: integratorBinding.maxTurns } : {}),
         access: 'workspace-write',
         requestApproval: input.requestApproval,
-        requestUserInput: input.requestUserInput,
+        requestUserInput: trackUserInput(input.requestUserInput, integratorQuestions),
         timeoutMs: config.taskTimeoutMs, staleAfterMs: config.staleAfterMs
       },
       logPath: conflictLogPath,
@@ -549,6 +638,14 @@ async function integrateRun(input: {
       throw new Error(`Integrator failed to resolve conflict for ${task.id}`);
     }
     const conflictReport = validateIntegrationResult(conflictResult.output);
+    // 集成者提问未答：集成结果不可采纳，冲突保持中止状态留给重放。
+    if (integratorQuestions.length > 0) {
+      await abortCherryPick(worktree);
+      throw new Error(
+        'Integrator questions await outer answers via contract revision: ' +
+        `${integratorQuestions.map((question) => question.question).join(' | ')}`
+      );
+    }
     if (conflictReport.status !== 'completed') {
       await abortCherryPick(worktree);
       throw new Error(conflictReport.blockedReason ?? conflictReport.summary);
@@ -569,9 +666,13 @@ async function integrateRun(input: {
   }
 
   const integrationCommit = await currentHead(worktree);
-  db.updateRun(runId, { status: 'done', integrationCommit, error: null, finishedAt: new Date().toISOString() });
+  db.updateRun(runId, { integrationCommit });
+  // handoff 先于 done 落盘：崩溃只会留下「integrating 但 handoff 已完整」（重放重写），
+  // 不会留下「done 却没有 handoff」的不可机械判定状态。
+  writeHandoff(db, join(config.workspace.stateDir, 'runs'), runId, { pendingDone: true });
+  db.updateRun(runId, { status: 'done', error: null, finishedAt: new Date().toISOString() });
   db.addEvent(runId, null, 'INTEGRATION_COMPLETED', { branch, worktree, integrationCommit });
-  writeFileSync(join(runDir, 'summary.txt'), `Run ${runId} completed\nBranch: ${branch}\nCommit: ${integrationCommit}\n`, 'utf8');
+  writeTextAtomic(join(runDir, 'summary.txt'), `Run ${runId} completed\nBranch: ${branch}\nCommit: ${integrationCommit}\n`);
 }
 
 async function getBackend(

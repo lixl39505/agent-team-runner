@@ -21,7 +21,7 @@ const control = vi.hoisted(() => ({
   abort: async () => {},
   commit: async () => 'commit',
   git: async () => ({ stdout: '' }),
-  resolve: (role) => ({ agent: role, backend: 'claude' }),
+  resolve: (role) => ({ agent: role, backend: role === 'reviewer' ? 'codex' : 'claude' }),
   build: () => control.backends
 }));
 
@@ -71,7 +71,8 @@ class Database {
   constructor(tasks, manifest = tasks.map((task) => JSON.parse(task.specJson))) {
     this.tasks = new Map(tasks.map((task) => [task.taskId, task]));
     this.run = {
-      status: 'planned', baseSha: 'base', manifestJson: JSON.stringify({ version: 1, title: 'matrix', summary: 'matrix', tasks: manifest }), rolesJson: '{}'
+      status: 'planned', baseSha: 'base', manifestJson: JSON.stringify({ version: 1, title: 'matrix', summary: 'matrix', tasks: manifest }), rolesJson: '{}',
+      executionContractJson: null
     };
     this.events = [];
   }
@@ -120,7 +121,7 @@ function reset() {
   control.abort = async () => {};
   control.commit = async () => 'commit';
   control.git = async () => ({ stdout: '' });
-  control.resolve = (role) => ({ agent: role, backend: 'claude' });
+  control.resolve = (role) => ({ agent: role, backend: role === 'reviewer' ? 'codex' : 'claude' });
   control.build = () => control.backends;
 }
 
@@ -244,7 +245,7 @@ test('orchestrator covers interruption and otherwise unreachable scheduler guard
 test('orchestrator passes explicit max-turn bindings to workers and reviewers', async () => {
   reset();
   const bound = new Database([record(spec('T1'))]);
-  control.resolve = (role) => ({ agent: role, backend: 'claude', maxTurns: 3 });
+  control.resolve = (role) => ({ agent: role, backend: role === 'reviewer' ? 'codex' : 'claude', maxTurns: 3 });
   control.runAgent = async ({ spec: session }) => {
     if (session.role === 'worker') return { ok: true, output: { status: 'completed', summary: 'done' }, timedOut: false, stalled: false };
     return { ok: true, output: { decision: 'approved', summary: 'approved', findings: [], requiredChanges: [] }, timedOut: false, stalled: false };
@@ -317,7 +318,7 @@ test('orchestrator covers integration failures, resolver outcomes, and interrupt
   const blockedConflict = new Database([record(spec('T1'), { status: 'approved', commitSha: 'one' })]);
   control.cherryPick = async () => ({ code: 1, stderr: 'conflict' });
   control.conflicts = async () => ['src/file.ts'];
-  control.resolve = (role) => ({ agent: role, backend: 'claude', model: 'model', maxTurns: 3 });
+  control.resolve = (role) => ({ agent: role, backend: role === 'reviewer' ? 'codex' : 'claude', model: 'model', maxTurns: 3 });
   control.runAgent = async () => ({ ok: true, output: { status: 'blocked', summary: 'cannot resolve' }, timedOut: false, stalled: false });
   await assert.rejects(run(blockedConflict), /cannot resolve/);
 
