@@ -49,12 +49,18 @@ export function splitCommand(input: string, platform: NodeJS.Platform = process.
 export function assertAllowedCommand(command: string, prefixes: string[], platform: NodeJS.Platform = process.platform): void {
   const tokens = splitCommand(command, platform);
   assertNoCapabilityBearingArguments(tokens);
-  const normalized = tokens.join(' ');
-  const allowed = prefixes.some((prefix) => {
+  if (!isAllowlistedCommand(command, prefixes, platform)) {
+    throw new Error(`Verification command is not allowlisted: ${command}`);
+  }
+}
+
+/** 前缀令牌匹配：命令与任一 allowlist 前缀逐令牌一致即视为放行。 */
+export function isAllowlistedCommand(command: string, prefixes: readonly string[], platform: NodeJS.Platform = process.platform): boolean {
+  const tokens = splitCommand(command, platform);
+  return prefixes.some((prefix) => {
     const prefixTokens = splitCommand(prefix, platform);
     return prefixTokens.every((token, index) => tokens[index] === token);
   });
-  if (!allowed) throw new Error(`Verification command is not allowlisted: ${normalized}`);
 }
 
 /** Reject options that turn nominally read/test commands into write, exec, or policy-escalation primitives. */

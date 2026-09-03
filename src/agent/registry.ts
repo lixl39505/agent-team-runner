@@ -1,4 +1,3 @@
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createCredentialStore, type CredentialStore } from '../core/credentials.js';
 import type {
@@ -127,7 +126,8 @@ class ProfileAwareBackendPool implements BackendPool {
   }
 
   private createProfiled(binding: AgentBinding, profile: string): Promise<AgentBackend> {
-    const runtime = join(homedir(), '.agent-team-runner', 'runtimes', binding.backend, profile);
+    // 运行时目录归属 $AGENT_TEAM_HOME，不落在固定的用户家目录旁路。
+    const runtime = join(this.config.workspace.stateDir, 'runtimes', binding.backend, profile);
     if (binding.backend === 'codex') {
       // Codex profile support is native-login isolation only. Do not read or
       // inject an API secret until Codex provider configuration is supported.

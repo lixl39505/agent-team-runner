@@ -7,9 +7,7 @@ import { DEFAULT_CONFIG } from '../src/core/defaults.ts';
 import { agentList, backendCommand, isBackendId, isValidAgentName, parseInlineAgentSpec, validateAgents } from '../src/core/agent-config.ts';
 import { checkPaths, globMatch, patternMatches } from '../src/core/path-policy.ts';
 import { validateIntegrationResult, validateReviewResult, validateTaskGraph, validateWorkerResult } from '../src/core/validation.ts';
-import { ProbeCache } from '../src/core/probe-cache.ts';
 import { assertAllowedCommand, splitCommand } from '../src/core/shell.ts';
-import { bindingsForRun, checkAgentAvailability, probeAll } from '../src/core/preflight.ts';
 
 function tempDir(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -96,20 +94,6 @@ test('validation rejects malformed manifests and result payloads', () => {
   });
 });
 
-test('probe cache treats missing fields as an empty cache and ignores persistence failures', () => {
-  const dir = tempDir('agent-team-cache-');
-  const path = join(dir, 'cache.json');
-  writeFileSync(path, '{}');
-  assert.equal(new ProbeCache(path).get('x', 'y', undefined), null);
-
-  const unwritable = new ProbeCache('/dev/null/preflight-cache.json');
-  assert.doesNotThrow(() => unwritable.set('codex', 'model', undefined, { ok: false, error: 'no access', latencyMs: 0, checkedAt: Date.now() }));
-  assert.equal(unwritable.get('codex', 'model', undefined)?.error, 'no access');
-  const future = new ProbeCache(join(dir, 'future.json'), 1);
-  future.set('codex', 'model', undefined, { ok: true, latencyMs: 0, checkedAt: Date.now() + 60_000 });
-  assert.equal(future.get('codex', 'model', undefined)?.ok, true);
-  assert.equal(existsSync(join(dir, 'future.json')), true);
-});
 
 test('shell parsing rejects empty, dangling, and unsafe allowlist commands', () => {
   assert.throws(() => splitCommand('   '), /Command is empty/);
@@ -121,103 +105,6 @@ test('shell parsing rejects empty, dangling, and unsafe allowlist commands', () 
   assert.throws(() => assertAllowedCommand('make test --eval=x', ['make test']), /Unsafe command arguments/);
 });
 
-test('preflight reports discovery, authentication, and probe failures without real backends', async () => {
-  const stateDir = tempDir('agent-team-preflight-');
-  const claude = backend('claude', {
-    discover: async () => ({ backend: 'claude', installed: false, detail: 'not installed' })
-  });
-  const codex = backend('codex', {
-    discover: async () => ({ backend: 'codex', installed: true, version: 'test-1', authed: false }),
-    listModels: async () => [{ id: 'listed' }]
-  });
-  const result = await checkAgentAvailability({
-    config: config(stateDir),
-    backends: { claude, codex, opencode: backend('opencode') },
-    bindings: [
-      { agent: 'missing-cli', backend: 'claude', source: 'test' },
-      { agent: 'unauthenticated', backend: 'codex', model: 'listed', source: 'test' },
-      { agent: 'unregistered', backend: 'opencode', source: 'test' }
-    ]
-  });
-  assert.equal(result.ok, false);
-  assert.match(result.errors.join('\n'), /not available locally \(not installed\)/);
-  assert.match(result.errors.join('\n'), /not authenticated/);
-});
 
-test('preflight handles missing implementations, crashes, cache, forced probes, and probeAll failures', async () => {
-  const stateDir = tempDir('agent-team-preflight-');
-  let probes = 0;
-  const claude = backend('claude', {
-    listModels: async () => { throw new Error('catalog down'); },
-    probe: async () => { probes += 1; return { ok: true, latencyMs: 2 }; }
-  });
-  const binding = { agent: 'custom', backend: 'claude', model: 'custom', source: 'test' };
-  const input = { config: config(stateDir), backends: { claude, codex: backend('codex'), opencode: backend('opencode') }, bindings: [binding, { ...binding, agent: 'duplicate' }] };
-  const first = await checkAgentAvailability(input);
-  assert.equal(first.ok, true);
-  assert.equal(probes, 1);
-  assert.match(first.warnings.join('\n'), /model enumeration failed/);
-  const cached = await checkAgentAvailability(input);
-  assert.equal(cached.ok, true);
-  assert.equal(probes, 1);
-  await checkAgentAvailability({ ...input, forceProbe: true });
-  assert.equal(probes, 2);
 
-  const missing = await checkAgentAvailability({ ...input, bindings: [{ agent: 'none', backend: 'codex', model: 'listed', source: 'test' }], backends: { claude, codex: undefined, opencode: backend('opencode') } });
-  assert.match(missing.errors[0], /no implementation registered/);
-  const crashed = await checkAgentAvailability({ ...input, bindings: [{ agent: 'crash', backend: 'codex', source: 'test' }], backends: { claude, codex: backend('codex', { discover: async () => { throw new Error('boom'); } }), opencode: backend('opencode') } });
-  assert.match(crashed.errors[0], /discovery failed: boom/);
 
-  const all = await probeAll({
-    ...input,
-    bindings: [binding, { ...binding, agent: 'duplicate' }, { agent: 'crash', backend: 'codex', source: 'test' }, { agent: 'absent', backend: 'opencode', source: 'test' }],
-    backends: {
-      claude,
-      codex: backend('codex', { probe: async () => { throw new Error('probe boom'); } }),
-      opencode: undefined
-    }
-  });
-  assert.deepEqual(all.map(({ agent, ok, error }) => ({ agent, ok, error })), [
-    { agent: 'custom', ok: true, error: undefined },
-    { agent: 'crash', ok: false, error: 'probe boom' },
-    { agent: 'absent', ok: false, error: 'backend "opencode" has no implementation registered' }
-  ]);
-});
-
-test('bindingsForRun falls back from invalid snapshots and deduplicates task agents', () => {
-  const value = {
-    ...DEFAULT_CONFIG,
-    agents: {
-      main: { backend: 'claude' },
-      specialist: { backend: 'codex', model: 'm' }
-    },
-    defaultAgent: 'main'
-  };
-  const bindings = bindingsForRun(value, '{bad json', JSON.stringify({ tasks: [{ agent: 'specialist' }, { agent: 'specialist' }] }));
-  assert.equal(bindings.filter((binding) => binding.agent === 'specialist').length, 1);
-  assert.equal(bindings.filter((binding) => binding.agent === 'main').length, 3);
-});
-
-test('preflight resolves profiled backend-pool bindings with OpenCode isolation rules', async () => {
-  const requested = [];
-  const pool = {
-    get: async (binding) => {
-      requested.push(binding);
-      return backend(binding.backend, { listModels: async () => [{ id: binding.model }] });
-    },
-    dispose: () => {}
-  };
-  const bindings = [
-    { agent: 'codex-profile', backend: 'codex', model: 'm', authProfile: 'work', source: 'test' },
-    { agent: 'opencode-shared', backend: 'opencode', model: 'm', authProfile: 'work', source: 'test' },
-    { agent: 'opencode-isolated', backend: 'opencode', model: 'm', authProfile: 'work', authIsolation: 'isolated', source: 'test' }
-  ];
-  const input = { config: config(), backends: pool, bindings };
-
-  const availability = await checkAgentAvailability(input);
-  const probes = await probeAll(input);
-
-  assert.equal(availability.ok, true);
-  assert.equal(requested.length, 6);
-  assert.deepEqual(probes.map((result) => result.agent), bindings.map((binding) => binding.agent));
-});

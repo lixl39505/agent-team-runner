@@ -20,7 +20,6 @@ function contract(overrides = {}) {
   return {
     version: 1,
     project: { id: 'project-1', repoRoot: '/repo', baseRef: 'dev' },
-    target: { integrationBranch: 'agent-team/export' },
     provenance: { documents: [{ kind: 'ticket', locator: 'opaque:42', revision: 'abc123' }] },
     tasks: [task()],
     ...overrides
@@ -46,11 +45,10 @@ test('validates a complete external execution contract and task skill handoff', 
 });
 
 test('normalizes optional contract fields and validates named agents', () => {
-  const input = contract({ target: {}, tasks: [task({ agent: 'careful', implementationSkills: [] })] });
+  const input = contract({ tasks: [task({ agent: 'careful', implementationSkills: [] })] });
   delete input.provenance;
   assert.deepEqual(validateExecutionContract(input, ['careful']), {
     ...input,
-    target: {},
     tasks: [task({ agent: 'careful', implementationSkills: [] })]
   });
   assert.throws(() => validateExecutionContract(input, ['other']), /unknown agent/);

@@ -21,13 +21,6 @@ export const DEFAULT_CONFIG: RunnerConfig = {
     maxWorkerAttempts: 2,
     maxReviewCycles: 2
   },
-  status: {
-    pollIntervalMs: 2000
-  },
-  interactionAlert: {
-    background: '#7C3AED',
-    foreground: '#FFFFFF'
-  },
   backends: {
     claude: { nativeWindowsSandbox: 'require' },
     codex: { nativeWindowsSandbox: 'require' },

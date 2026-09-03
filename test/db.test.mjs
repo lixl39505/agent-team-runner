@@ -93,54 +93,6 @@ test('resetInterrupted marks active tasks for a clean recovered attempt', () => 
   db.close();
 });
 
-test('lists durable events as ordered JSON records with bounded cursor pagination', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agent-team-db-events-'));
-  const db = new StateDatabase(join(dir, 'state.sqlite'));
-  try {
-    db.createRun({ id: 'events', repoRoot: dir, goalFile: 'goal.md', baseRef: 'HEAD', baseSha: 'abc', adapter: 'claude' });
-    db.addEvent('events', 'T001', 'JSON_EVENT', { nested: [true, 2] });
-    db.addEvent('events', null, 'NULL_EVENT', null);
-    db.addEvent('events', null, 'MISSING_PAYLOAD');
-
-    const firstPage = db.listEvents('events', 0, 2);
-    assert.deepEqual(firstPage.map((event) => ({
-      runId: event.runId,
-      taskId: event.taskId,
-      eventType: event.eventType,
-      payload: event.payload
-    })), [
-      { runId: 'events', taskId: null, eventType: 'RUN_CREATED', payload: { id: 'events', repoRoot: dir, goalFile: 'goal.md', baseRef: 'HEAD', baseSha: 'abc', adapter: 'claude' } },
-      { runId: 'events', taskId: 'T001', eventType: 'JSON_EVENT', payload: { nested: [true, 2] } }
-    ]);
-    assert.ok(firstPage[0].id < firstPage[1].id);
-    assert.ok(Date.parse(firstPage[0].createdAt));
-    const secondPage = db.listEvents('events', firstPage[1].id, 1);
-    assert.deepEqual(secondPage, [{
-      id: firstPage[1].id + 1,
-      runId: 'events',
-      taskId: null,
-      eventType: 'NULL_EVENT',
-      payload: null,
-      createdAt: secondPage[0].createdAt
-    }]);
-    assert.deepEqual(db.listEvents('events', secondPage[0].id), [{
-      id: secondPage[0].id + 1,
-      runId: 'events',
-      taskId: null,
-      eventType: 'MISSING_PAYLOAD',
-      payload: null,
-      createdAt: db.listEvents('events', secondPage[0].id)[0].createdAt
-    }]);
-    assert.equal(db.listEvents('events')[0].id, firstPage[0].id);
-    assert.deepEqual(db.listEvents('events', 999), []);
-    assert.throws(() => db.listEvents('events', -1), /afterEventId/);
-    assert.throws(() => db.listEvents('events', 0.5), /afterEventId/);
-    assert.throws(() => db.listEvents('events', 0, 0), /limit/);
-    assert.throws(() => db.listEvents('events', 0, 1001), /limit/);
-  } finally {
-    db.close();
-  }
-});
 
 test('replaces task specs and reads legacy task rows without resolved skills', () => {
   const dir = mkdtempSync(join(tmpdir(), 'agent-team-db-task-spec-'));

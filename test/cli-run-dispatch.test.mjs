@@ -5,7 +5,8 @@ const control = vi.hoisted(() => ({
   runOptions: [],
   runOutcome: null,
   cleaned: [],
-  logs: []
+  logs: [],
+  failNext: false
 }));
 
 vi.mock('../src/core/run-execute.ts', async (importOriginal) => {
@@ -14,6 +15,7 @@ vi.mock('../src/core/run-execute.ts', async (importOriginal) => {
     ...actual,
     executeRunCommand: async (options) => {
       control.runOptions.push(options);
+      if (control.failNext) throw new Error('boom');
       if (control.runOutcome) return control.runOutcome;
       return {
         runId: 'r9', exitCode: 0, kind: 'done', runStatus: 'done', contractRevision: 1,
@@ -107,6 +109,22 @@ test('run dispatches parsed options and reports summaries with the exit code', a
   assert.match(output.join('\n'), /Run r1: needs_approval \(exit 10\)/);
   assert.match(output.join('\n'), /Contract blockers: T001/);
   expect(JSON.parse(output.at(-1))).toMatchObject({ runId: 'r1', kind: 'needs_approval', exit: 10 });
+});
+
+test('run reports a machine-readable terminal state when execution throws', async () => {
+  control.failNext = true;
+  const errors = [];
+  const errSpy = vi.spyOn(console, 'error').mockImplementation((value = '') => errors.push(String(value)));
+  const previousExitCode = process.exitCode;
+  try {
+    await runCli(['run', 'boom.json']);
+    assert.equal(process.exitCode, 1);
+    assert.match(errors.join('\n'), /"kind":"failed"/);
+  } finally {
+    process.exitCode = previousExitCode;
+    errSpy.mockRestore();
+    control.failNext = false;
+  }
 });
 
 test('run reports a completed run and accepts positional contract files', async () => {

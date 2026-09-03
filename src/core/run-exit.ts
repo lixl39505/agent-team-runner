@@ -1,5 +1,5 @@
-import { join } from 'node:path';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { basename, join, dirname } from 'node:path';
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import type { RunRecord, TaskRecord } from './types.js';
 
 export type RunExitKind = 'done' | 'needs_approval' | 'contract_blocked' | 'failed' | 'interrupted';
@@ -14,6 +14,8 @@ export interface PendingItem {
   reason: string;
   /** 审批对应的原始命令;grant approve 时按原样沉淀进项目 allowlist。 */
   commands?: string[];
+  /** question 明细(id + 问题文本),供外层通过契约修订(implementationGuidance)作答。 */
+  questions?: Array<{ id: string; question: string }>;
 }
 
 export interface PendingFile {
@@ -66,20 +68,45 @@ export function readPendingFileSync(path: string): PendingFile | undefined {
   try {
     parsed = JSON.parse(readFileSync(path, 'utf8'));
   } catch {
+    // 读取失败（缺失或损坏）：把损坏文件移到 .corrupt 备份，避免覆盖丢失证据。
+    quarantine(path);
     return undefined;
   }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
-  const file = parsed as { runId?: unknown; pending?: unknown };
-  if (typeof file.runId !== 'string' || !Array.isArray(file.pending)) return undefined;
-  return file as PendingFile;
+  if (!isValidPendingFile(parsed)) {
+    quarantine(path);
+    return undefined;
+  }
+  return parsed as PendingFile;
 }
 
+function isValidPendingFile(value: unknown): value is PendingFile {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const file = value as { runId?: unknown; pending?: unknown };
+  return typeof file.runId === 'string' && Array.isArray(file.pending);
+}
+
+/** 原子写：先写同目录临时文件，再 rename 覆盖，中断不会留下半截 JSON。 */
 export function writePendingFileSync(path: string, file: PendingFile): void {
-  writeJsonFileSync(path, file);
+  writeJsonAtomically(path, file);
 }
 
 export function writeBlockersFileSync(path: string, blockers: readonly ContractBlocker[]): void {
-  writeJsonFileSync(path, { blockers });
+  writeJsonAtomically(path, { blockers });
+}
+
+function writeJsonAtomically(path: string, value: unknown): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = join(dirname(path), `.${basename(path)}.tmp-${process.pid}`);
+  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  renameSync(tmp, path);
+}
+
+function quarantine(path: string): void {
+  try {
+    renameSync(path, `${path}.corrupt-${Date.now()}`);
+  } catch {
+    // 没有可隔离的文件（例如原本就不存在）时忽略。
+  }
 }
 
 export function renderRunSummary(input: {
@@ -142,7 +169,3 @@ export function handoffPath(runsDir: string, runId: string): string {
   return join(runsDir, runId, 'handoff.json');
 }
 
-function writeJsonFileSync(path: string, value: unknown): void {
-  mkdirSync(join(path, '..'), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-}

@@ -16,8 +16,7 @@ test('resolveAgentTeamHome prefers AGENT_TEAM_HOME and exposes all global paths'
     root,
     stateDb: join(root, 'state.sqlite'),
     runsDir: join(root, 'runs'),
-    worktreesDir: join(root, 'worktrees'),
-    preflightDir: join(root, 'preflight')
+    worktreesDir: join(root, 'worktrees')
   });
 });
 
@@ -41,7 +40,6 @@ test('ensureAgentTeamHome creates persistent directories only', () => {
     assert.equal(existsSync(home.root), true);
     assert.equal(existsSync(home.runsDir), true);
     assert.equal(existsSync(home.worktreesDir), true);
-    assert.equal(existsSync(home.preflightDir), true);
     assert.equal(existsSync(home.stateDb), false);
   } finally {
     rmSync(parent, { recursive: true, force: true });
@@ -58,7 +56,7 @@ test('default resolution uses os.homedir and default directory creation uses AGE
 
     process.env.AGENT_TEAM_HOME = join(parent, 'home');
     ensureAgentTeamHome();
-    assert.equal(existsSync(join(process.env.AGENT_TEAM_HOME, 'preflight')), true);
+    assert.equal(existsSync(join(process.env.AGENT_TEAM_HOME, 'worktrees')), true);
   } finally {
     if (previousHome === undefined) delete process.env.AGENT_TEAM_HOME;
     else process.env.AGENT_TEAM_HOME = previousHome;

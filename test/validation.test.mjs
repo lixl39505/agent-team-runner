@@ -16,7 +16,6 @@ const task = (id, dependsOn = []) => ({
 const contract = (tasks) => ({
   version: 1,
   project: { id: 'project', repoRoot: '/repo', baseRef: 'HEAD' },
-  target: {},
   tasks
 });
 

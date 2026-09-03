@@ -3,10 +3,7 @@ import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type {
   AgentExecutionRecord,
-  RunEventRecord,
   RunRecord,
-  RunDesiredState,
-  RunRuntimeState,
   RunStatus,
   ResolvedSkill,
   TaskRecord,
@@ -33,8 +30,8 @@ function mapRun(row: Record<string, unknown>): RunRecord {
     contractRevision: Number(row.contract_revision),
     adapter: String(row.adapter),
     status: String(row.status) as RunStatus,
-    runtimeState: String(row.runtime_state) as RunRuntimeState,
-    desiredState: String(row.desired_state) as RunDesiredState,
+
+
     manifestJson: row.manifest_json === null ? null : String(row.manifest_json),
     rolesJson: row.roles_json === null || row.roles_json === undefined ? null : String(row.roles_json),
     integrationBranch: row.integration_branch === null ? null : String(row.integration_branch),
@@ -80,16 +77,6 @@ function mapAgentExecution(row: Record<string, unknown>): AgentExecutionRecord {
   };
 }
 
-function mapEvent(row: Record<string, unknown>): RunEventRecord {
-  return {
-    id: Number(row.id),
-    runId: String(row.run_id),
-    taskId: row.task_id === null ? null : String(row.task_id),
-    eventType: String(row.event_type),
-    payload: row.payload_json === null ? null : JSON.parse(String(row.payload_json)),
-    createdAt: String(row.created_at)
-  };
-}
 
 export class StateDatabase {
   readonly db: DatabaseSync;
@@ -229,9 +216,9 @@ export class StateDatabase {
     this.db.prepare(`
       INSERT INTO runs (
         id, repo_root, goal_file, base_ref, base_sha, project_id, project_policy_revision_id,
-        execution_contract_json, contract_revision, adapter, status, runtime_state, desired_state,
+        execution_contract_json, contract_revision, adapter, status,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planning', 'recovering', 'running', ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planning', ?, ?)
     `).run(
       input.id,
       input.repoRoot,
@@ -291,8 +278,6 @@ export class StateDatabase {
 
   updateRun(id: string, patch: Partial<{
     status: RunStatus;
-    runtimeState: RunRuntimeState;
-    desiredState: RunDesiredState;
     manifestJson: string;
     rolesJson: string;
     projectId: string;
@@ -307,8 +292,6 @@ export class StateDatabase {
     if (entries.length === 0) return;
     const columnMap: Record<string, string> = {
       status: 'status',
-      runtimeState: 'runtime_state',
-      desiredState: 'desired_state',
       manifestJson: 'manifest_json',
       rolesJson: 'roles_json',
       projectId: 'project_id',
@@ -324,6 +307,22 @@ export class StateDatabase {
     sets.push('updated_at = ?');
     values.push(now(), id);
     this.db.prepare(`UPDATE runs SET ${sets.join(', ')} WHERE id = ?`).run(...values);
+  }
+
+  /** 删除整个 run（任务/事件/执行记录随 FK 级联），用于废弃残留的 planning run。 */
+  deleteRun(runId: string): void {
+    this.db.prepare('DELETE FROM runs WHERE id = ?').run(runId);
+  }
+
+  /** 最近一次该任务 worker 执行的会话 ID；重放时用于后端 session resume。 */
+  latestTaskSession(runId: string, taskId: string, role: string): string | undefined {
+    const row = this.db.prepare(`
+      SELECT session_id FROM agent_executions
+      WHERE run_id = ? AND task_id = ? AND role = ? AND session_id IS NOT NULL
+      ORDER BY started_at DESC, agent_id DESC
+      LIMIT 1
+    `).get(runId, taskId, role) as { session_id: string | null } | undefined;
+    return row?.session_id ?? undefined;
   }
 
   insertTask(runId: string, spec: TaskSpec, resolvedSkills: readonly ResolvedSkill[] = []): void {
@@ -401,20 +400,6 @@ export class StateDatabase {
     `).run(runId, taskId, eventType, payload === undefined ? null : JSON.stringify(payload), now());
   }
 
-  listEvents(runId: string, afterEventId = 0, limit = 100): RunEventRecord[] {
-    if (!Number.isSafeInteger(afterEventId) || afterEventId < 0) {
-      throw new Error('afterEventId must be a non-negative integer');
-    }
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
-      throw new Error('limit must be an integer between 1 and 1000');
-    }
-    return (this.db.prepare(`
-      SELECT * FROM events
-      WHERE run_id = ? AND id > ?
-      ORDER BY id ASC
-      LIMIT ?
-    `).all(runId, afterEventId, limit) as Record<string, unknown>[]).map(mapEvent);
-  }
 
   startAgentExecution(input: {
     runId: string; agentId: string; taskId?: string | undefined; role: string; backend: string; model?: string | undefined; logPath: string;

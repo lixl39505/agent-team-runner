@@ -114,7 +114,7 @@ test('orchestrator completes a conflict-free integration without starting an Int
   }
 });
 
-test('orchestrator records daemon aborts without setting the process exit code', async () => {
+test('orchestrator records outer-signal aborts without setting the process exit code', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
   const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
@@ -140,7 +140,7 @@ test('orchestrator records daemon aborts without setting the process exit code',
     assert.equal(interrupted, 1);
     assert.equal(process.exitCode, undefined);
     assert.equal(db.getRun('run').status, 'running');
-    assert.equal(db.getRun('run').error, 'Interrupted by daemon; run again to resume.');
+    assert.equal(db.getRun('run').error, 'Interrupted by an outer signal; run again to resume.');
     assert.equal(eventTypes(db, 'run').includes('RUN_INTERRUPTED'), true);
   } finally {
     process.exitCode = exitCode;
@@ -164,7 +164,7 @@ test('orchestrator handles an already aborted daemon signal without opening a se
 
     assert.equal(backend.specs.length, 0);
     assert.equal(process.exitCode, undefined);
-    assert.equal(db.getRun('run').error, 'Interrupted by daemon; run again to resume.');
+    assert.equal(db.getRun('run').error, 'Interrupted by an outer signal; run again to resume.');
     assert.equal(existsSync(join(config.workspace.stateDir, 'runs', 'run', 'summary.txt')), false);
   } finally {
     process.exitCode = exitCode;

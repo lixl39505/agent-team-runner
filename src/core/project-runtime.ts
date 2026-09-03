@@ -12,8 +12,6 @@ const BACKEND_POLICY_KEYS = [
   'staleAfterMs',
   'taskTimeoutMs',
   'retry',
-  'status',
-  'interactionAlert',
   'integration'
 ] as const;
 
@@ -91,8 +89,6 @@ function defaultConfig(): RunnerConfig {
     ...DEFAULT_CONFIG,
     workspace: { ...DEFAULT_CONFIG.workspace },
     retry: { ...DEFAULT_CONFIG.retry },
-    status: { ...DEFAULT_CONFIG.status },
-    interactionAlert: { ...DEFAULT_CONFIG.interactionAlert },
     backends: {
       claude: { ...DEFAULT_CONFIG.backends.claude },
       codex: { ...DEFAULT_CONFIG.backends.codex },
@@ -166,17 +162,6 @@ export function runnerConfigFromProjectPolicy(
     allowedKeys(retry, ['maxWorkerAttempts', 'maxReviewCycles'], 'backendPolicy.retry');
     if (retry.maxWorkerAttempts !== undefined) config.retry.maxWorkerAttempts = positiveInteger(retry.maxWorkerAttempts, 'backendPolicy.retry.maxWorkerAttempts');
     if (retry.maxReviewCycles !== undefined) config.retry.maxReviewCycles = positiveInteger(retry.maxReviewCycles, 'backendPolicy.retry.maxReviewCycles');
-  }
-  if (backendPolicy.status !== undefined) {
-    const status = object(backendPolicy.status, 'backendPolicy.status');
-    allowedKeys(status, ['pollIntervalMs'], 'backendPolicy.status');
-    if (status.pollIntervalMs !== undefined) config.status.pollIntervalMs = positiveInteger(status.pollIntervalMs, 'backendPolicy.status.pollIntervalMs');
-  }
-  if (backendPolicy.interactionAlert !== undefined) {
-    const alert = object(backendPolicy.interactionAlert, 'backendPolicy.interactionAlert');
-    allowedKeys(alert, ['background', 'foreground'], 'backendPolicy.interactionAlert');
-    if (alert.background !== undefined) config.interactionAlert.background = string(alert.background, 'backendPolicy.interactionAlert.background');
-    if (alert.foreground !== undefined) config.interactionAlert.foreground = string(alert.foreground, 'backendPolicy.interactionAlert.foreground');
   }
   if (backendPolicy.integration !== undefined) {
     const integration = object(backendPolicy.integration, 'backendPolicy.integration');

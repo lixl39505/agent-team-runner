@@ -44,7 +44,8 @@ export function syncSkills(repoRoot: string): string[] {
   return written;
 }
 
-export function writeTaskMarkdown(path: string, task: TaskSpec, baseSha: string): void {
+/** 渲染任务 Markdown(与 writeTaskMarkdown 落盘内容一致),供先暂存后提交使用。 */
+export function taskMarkdownContent(task: TaskSpec, baseSha: string): string {
   const list = (values: string[]) => values.length ? values.map((value) => `- ${value}`).join('\n') : '- 无';
   const body = `# ${task.id} ${task.title}
 
@@ -96,6 +97,10 @@ ${list(task.verificationCommands)}
 - [ ] 指定验证命令全部通过
 
 `;
+  return body;
+}
+
+export function writeTaskMarkdown(path: string, task: TaskSpec, baseSha: string): void {
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, body, 'utf8');
+  writeFileSync(path, taskMarkdownContent(task, baseSha));
 }

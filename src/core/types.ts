@@ -1,6 +1,4 @@
 export type BackendId = 'claude' | 'codex' | 'opencode';
-/** @deprecated 旧名，随旧 adapter 层在 Phase 4 一起删除 */
-export type AdapterName = BackendId;
 export type AgentRole = 'worker' | 'reviewer' | 'integrator';
 export type NativeWindowsSandboxPolicy = 'require' | 'allow-degraded';
 export type AuthIsolation = 'shared' | 'isolated';
@@ -15,9 +13,6 @@ export type RunStatus =
   | 'done'
   | 'cancelled'
   | 'failed';
-
-export type RunRuntimeState = 'active' | 'waiting_interaction' | 'paused' | 'cancelling' | 'recovering';
-export type RunDesiredState = 'running' | 'paused' | 'cancel_requested';
 
 export type TaskStatus =
   | 'pending'
@@ -90,13 +85,6 @@ export interface RunnerConfig {
   retry: {
     maxWorkerAttempts: number;
     maxReviewCycles: number;
-  };
-  status: {
-    pollIntervalMs: number;
-  };
-  interactionAlert: {
-    background: string;
-    foreground: string;
   };
   backends: Record<BackendId, BackendConfig>;
   /** agent 注册表：名 → {backend, model, ...} */
@@ -172,9 +160,6 @@ export interface ExecutionContract {
     id: string;
     repoRoot: string;
     baseRef: string;
-  };
-  target: {
-    integrationBranch?: string;
   };
   provenance?: {
     documents: ExecutionProvenanceDocument[];
@@ -271,8 +256,6 @@ export interface RunRecord {
   /** 运行来源后端（历史列名，保持 schema 不变）。 */
   adapter: string;
   status: RunStatus;
-  runtimeState: RunRuntimeState;
-  desiredState: RunDesiredState;
   manifestJson: string | null;
   /** 创建运行时固化的 AgentSnapshot，保证后续执行不受配置文件变化影响。 */
   rolesJson: string | null;

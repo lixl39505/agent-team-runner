@@ -1,12 +1,14 @@
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
+import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import type { AgentTeamHome } from './home.js';
 import { StateDatabase } from './db.js';
 import { agentList } from './agent-config.js';
-import type { ExecutionContract, RunManifest } from './types.js';
+import type { ExecutionContract, RunManifest, TaskSpec } from './types.js';
 import { validateExecutionContract } from './validation.js';
 import { assertExecutionContractFields } from './validation.js';
 import { assertAllowedCommand } from './shell.js';
-import { writeJson, writeTaskMarkdown } from './files.js';
+import { taskMarkdownContent } from './files.js';
+
 import { localSkillRoots, snapshotTaskSkills } from './skill-handoff.js';
 import { ProjectRegistry } from './project-registry.js';
 import { runnerConfigFromProjectPolicy } from './project-runtime.js';
@@ -61,6 +63,16 @@ export function applyContractRevision(input: ApplyContractRevisionInput): Contra
   }
   const blocked = currentTasks.filter((task) => task.status === 'blocked_on_contract').map((task) => task.taskId);
   if (blocked.length === 0) throw new Error(`Run ${runId} has no blocked_on_contract task`);
+  // 「可修改基线」按旧契约图计算：原 blocked 及其在旧图中的下游。
+  // 以新图计算会让既有独立任务借新增对 blocked 的依赖混入可改集合。
+  const oldTasks = (JSON.parse(run.executionContractJson) as ExecutionContract).tasks;
+  const modifiable = new Set(blocked);
+  while (true) {
+    const next = oldTasks.filter((task) => task.dependsOn.some((dependency) => modifiable.has(dependency)));
+    const additions = next.filter((task) => !modifiable.has(task.id));
+    if (additions.length === 0) break;
+    for (const task of additions) modifiable.add(task.id);
+  }
   const affected = new Set(blocked);
   while (true) {
     const next = contract.tasks.filter((task) => task.dependsOn.some((dependency) => affected.has(dependency)));
@@ -79,7 +91,7 @@ export function applyContractRevision(input: ApplyContractRevisionInput): Contra
       }
       continue;
     }
-    if (!affected.has(task.id) && current.specJson !== JSON.stringify(task)) {
+    if (!modifiable.has(task.id) && current.specJson !== JSON.stringify(task)) {
       throw new Error(`Contract revision can only change blocked tasks or their downstream tasks: ${task.id}`);
     }
   }
@@ -100,6 +112,22 @@ export function applyContractRevision(input: ApplyContractRevisionInput): Contra
       db.replaceTaskSpec(runId, task, revisedSkills.get(task.id));
     }
   }
+  // 先把全部文件写到临时位置，DB 提交成功后再原子就位：磁盘失败不会留下
+  // 「DB 已提交而 contract.json/任务 Markdown 仍是旧版」的半套状态。
+  const runDir = join(home.runsDir, runId);
+  const staged: Array<{ tmp: string; final: string }> = [];
+  const stage = (final: string, content: string): void => {
+    mkdirSync(dirname(final), { recursive: true });
+    const tmp = join(dirname(final), `.${basename(final)}.tmp-${process.pid}`);
+    writeFileSync(tmp, content, 'utf8');
+    staged.push({ tmp, final });
+  };
+  stage(join(runDir, 'contract.json'), `${JSON.stringify(contract, null, 2)}\n`);
+  for (const taskId of affected) {
+    const task = proposedById.get(taskId)!;
+    stage(join(runDir, 'tasks', `${task.id}.md`), taskMarkdownContent(task, run.baseSha));
+  }
+
   const revision = db.appendContractRevision(runId, JSON.stringify(contract));
   const manifest: RunManifest = {
     version: 1,
@@ -108,15 +136,11 @@ export function applyContractRevision(input: ApplyContractRevisionInput): Contra
     tasks: contract.tasks
   };
   db.updateRun(runId, {
-    status: 'queued', runtimeState: 'recovering', desiredState: 'running',
+    status: 'queued',
     error: null, finishedAt: null, manifestJson: JSON.stringify(manifest)
   });
-  const runDir = join(home.runsDir, runId);
-  writeJson(join(runDir, 'contract.json'), contract);
-  for (const taskId of affected) {
-    const task = proposedById.get(taskId)!;
-    writeTaskMarkdown(join(runDir, 'tasks', `${task.id}.md`), task, run.baseSha);
-  }
+  for (const { tmp, final } of staged) renameSync(tmp, final);
   db.addEvent(runId, null, 'EXECUTION_CONTRACT_UPDATED', { revision, affectedTaskIds: [...affected].sort() });
   return { runId, revision, affectedTaskIds: [...affected].sort() };
 }
+

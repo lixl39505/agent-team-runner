@@ -112,10 +112,8 @@ export function validateExecutionContract(value: unknown, validAgentNames?: stri
   const repoRoot = String(value.project.repoRoot ?? '');
   const baseRef = String(value.project.baseRef ?? '');
   if (!projectId || !repoRoot || !baseRef) throw new Error('Execution contract project requires id, repoRoot, and baseRef');
-  if (value.target !== undefined) assertObject(value.target, 'Execution contract target');
-  const integrationBranch = value.target === undefined ? undefined : value.target.integrationBranch;
-  if (integrationBranch !== undefined && (typeof integrationBranch !== 'string' || integrationBranch.length === 0)) {
-    throw new Error('Execution contract target.integrationBranch must be a non-empty string');
+  if (value.target !== undefined) {
+    throw new Error('Execution contract no longer accepts target.integrationBranch; the Runner derives agent-team/<runId>/integration');
   }
   if (!Array.isArray(value.tasks) || value.tasks.length === 0) {
     throw new Error('Execution contract must contain at least one task');
@@ -127,7 +125,6 @@ export function validateExecutionContract(value: unknown, validAgentNames?: stri
   return {
     version: 1,
     project: { id: projectId, repoRoot, baseRef },
-    target: integrationBranch === undefined ? {} : { integrationBranch },
     ...(provenance ? { provenance } : {}),
     tasks
   };
@@ -371,11 +368,11 @@ export function assertExecutionContractFields(
   value: unknown,
   label: string = 'execution.submit params.contract'
 ): void {
-  const contract = strictObjectFields(value, label, ['version', 'project', 'target', 'provenance', 'tasks']);
-  strictObjectFields(contract.project, `${label}.project`, ['id', 'repoRoot', 'baseRef']);
-  if (contract.target !== undefined) {
-    strictObjectFields(contract.target, `${label}.target`, ['integrationBranch']);
+  if (value && typeof value === 'object' && !Array.isArray(value) && 'target' in value) {
+    throw new Error(`${label}.target is no longer accepted; the Runner derives agent-team/<runId>/integration itself`);
   }
+  const contract = strictObjectFields(value, label, ['version', 'project', 'provenance', 'tasks']);
+  strictObjectFields(contract.project, `${label}.project`, ['id', 'repoRoot', 'baseRef']);
   if (contract.provenance !== undefined) {
     const provenance = strictObjectFields(contract.provenance, `${label}.provenance`, ['documents']);
     if (Array.isArray(provenance.documents)) {

@@ -44,14 +44,23 @@ const WORKER_COMPLETED = { status: 'completed', summary: 'did it', testsRun: [],
 const APPROVED_REVIEW = { decision: 'approved', summary: 'approved', findings: [], requiredChanges: [] };
 
 function scriptBackend(handler) {
-  return {
+  const specs = [];
+  let sessionCounter = 0;
+  const backend = {
     id: 'claude',
     capabilities: { maxTurns: true, resumeSession: true },
+    specs,
     async discover() { return { backend: this.id, installed: true, authed: true }; },
     async listModels() { return []; },
     async probe() { return { ok: true, latencyMs: 1 }; },
     async openSession(spec) {
+      sessionCounter += 1;
+      const sessionId = `sess-${sessionCounter}`;
+      spec.sessionId = sessionId;
+      specs.push(spec);
+      spec.onEvent?.({ type: 'session', sessionId });
       return {
+        sessionId,
         async interrupt() {},
         async close() {},
         completion: async () => {
@@ -63,6 +72,7 @@ function scriptBackend(handler) {
       };
     }
   };
+  return backend;
 }
 
 function triple(backend) {
@@ -155,13 +165,23 @@ test('run collects denied approvals, exits 10, and a grant sediments the allowli
 
   const decisionsPath = join(repoRoot, 'decisions.json');
   writeFileSync(decisionsPath, JSON.stringify({ p1: 'approve' }));
+  const replayBackend = scriptBackend(workerHandler({ approvals: 0 }));
   const second = await executeRunCommand({
     contractPath, runId: first.runId, grantPath: decisionsPath, home,
-    backends: pool(workerHandler({ approvals: 0 })), exitMode: 'quiescence'
+    backends: { claude: replayBackend, codex: replayBackend, opencode: replayBackend }, exitMode: 'quiescence'
   });
 
   assert.equal(second.exitCode, 0);
   assert.equal(second.kind, 'done');
+  // 重放时在途任务带上旧 session，验证 resume 接线。
+  const workerSpecs = replayBackend.specs.filter((spec) => spec.role === 'worker');
+  console.log('DBG workerSpecs:', JSON.stringify(workerSpecs.map((spec) => ({ resume: spec.resumeSessionId, task: spec.taskId, session: spec.sessionId }))));
+  const dbdbg = new StateDatabase(home.stateDb);
+  console.log('DBG exec:', JSON.stringify(dbdbg.db.prepare('SELECT agent_id, session_id FROM agent_executions WHERE run_id=?').all(first.runId)));
+  dbdbg.close();
+  assert.ok(workerSpecs.length >= 1);
+  assert.equal(workerSpecs.at(-1).resumeSessionId !== undefined, true);
+  assert.equal(workerSpecs.at(-1).taskId, 'T001');
   const registry = new ProjectRegistry(home.stateDb);
   const policy = registry.getProjectPolicy('e2e-project');
   assert.ok(policy.verificationAllowedCommandPrefixes.includes('pnpm add zod'));

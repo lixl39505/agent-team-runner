@@ -21,12 +21,8 @@ const project = {
 const home = {
   root: '/state/agent-team',
   stateDb: '/state/agent-team/state.sqlite',
-  daemonLock: '/state/agent-team/daemon.lock',
-  daemonInfo: '/state/agent-team/daemon.json',
-  socket: '/state/agent-team/daemon.sock',
   runsDir: '/state/agent-team/runs',
-  worktreesDir: '/state/agent-team/worktrees',
-  preflightDir: '/state/agent-team/preflight'
+  worktreesDir: '/state/agent-team/worktrees'
 };
 
 function policy(overrides = {}) {
@@ -63,8 +59,6 @@ test('converts a complete project policy into an isolated runner config', () => 
       staleAfterMs: 100,
       taskTimeoutMs: 200,
       retry: { maxWorkerAttempts: 4, maxReviewCycles: 5 },
-      status: { pollIntervalMs: 300 },
-      interactionAlert: { background: '#123456', foreground: '#abcdef' },
       integration: { allowedPaths: ['src/**'] }
     }
   });
@@ -84,9 +78,11 @@ test('converts a complete project policy into an isolated runner config', () => 
   assert.equal(config.backends.codex.nativeWindowsSandbox, 'allow-degraded');
   assert.deepEqual(config.backends.codex.extraArgs, ['--quiet']);
   assert.deepEqual(
-    [config.concurrency, config.staleAfterMs, config.taskTimeoutMs, config.retry, config.status, config.interactionAlert, config.integration],
-    [5, 100, 200, { maxWorkerAttempts: 4, maxReviewCycles: 5 }, { pollIntervalMs: 300 }, { background: '#123456', foreground: '#abcdef' }, { allowedPaths: ['src/**'] }]
+    [config.concurrency, config.staleAfterMs, config.taskTimeoutMs, config.retry, config.integration],
+    [5, 100, 200, { maxWorkerAttempts: 4, maxReviewCycles: 5 }, { allowedPaths: ['src/**'] }]
   );
+  assert.throws(() => runnerConfigFromProjectPolicy({ ...input, backendPolicy: { ...input.backendPolicy, status: { pollIntervalMs: 300 } } }, project, home), /status is not allowed/);
+  assert.throws(() => runnerConfigFromProjectPolicy({ ...input, backendPolicy: { ...input.backendPolicy, interactionAlert: {} } }, project, home), /interactionAlert is not allowed/);
 
   config.backends.codex.extraArgs.push('--mutated');
   config.verification.allowedCommandPrefixes.push('npm run lint');
@@ -99,7 +95,6 @@ test('uses DEFAULT_CONFIG for omitted backend policy values', () => {
   const config = runnerConfigFromProjectPolicy(policy(), project, home);
   assert.equal(config.concurrency, DEFAULT_CONFIG.concurrency);
   assert.deepEqual(config.retry, DEFAULT_CONFIG.retry);
-  assert.deepEqual(config.status, DEFAULT_CONFIG.status);
   assert.deepEqual(config.integration, DEFAULT_CONFIG.integration);
   assert.deepEqual(config.backends, DEFAULT_CONFIG.backends);
   assert.deepEqual(config.roles, {});
@@ -124,8 +119,6 @@ test('accepts every optional policy value and preserves defaults for empty neste
     backendPolicy: {
       backends: { claude: {} },
       retry: {},
-      status: {},
-      interactionAlert: {},
       integration: {}
     }
   }), project, home);
@@ -171,7 +164,7 @@ test('rejects invalid agents, backend ids, and non-positive numeric policy value
     { taskTimeoutMs: 1.5 },
     { retry: { maxWorkerAttempts: -1 } },
     { retry: { maxReviewCycles: 1.5 } },
-    { status: { pollIntervalMs: 0 } }
+    { concurrency: 1.5 }
   ]) {
     assert.throws(() => runnerConfigFromProjectPolicy(policy({ backendPolicy }), project, home), /positive integer/);
   }

@@ -106,6 +106,8 @@ test('pending and blockers files round-trip and tolerate malformed input', () =>
   assert.equal(readPendingFileSync(join(dir, 'garbage.json')), undefined);
   writeFileSync(join(dir, 'shape.json'), JSON.stringify({ runId: 7, pending: 'nope' }), 'utf8');
   assert.equal(readPendingFileSync(join(dir, 'shape.json')), undefined);
+  writeFileSync(join(dir, 'number.json'), '5', 'utf8');
+  assert.equal(readPendingFileSync(join(dir, 'number.json')), undefined);
 
   const blockersPathFile = join(dir, 'nested2', 'blockers.json');
   writeBlockersFileSync(blockersPathFile, [{ taskId: 'T001', title: 't', attempts: 1, reason: 'r' }]);
@@ -139,7 +141,7 @@ test('ApprovalCollector denies with guidance, persists items, and drives eager a
 
   const aborts = [];
   const collector = new ApprovalCollector({
-    runId: 'run-a', pendingPath, debounceMs: 0, exitMode: 'eager', onEagerAbort: () => aborts.push('a')
+    runId: 'run-a', pendingPath, debounceMs: 0, exitMode: 'eager', allowedPrefixes: [], onEagerAbort: () => aborts.push('a')
   });
   assert.equal(collector.pending.length, 1);
   assert.equal(collector.hasPending, true);
@@ -171,7 +173,7 @@ test('ApprovalCollector denies with guidance, persists items, and drives eager a
 
   collector.dispose();
   const quiescent = new ApprovalCollector({
-    runId: 'other-run', pendingPath, debounceMs: 50, exitMode: 'quiescence', onEagerAbort: () => aborts.push('never')
+    runId: 'other-run', pendingPath, debounceMs: 50, exitMode: 'quiescence', allowedPrefixes: [], onEagerAbort: () => aborts.push('never')
   });
   assert.equal(quiescent.pending.length, 0, 'items from another run are not carried over');
   await quiescent.requestApproval({
@@ -563,11 +565,17 @@ test('agent log maps unknown errno codes and reconnect Error instances', async (
   db.close();
 });
 
-test('ApprovalCollector records undefined tool input as unknown', () => {
+test('ApprovalCollector records undefined tool input as unknown', async () => {
   const dir = scratch('agent-team-collector-undefined-');
   const collector = new ApprovalCollector({
-    runId: 'r1', pendingPath: join(dir, 'pending.json'), debounceMs: 0, exitMode: 'eager', onEagerAbort: () => {}
+    runId: 'r1', pendingPath: join(dir, 'pending.json'), debounceMs: 0, exitMode: 'eager', allowedPrefixes: ['pnpm test'], onEagerAbort: () => {}
   });
+  const allowlisted = await collector.requestApproval({
+    backend: 'claude', role: 'worker', cwd: '/w', kind: 'command', tool: 'Bash',
+    input: { command: 'pnpm test' }, allowSession: false
+  });
+  assert.equal(allowlisted, 'once');
+  assert.equal(collector.pending.length, 0);
   collector.requestApproval({
     backend: 'claude', role: 'worker', cwd: '/w', kind: 'tool', tool: 'Unknown',
     input: undefined, allowSession: false

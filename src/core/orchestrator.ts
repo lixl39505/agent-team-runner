@@ -56,6 +56,14 @@ function taskSkills(record: TaskRecord): readonly ResolvedSkill[] {
   return JSON.parse(record.resolvedSkillsJson ?? '[]') as ResolvedSkill[];
 }
 
+/** 最近一次该任务 worker 执行的会话;假 DB(测试缝)可能不提供该查询。 */
+function latestWorkerSession(db: StateDatabase, runId: string, taskId: string): string | undefined {
+  const seam = db as StateDatabase & {
+    latestTaskSession?: (runId: string, taskId: string, role: string) => string | undefined;
+  };
+  return seam.latestTaskSession?.(runId, taskId, 'worker');
+}
+
 function parseManifest(json: string | null): RunManifest {
   if (!json) throw new Error('Run has no manifest');
   return JSON.parse(json) as RunManifest;
@@ -102,7 +110,7 @@ export async function runOrchestrator(input: {
     disposeBackends(backends);
   };
   const onSignal = (): void => { interruptRun('Interrupted by user; run again to resume.', true); };
-  const onAbort = (): void => { interruptRun('Interrupted by daemon; run again to resume.', false); };
+  const onAbort = (): void => { interruptRun('Interrupted by an outer signal; run again to resume.', false); };
   process.once('SIGTERM', onSignal);
   process.once('SIGINT', onSignal);
   process.once('SIGHUP', onSignal);
@@ -253,6 +261,9 @@ async function executeTask(input: {
       role: 'worker', cwd: worktreeInfo.path,
       label: `${runId} ${task.id} worker`,
       taskId: task.id,
+      ...(latestWorkerSession(db, runId, task.id) !== undefined
+        ? { resumeSessionId: latestWorkerSession(db, runId, task.id) }
+        : {}),
       prompt: workerPrompt({ task, startSha: worktreeInfo.startSha, runId, worktreePath: worktreeInfo.path, priorFeedback: record.lastError, retry, skills: taskSkills(record) }),
       schema: WORKER_SCHEMA,
       ...(workerBinding.model !== undefined ? { model: workerBinding.model } : {}),
@@ -508,10 +519,8 @@ async function integrateRun(input: {
   db.addEvent(runId, null, 'INTEGRATION_STARTED');
   const repoName = safeSegment(basename(config.workspace.repoRoot));
   const worktree = join(config.workspace.worktreesDir, repoName, safeSegment(runId), 'integration');
-  const contractBranch = typeof run.executionContractJson === 'string'
-    ? (JSON.parse(run.executionContractJson) as { target?: { integrationBranch?: string } }).target?.integrationBranch
-    : undefined;
-  const branch = contractBranch ?? `${config.workspace.branchPrefix}/${safeSegment(runId)}/integration`;
+  // 集成分支一律由 Runner 派生为本 run 专属名称，契约无法指向既有分支。
+  const branch = `${config.workspace.branchPrefix}/${safeSegment(runId)}/integration`;
   await resetWorktree({ repoRoot: config.workspace.repoRoot, path: worktree, branch, baseSha: run.baseSha });
   db.updateRun(runId, { integrationBranch: branch, integrationWorktree: worktree });
   const runDir = join(config.workspace.stateDir, 'runs', runId);

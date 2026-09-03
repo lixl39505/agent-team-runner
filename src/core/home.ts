@@ -7,7 +7,6 @@ export interface AgentTeamHome {
   stateDb: string;
   runsDir: string;
   worktreesDir: string;
-  preflightDir: string;
 }
 
 export interface ResolveAgentTeamHomeOptions {
@@ -22,13 +21,12 @@ export function resolveAgentTeamHome(options: ResolveAgentTeamHomeOptions = {}):
     root,
     stateDb: join(root, 'state.sqlite'),
     runsDir: join(root, 'runs'),
-    worktreesDir: join(root, 'worktrees'),
-    preflightDir: join(root, 'preflight')
+    worktreesDir: join(root, 'worktrees')
   };
 }
 
 export function ensureAgentTeamHome(home: AgentTeamHome = resolveAgentTeamHome()): void {
-  for (const path of [home.root, home.runsDir, home.worktreesDir, home.preflightDir]) {
+  for (const path of [home.root, home.runsDir, home.worktreesDir]) {
     mkdirSync(path, { recursive: true });
   }
 }

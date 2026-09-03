@@ -56,15 +56,23 @@ async function main(): Promise<void> {
     const home = homeOption();
     const parsed = parseRunCommandArgs(argv);
     argv = [];
-    const outcome = await executeRunCommand({
+    let outcome;
+    try {
+      outcome = await executeRunCommand({
       contractPath: parsed.contractPath,
       ...(parsed.runId === undefined ? {} : { runId: parsed.runId }),
       ...(parsed.grantPath === undefined ? {} : { grantPath: parsed.grantPath }),
       ...(parsed.debounceMs === undefined ? {} : { debounceMs: parsed.debounceMs }),
       ...(parsed.maxParallel === undefined ? {} : { maxParallel: parsed.maxParallel }),
-      ...(parsed.exitMode === undefined ? {} : { exitMode: parsed.exitMode }),
-      ...(home === undefined ? {} : { home })
-    });
+        ...(parsed.exitMode === undefined ? {} : { exitMode: parsed.exitMode }),
+        ...(home === undefined ? {} : { home })
+      });
+    } catch (error) {
+      // 崩溃也要有机器可读终态：外层控制器依据 JSON 决定重试/上报。
+      console.error(JSON.stringify({ kind: 'failed', exit: 1, error: String(error) }));
+      process.exitCode = 1;
+      return;
+    }
     console.log(renderRunSummary({
       runId: outcome.runId,
       kind: outcome.kind,

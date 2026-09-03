@@ -1,4 +1,4 @@
-import { basename, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import type { AgentBackend } from '../agent/types.js';
 import type { BackendPool } from '../agent/registry.js';
 import { ApprovalCollector, partitionGrants, type GrantDecisionMap, type RunExitMode } from './approval-collector.js';
@@ -6,11 +6,13 @@ import { applyContractRevision } from './contract-revision.js';
 import { StateDatabase } from './db.js';
 import { DEFAULT_CONFIG } from './defaults.js';
 import { createExecutionRun } from './execution-run.js';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { readJson } from './files.js';
 import { git } from './git.js';
 import { ensureAgentTeamHome, resolveAgentTeamHome, type AgentTeamHome } from './home.js';
 import { writeHandoff } from './handoff.js';
 import { runOrchestrator } from './orchestrator.js';
+import { isAllowlistedCommand } from './shell.js';
 import { ProjectRegistry, type JsonValue, type ProjectRecord } from './project-registry.js';
 import { runnerConfigFromProjectPolicy } from './project-runtime.js';
 import {
@@ -123,6 +125,7 @@ export async function executeRunCommand(options: RunCommandOptions): Promise<Run
 
   const db = new StateDatabase(home.stateDb);
   const registry = new ProjectRegistry(home.stateDb);
+  let lockedRunId: string | undefined;
   try {
     let project: ProjectRecord;
     try {
@@ -138,9 +141,18 @@ export async function executeRunCommand(options: RunCommandOptions): Promise<Run
     if (runId === undefined) {
       runId = await createExecutionRun({ config, db, contract: rawContract, projectPolicyRevisionId: policy.id });
     } else {
-      db.getRun(runId);
+      const existing = db.getRun(runId);
+      if (existing.status === 'planning') {
+        // 上次进程在「创建 run 之后、写任务之前」崩溃：残留记录不可直接编排，重建后重放。
+        db.deleteRun(runId);
+        runId = await createExecutionRun({ config, db, contract: rawContract, projectPolicyRevisionId: policy.id, runId });
+      }
     }
     const pendingPath = pendingItemPath(home.runsDir, runId);
+
+    // 同一 runId 的进程互斥：锁目录写入存活 pid；崩溃残留（pid 不存活）可接管。
+    acquireRunLock(home, runId);
+    lockedRunId = runId;
 
     let run = db.getRun(runId);
     const existingTasks = db.listTasks(runId);
@@ -171,6 +183,7 @@ export async function executeRunCommand(options: RunCommandOptions): Promise<Run
       pendingPath,
       debounceMs: options.debounceMs ?? DEFAULT_EAGER_DEBOUNCE_MS,
       exitMode: options.exitMode ?? 'eager',
+      allowedPrefixes: config.verification.allowedCommandPrefixes,
       onEagerAbort: () => controller.abort()
     });
     pending = collector.pending;
@@ -187,12 +200,14 @@ export async function executeRunCommand(options: RunCommandOptions): Promise<Run
     } finally {
       collector.dispose();
     }
-    const handoffWritten = run.status === 'done' || db.getRun(runId).status === 'done';
+    const finalRun = db.getRun(runId);
+    const handoffWritten = finalRun.status === 'done';
     if (handoffWritten) writeHandoff(db, home.runsDir, runId);
 
-    run = db.getRun(runId);
+    run = finalRun;
     const tasks = db.listTasks(runId);
-    pending = collector.pending;
+    // run 完成意味着所有任务已 approved：其余 pending 都是被替代方案化解的陈旧请求。
+    if (run.status === 'done') pending = [];
     const blockers = contractBlockers(tasks);
     const { code, kind } = classifyRunExit({
       run,
@@ -201,7 +216,7 @@ export async function executeRunCommand(options: RunCommandOptions): Promise<Run
       interrupted: process.exitCode === 130
     });
     writeBlockersFileSync(blockersPath(home.runsDir, runId), blockers);
-    collector.flush();
+    writePendingFileSync(pendingPath, { runId, pending });
     return {
       runId,
       exitCode: code,
@@ -217,9 +232,47 @@ export async function executeRunCommand(options: RunCommandOptions): Promise<Run
       handoffPath: handoffWritten ? handoffPath(home.runsDir, runId) : null
     };
   } finally {
+    if (lockedRunId !== undefined) releaseRunLock(home, lockedRunId);
     db.close();
     registry.close();
   }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 同一 runId 的进程互斥锁：runs/<id>/lock/pid 记录持有者，崩溃残留可被接管。 */
+function acquireRunLock(home: AgentTeamHome, runId: string): void {
+  const lockDir = join(home.runsDir, runId, 'lock');
+  try {
+    mkdirSync(lockDir);
+  } catch {
+    const pidFile = join(lockDir, 'pid');
+    let holder: number | undefined;
+    try {
+      holder = Number(readFileSync(pidFile, 'utf8'));
+    } catch {
+      holder = undefined;
+    }
+    if (holder !== undefined && Number.isSafeInteger(holder) && isProcessAlive(holder)) {
+      console.error('LOCKDEBUG holder alive:', holder);
+      throw new Error(`Run ${runId} is already executing in another process (pid ${holder})`);
+    }
+    console.error('LOCKDEBUG taking over, holder:', holder);
+    rmSync(lockDir, { recursive: true, force: true });
+    mkdirSync(lockDir);
+  }
+  writeFileSync(join(lockDir, 'pid'), String(process.pid), 'utf8');
+}
+
+function releaseRunLock(home: AgentTeamHome, runId: string): void {
+  rmSync(join(home.runsDir, runId, 'lock'), { recursive: true, force: true });
 }
 
 export function readGrantDecisions(grantPath: string): GrantDecisionMap {
@@ -248,6 +301,14 @@ function applyGrants(input: {
   pending: PendingItem[];
   decisions: GrantDecisionMap;
 }): PendingItem[] {
+  for (const item of input.pending) {
+    if (item.kind === 'question' && input.decisions[item.id] !== undefined) {
+      throw new Error(
+        `Pending item ${item.id} is a question; answer it by revising the contract ` +
+        '(implementationGuidance), not through --grant approvals'
+      );
+    }
+  }
   const { approved, denied, unresolved } = partitionGrants(input.pending, input.decisions);
   const prefixes = new Set(input.policy.verificationAllowedCommandPrefixes);
   let allowlistChanged = false;
@@ -295,7 +356,7 @@ async function registerContractProject(registry: ProjectRegistry, contract: Exec
   const gitCommonDir = commonDir.stdout.trim() === '' ? repoRoot : resolve(repoRoot, commonDir.stdout.trim());
   const remote = await git(repoRoot, ['remote', 'get-url', 'origin'], true);
   const gitIdentity: JsonValue = remote.stdout.trim() === '' ? { root: repoRoot } : { remote: remote.stdout.trim() };
-  return registry.registerProject({
+  const registered = registry.registerProject({
     gitCommonDir,
     repoRoot,
     displayName: basename(repoRoot),
@@ -313,6 +374,13 @@ async function registerContractProject(registry: ProjectRegistry, contract: Exec
       backendPolicy: {}
     }
   });
+  if (registered.id !== contract.project.id) {
+    throw new Error(
+      `Repository is already registered as project "${registered.id}"; ` +
+      `the contract must use that id instead of "${contract.project.id}"`
+    );
+  }
+  return registered;
 }
 
 function canonicalJson(value: unknown): string {

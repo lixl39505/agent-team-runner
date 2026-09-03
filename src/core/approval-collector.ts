@@ -1,5 +1,6 @@
 import type { ApprovalDecision, ApprovalHandler, UserInputAnswers, UserInputHandler } from '../agent/approval.js';
 import { readPendingFileSync, writePendingFileSync, type PendingFile, type PendingItem } from './run-exit.js';
+import { isAllowlistedCommand } from './shell.js';
 
 export type RunExitMode = 'eager' | 'quiescence';
 
@@ -8,6 +9,8 @@ export interface ApprovalCollectorOptions {
   pendingPath: string;
   debounceMs: number;
   exitMode: RunExitMode;
+  /** 当前项目 allowlist；命中的命令直接放行（grant 沉淀后重放即由此通过）。 */
+  allowedPrefixes: readonly string[];
   /** Called when the eager debounce window elapses while pending items exist. */
   onEagerAbort: () => void;
 }
@@ -43,13 +46,18 @@ export class ApprovalCollector {
   }
 
   requestApproval: ApprovalHandler = async (request) => {
+    const commands = extractCommands(request.input);
+    // grant 沉淀过的命令已进入项目 allowlist：重放时直接放行，避免 approve 后仍无限 exit 10。
+    if (commands.length > 0 && commands.every((command) => isAllowlistedCommand(command, this.options.allowedPrefixes))) {
+      return 'once';
+    }
     this.record({
       kind: 'approval',
       taskId: request.taskId ?? null,
       agentId: `${request.role}:${request.backend}`,
       subject: `${request.kind} ${request.tool}: ${describeInput(request.input)}`,
       reason: request.reason ?? denialGuidance,
-      commands: extractCommands(request.input)
+      commands
     });
     return 'deny';
   };
@@ -60,7 +68,8 @@ export class ApprovalCollector {
       taskId: request.taskId ?? null,
       agentId: `${request.role}:${request.backend}`,
       subject: request.questions.map((question) => question.question).join(' | '),
-      reason: 'Outer interaction is unavailable in headless mode; proceed from the contract guidance.'
+      reason: 'Outer interaction is unavailable in headless mode; proceed from the contract guidance.',
+      questions: request.questions.map((question) => ({ id: question.id, question: question.question }))
     });
     return {};
   };

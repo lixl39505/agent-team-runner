@@ -2,6 +2,9 @@ import assert from 'node:assert/strict';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'vitest';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { backendFor, buildBackends, disposeBackends } from '../src/agent/registry.ts';
 
 function binding(backend, profile, isolation = 'isolated', baseUrl) {
@@ -15,8 +18,9 @@ function binding(backend, profile, isolation = 'isolated', baseUrl) {
   };
 }
 
-function config() {
+function config(stateDir = mkdtempSync(join(tmpdir(), 'agent-team-pool-home-'))) {
   return {
+    workspace: { stateDir },
     backends: {
       claude: {},
       codex: {},
@@ -36,7 +40,8 @@ test('profile-aware pool isolates backend state without leaking credentials into
     async hasApiKey() { return true; },
     async deleteApiKey() { return true; }
   };
-  const backends = buildBackends(config(), { credentials });
+  const stateDir = mkdtempSync(join(tmpdir(), 'agent-team-pool-state-'));
+  const backends = buildBackends(config(stateDir), { credentials });
   try {
     const claudeWork = await backends.get(binding('claude', 'work', 'isolated', 'https://gateway.example/v1'));
     const claudeWorkAgain = await backends.get(binding('claude', 'work'));
@@ -44,7 +49,7 @@ test('profile-aware pool isolates backend state without leaking credentials into
     assert.equal(claudeWork, claudeWorkAgain);
     assert.notEqual(claudeWork, claudePersonal);
     assert.deepEqual(claudeWork.options.env, {
-      CLAUDE_CONFIG_DIR: join(homedir(), '.agent-team-runner', 'runtimes', 'claude', 'work'),
+      CLAUDE_CONFIG_DIR: join(stateDir, 'runtimes', 'claude', 'work'),
       ANTHROPIC_API_KEY: 'claude-work-secret',
       ANTHROPIC_BASE_URL: 'https://gateway.example/v1'
     });
@@ -54,7 +59,7 @@ test('profile-aware pool isolates backend state without leaking credentials into
     const codexPersonal = await backends.get(binding('codex', 'personal'));
     assert.notEqual(codexWork, codexPersonal);
     assert.deepEqual(codexWork.options.env, {
-      CODEX_HOME: join(homedir(), '.agent-team-runner', 'runtimes', 'codex', 'work')
+      CODEX_HOME: join(stateDir, 'runtimes', 'codex', 'work')
     });
     assert.equal(codexWork.options.minimalEnv, true);
 
@@ -86,7 +91,8 @@ test('backendFor supports both managed pools and injected backend records', asyn
 });
 
 test('disposing a rejected profiled backend absorbs its pending creation failure', async () => {
-  const backends = buildBackends(config(), {
+  const stateDir = mkdtempSync(join(tmpdir(), 'agent-team-pool-state-'));
+  const backends = buildBackends(config(stateDir), {
     credentials: { async getApiKey() { return null; }, async setApiKey() {}, async hasApiKey() { return false; }, async deleteApiKey() { return false; } }
   });
   await assert.rejects(backends.get({ ...binding('opencode', 'missing'), model: 'openai/gpt-5' }), /has no API key/);
@@ -95,7 +101,8 @@ test('disposing a rejected profiled backend absorbs its pending creation failure
 });
 
 test('profile pool permits Claude native auth, isolates Codex, and rejects use after disposal', async () => {
-  const backends = buildBackends(config(), {
+  const stateDir = mkdtempSync(join(tmpdir(), 'agent-team-pool-state-'));
+  const backends = buildBackends(config(stateDir), {
     credentials: { async getApiKey() { return null; }, async setApiKey() {}, async hasApiKey() { return false; }, async deleteApiKey() { return false; } }
   });
   const claude = await backends.get(binding('claude', 'native'));
@@ -119,7 +126,7 @@ test('isolated OpenCode requires a provider-qualified model', async () => {
 });
 
 test('profile pool treats an empty profile as shared and omits absent backend commands', async () => {
-  const backends = buildBackends(config());
+  const backends = buildBackends(config(mkdtempSync(join(tmpdir(), 'agent-team-pool-shared-'))));
   try {
     assert.equal(await backends.get({ agent: 'shared-claude', backend: 'claude', authProfile: '', source: 'test' }), backends.claude);
     assert.equal(backends.claude.options.command, undefined);

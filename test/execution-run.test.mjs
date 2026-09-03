@@ -40,7 +40,6 @@ function contract(repoRoot, overrides = {}) {
   return {
     version: 1,
     project: { id: 'external-project', repoRoot, baseRef: 'HEAD' },
-    target: {},
     tasks: [{
       id: 'T001',
       title: 'Create feature',

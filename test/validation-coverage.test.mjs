@@ -7,7 +7,7 @@ function task(id, overrides = {}) {
 }
 
 function contract(tasks) {
-  return { version: 1, project: { id: 'project', repoRoot: '/repo', baseRef: 'HEAD' }, target: {}, tasks };
+  return { version: 1, project: { id: 'project', repoRoot: '/repo', baseRef: 'HEAD' }, tasks };
 }
 
 test('covers execution-contract task defaults and invalid task field branches', () => {
