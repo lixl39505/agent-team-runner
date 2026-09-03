@@ -54,12 +54,11 @@ test('converts a complete project policy into an isolated runner config', () => 
       roles: { worker: 'worker', reviewer: 'reviewer' }
     },
     backendPolicy: {
-      backends: { codex: { command: 'codex-team', extraArgs: ['--quiet'], nativeWindowsSandbox: 'allow-degraded' } },
+      backends: { codex: { command: 'codex-team', nativeWindowsSandbox: 'allow-degraded' } },
       concurrency: 5,
       staleAfterMs: 100,
       taskTimeoutMs: 200,
-      retry: { maxWorkerAttempts: 4, maxReviewCycles: 5 },
-      integration: { allowedPaths: ['src/**'] }
+      retry: { maxWorkerAttempts: 4, maxReviewCycles: 5 }
     }
   });
   const config = runnerConfigFromProjectPolicy(input, project, home);
@@ -71,23 +70,22 @@ test('converts a complete project policy into an isolated runner config', () => 
     baseRef: 'main',
     branchPrefix: 'agent-team'
   });
-  assert.deepEqual(config.verification, { allowedCommandPrefixes: ['npm test'], globalCommands: [] });
+  assert.deepEqual(config.verification, { allowedCommandPrefixes: ['npm test'] });
   assert.deepEqual(config.agents.worker, { backend: 'codex', model: 'gpt-5.6-terra', maxTurns: 8 });
   assert.deepEqual(config.roles, { worker: 'worker', reviewer: 'reviewer' });
   assert.equal(config.backends.codex.command, 'codex-team');
   assert.equal(config.backends.codex.nativeWindowsSandbox, 'allow-degraded');
-  assert.deepEqual(config.backends.codex.extraArgs, ['--quiet']);
   assert.deepEqual(
-    [config.concurrency, config.staleAfterMs, config.taskTimeoutMs, config.retry, config.integration],
-    [5, 100, 200, { maxWorkerAttempts: 4, maxReviewCycles: 5 }, { allowedPaths: ['src/**'] }]
+    [config.concurrency, config.staleAfterMs, config.taskTimeoutMs, config.retry],
+    [5, 100, 200, { maxWorkerAttempts: 4, maxReviewCycles: 5 }]
   );
   assert.throws(() => runnerConfigFromProjectPolicy({ ...input, backendPolicy: { ...input.backendPolicy, status: { pollIntervalMs: 300 } } }, project, home), /status is not allowed/);
   assert.throws(() => runnerConfigFromProjectPolicy({ ...input, backendPolicy: { ...input.backendPolicy, interactionAlert: {} } }, project, home), /interactionAlert is not allowed/);
+  // 已移除的策略键（旧字段）必须被拒绝，而不是被静默吞掉。
+  assert.throws(() => runnerConfigFromProjectPolicy({ ...input, backendPolicy: { ...input.backendPolicy, integration: { allowedPaths: ['src/**'] } } }, project, home), /integration is not allowed/);
 
-  config.backends.codex.extraArgs.push('--mutated');
   config.verification.allowedCommandPrefixes.push('npm run lint');
   const next = runnerConfigFromProjectPolicy(input, project, home);
-  assert.deepEqual(next.backends.codex.extraArgs, ['--quiet']);
   assert.deepEqual(next.verification.allowedCommandPrefixes, ['npm test']);
 });
 
@@ -95,7 +93,6 @@ test('uses DEFAULT_CONFIG for omitted backend policy values', () => {
   const config = runnerConfigFromProjectPolicy(policy(), project, home);
   assert.equal(config.concurrency, DEFAULT_CONFIG.concurrency);
   assert.deepEqual(config.retry, DEFAULT_CONFIG.retry);
-  assert.deepEqual(config.integration, DEFAULT_CONFIG.integration);
   assert.deepEqual(config.backends, DEFAULT_CONFIG.backends);
   assert.deepEqual(config.roles, {});
 });
@@ -118,8 +115,7 @@ test('accepts every optional policy value and preserves defaults for empty neste
     },
     backendPolicy: {
       backends: { claude: {} },
-      retry: {},
-      integration: {}
+      retry: {}
     }
   }), project, home);
   assert.deepEqual(config.agents.worker, {
@@ -132,7 +128,6 @@ test('accepts every optional policy value and preserves defaults for empty neste
     baseUrl: 'https://api.example.com/v1'
   });
   assert.deepEqual(config.backends.claude, DEFAULT_CONFIG.backends.claude);
-  assert.deepEqual(config.integration, DEFAULT_CONFIG.integration);
 });
 
 test('rejects malformed JSON policy sections', () => {

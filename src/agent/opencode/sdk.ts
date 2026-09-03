@@ -1,8 +1,9 @@
 import type { ChildProcess } from 'node:child_process';
 import spawn from 'cross-spawn';
 import { mkdtempSync } from 'node:fs';
+import { realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { isAbsolute, join, dirname, relative, resolve } from 'node:path';
 import { createOpencodeClient, type OpencodeClient } from '@opencode-ai/sdk/client';
 import {
   createOpencodeClient as createOpencodeV2Client,
@@ -26,6 +27,7 @@ import { compileOpenCode, compileOpenCodeBasePermission } from './policy.js';
 import { parseAgentJson } from '../parse.js';
 import { sanitizedEnv } from '../env.js';
 import { denialGuidance } from '../../core/approval-collector.js';
+import { isWithinDirectory } from '../../core/files.js';
 import { killProcessTree } from '../process-tree.js';
 import { unsupportedNativeWindowsSandbox } from '../platform.js';
 
@@ -584,11 +586,12 @@ ${JSON.stringify(this.spec.schema)}`;
     const hardDenied = this.compiled.access === 'read-only' && ['bash', 'edit'].includes(request.type);
     const kind = openCodeApprovalKind(request.type);
     // workspace-write 的 edit 不能只信服务端归类：本地再校验一次目标路径确实落在
-    // 会话工作区内，越界路径（如 ../outside.txt）必须走审批通道（headless 下即拒绝）。
+    // 会话工作区内（realpath 复核，目录软链接不放行），越界路径（如 ../outside.txt）
+    // 必须走审批通道（headless 下即拒绝）。
     const editInsideWorkspace = !hardDenied
       && this.compiled.access === 'workspace-write'
       && request.type === 'edit'
-      && editPatternWithinWorkspace(request.pattern, this.spec.cwd);
+      && await editPatternWithinWorkspace(request.pattern, this.spec.cwd);
     let response: 'once' | 'always' | 'reject' = 'reject';
     if (editInsideWorkspace) {
       response = 'once';
@@ -614,7 +617,7 @@ ${JSON.stringify(this.spec.schema)}`;
     }
     const denyReason = hardDenied
       ? 'read-only role'
-      : request.type === 'edit' && !editPatternWithinWorkspace(request.pattern, this.spec.cwd)
+      : request.type === 'edit' && !(await editPatternWithinWorkspace(request.pattern, this.spec.cwd))
         ? 'edit target outside the session workspace'
         : denialGuidance;
     this.spec.onEvent?.({
@@ -711,17 +714,44 @@ const GLOB_META = /[*?[\]{}]/;
  * pattern 是 glob：取首段不含 glob 元字符的字面前缀作为锚点判定——前缀解析后
  * 越出工作区（如 ../outside.txt、越界绝对路径）即视为越界；空 pattern 无法证明
  * 在工作区内，一律交给审批通道。
+ * 词法判定之外再按 realpath 复核：工作区内的目录软链接可以把字面合法的路径
+ * 导向工作区外，必须用「目标最近存在祖先 + 工作区根」的解析结果做包含判定；
+ * 解析失败（新文件）时逐级上探到最近存在的祖先。
  */
-export function editPatternWithinWorkspace(pattern: string | Array<string> | undefined, workspaceRoot: string): boolean {
+export async function editPatternWithinWorkspace(pattern: string | Array<string> | undefined, workspaceRoot: string): Promise<boolean> {
   const patterns = pattern === undefined ? [] : Array.isArray(pattern) ? pattern : [pattern];
   if (patterns.length === 0) return false;
-  return patterns.every((entry) => {
-    if (entry.length === 0) return false;
-    const literalEnd = entry.search(GLOB_META);
-    const literalPrefix = literalEnd < 0 ? entry : entry.slice(0, literalEnd);
-    const rel = relative(workspaceRoot, resolve(workspaceRoot, literalPrefix));
-    return !rel.startsWith('..') && !isAbsolute(rel);
-  });
+  const realRoot = await safeRealpath(workspaceRoot) ?? workspaceRoot;
+  for (const entry of patterns) {
+    if (!(await literalPrefixWithinWorkspace(entry, workspaceRoot, realRoot))) return false;
+  }
+  return true;
+}
+
+async function literalPrefixWithinWorkspace(entry: string, workspaceRoot: string, realRoot: string): Promise<boolean> {
+  if (entry.length === 0) return false;
+  const literalEnd = entry.search(GLOB_META);
+  const literalPrefix = literalEnd < 0 ? entry : entry.slice(0, literalEnd);
+  const target = resolve(workspaceRoot, literalPrefix);
+  const lexical = relative(workspaceRoot, target);
+  if (lexical.startsWith('..') || isAbsolute(lexical)) return false;
+  let probe = target;
+  while (true) {
+    const real = await safeRealpath(probe);
+    if (real !== undefined) return isWithinDirectory(real, realRoot);
+    const parent = dirname(probe);
+    /* istanbul ignore if -- 上探必然先命中已存在的工作区根；抵达文件系统根说明根自身不可解析。 */
+    if (parent === probe) return isWithinDirectory(target, realRoot);
+    probe = parent;
+  }
+}
+
+async function safeRealpath(path: string): Promise<string | undefined> {
+  try {
+    return await realpath(path);
+  } catch {
+    return undefined;
+  }
 }
 
 function openCodeApprovalKind(type: string): 'command' | 'file-change' | 'network' | 'external-directory' | 'tool' {

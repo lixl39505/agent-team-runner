@@ -1,9 +1,15 @@
 import { test } from 'vitest';
 import { denialGuidance } from '../src/core/approval-collector.ts';
 import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { OpenCodeBackend } from '../src/agent/opencode/sdk.ts';
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+// edit 权限的工作区包含性检查会按 realpath 解析：工作区必须是真实存在的目录。
+const REAL_WORKSPACE = mkdtempSync(join(tmpdir(), 'opencode-workspace-'));
 
 function spec(overrides = {}) {
   return {
@@ -108,7 +114,7 @@ test('OpenCode session contains permission and question failures', async () => {
 
   const postFailure = await open(
     { data: { info: { structured: {} } } },
-    {},
+    { cwd: REAL_WORKSPACE },
     { permission: async () => { throw new Error('session gone'); } }
   );
   await postFailure.session.answerPermission('permission-edit', { type: 'edit', pattern: 'src/in-workspace.ts' });

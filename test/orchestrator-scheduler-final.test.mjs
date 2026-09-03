@@ -31,8 +31,7 @@ function configFor(repoRoot, overrides = {}) {
     concurrency: 1,
     retry: { ...DEFAULT_CONFIG.retry, maxWorkerAttempts: 2, maxReviewCycles: 2, ...retry },
     status: { ...DEFAULT_CONFIG.status, ...status },
-    integration: { ...DEFAULT_CONFIG.integration },
-    verification: { ...DEFAULT_CONFIG.verification, globalCommands: [] },
+    verification: { ...DEFAULT_CONFIG.verification },
     ...rest
   };
 }
@@ -265,13 +264,9 @@ test('orchestrator records and reports a contract-blocked worker without verific
       }
     };
   });
-  let report;
   try {
     await createPlannedRun(db, config);
-    await runOrchestrator({
-      config, db, runId: 'run', backends: backendPool(backend),
-      reportContractBlock: (value) => { report = value; }
-    });
+    await runOrchestrator({ config, db, runId: 'run', backends: backendPool(backend) });
     const record = db.getTask('run', 'T001');
     assert.equal(db.getRun('run').status, 'needs_attention');
     assert.equal(record.status, 'blocked_on_contract');
@@ -280,16 +275,12 @@ test('orchestrator records and reports a contract-blocked worker without verific
     assert.notEqual(record.finishedAt, null);
     assert.equal(backend.specs.length, 1);
     assert.ok(eventTypes(db).includes('WORKER_BLOCKED_ON_CONTRACT'));
-    assert.equal(report.run.id, 'run');
-    assert.equal(report.task.status, 'blocked_on_contract');
-    assert.equal(report.agentExecution.role, 'worker');
-    assert.equal(report.reason.code, 'out_of_scope');
   } finally {
     db.close();
   }
 });
 
-test('orchestrator preserves a contract block when its optional reporter fails', async () => {
+test('orchestrator records the structured contract-block reason verbatim', async () => {
   const repoRoot = await repository();
   const config = configFor(repoRoot);
   const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
@@ -299,12 +290,9 @@ test('orchestrator preserves a contract block when its optional reporter fails',
   }));
   try {
     await createPlannedRun(db, config);
-    await runOrchestrator({
-      config, db, runId: 'run', backends: backendPool(backend),
-      reportContractBlock: () => { throw new Error('report unavailable'); }
-    });
+    await runOrchestrator({ config, db, runId: 'run', backends: backendPool(backend) });
     assert.equal(db.getTask('run', 'T001').status, 'blocked_on_contract');
-    assert.ok(eventTypes(db).includes('WORKER_CONTRACT_BLOCK_REPORT_FAILED'));
+    assert.ok(eventTypes(db).includes('WORKER_BLOCKED_ON_CONTRACT'));
   } finally {
     db.close();
   }

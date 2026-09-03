@@ -32,7 +32,7 @@ function configFor(repoRoot, overrides = {}) {
     retry: { ...DEFAULT_CONFIG.retry, ...retry },
     status: { ...DEFAULT_CONFIG.status, ...status },
     concurrency: 1,
-    verification: { ...DEFAULT_CONFIG.verification, globalCommands: [], ...verification },
+    verification: { ...DEFAULT_CONFIG.verification, ...verification },
     ...rest
   };
 }
@@ -94,12 +94,12 @@ async function createApprovedRun(db, config, id = 'run') {
 }
 
 test('orchestrator completes a conflict-free integration without starting an Integrator', async () => {
-  const repoRoot = await repository({ verify: 'node -e ""' });
-  const config = configFor(repoRoot, { verification: { globalCommands: ['npm run verify'] } });
+  const repoRoot = await repository();
+  const config = configFor(repoRoot);
   const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const backend = new ScriptBackend(() => { throw new Error('Integrator must not start without a conflict'); });
   try {
-    const { runDir } = await createApprovedRun(db, config);
+    await createApprovedRun(db, config);
     await runOrchestrator({ config, db, runId: 'run', backends: backendPool(backend) });
 
     const run = db.getRun('run');
@@ -107,7 +107,6 @@ test('orchestrator completes a conflict-free integration without starting an Int
     assert.equal(run.integrationCommit, await currentHead(run.integrationWorktree));
     assert.equal(backend.specs.length, 0);
     assert.equal(readFileSync(join(run.integrationWorktree, 'src', 'feature.txt'), 'utf8'), 'implemented\n');
-    assert.match(readFileSync(join(runDir, 'logs', 'integration-verification.log'), 'utf8'), /\$ npm run verify/);
     assert.deepEqual(eventTypes(db, 'run').slice(-2), ['INTEGRATION_COMPLETED', 'RUN_COMPLETED']);
   } finally {
     db.close();

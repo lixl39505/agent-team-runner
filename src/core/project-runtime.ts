@@ -11,8 +11,7 @@ const BACKEND_POLICY_KEYS = [
   'concurrency',
   'staleAfterMs',
   'taskTimeoutMs',
-  'retry',
-  'integration'
+  'retry'
 ] as const;
 
 function isJsonObject(value: JsonValue | undefined): value is JsonObject {
@@ -70,10 +69,9 @@ function agentEntry(value: JsonValue | undefined, path: string): AgentEntry {
 
 function backendConfig(value: JsonValue | undefined, path: string): BackendConfig {
   const input = object(value, path);
-  allowedKeys(input, ['command', 'extraArgs', 'nativeWindowsSandbox'], path);
+  allowedKeys(input, ['command', 'nativeWindowsSandbox'], path);
   const config: BackendConfig = {};
   if (input.command !== undefined) config.command = string(input.command, `${path}.command`);
-  if (input.extraArgs !== undefined) config.extraArgs = stringArray(input.extraArgs, `${path}.extraArgs`);
   if (input.nativeWindowsSandbox !== undefined) {
     const sandbox = string(input.nativeWindowsSandbox, `${path}.nativeWindowsSandbox`);
     if (sandbox !== 'require' && sandbox !== 'allow-degraded') {
@@ -97,11 +95,7 @@ function defaultConfig(): RunnerConfig {
     agents: {},
     roles: {},
     verification: {
-      allowedCommandPrefixes: [...DEFAULT_CONFIG.verification.allowedCommandPrefixes],
-      globalCommands: [...DEFAULT_CONFIG.verification.globalCommands]
-    },
-    integration: {
-      allowedPaths: [...DEFAULT_CONFIG.integration.allowedPaths]
+      allowedCommandPrefixes: [...DEFAULT_CONFIG.verification.allowedCommandPrefixes]
     }
   };
 }
@@ -143,8 +137,7 @@ export function runnerConfigFromProjectPolicy(
     branchPrefix: 'agent-team'
   };
   config.verification = {
-    allowedCommandPrefixes: stringArray(policy.verificationAllowedCommandPrefixes, 'verificationAllowedCommandPrefixes'),
-    globalCommands: []
+    allowedCommandPrefixes: stringArray(policy.verificationAllowedCommandPrefixes, 'verificationAllowedCommandPrefixes')
   };
 
   if (backendPolicy.backends !== undefined) {
@@ -162,11 +155,6 @@ export function runnerConfigFromProjectPolicy(
     allowedKeys(retry, ['maxWorkerAttempts', 'maxReviewCycles'], 'backendPolicy.retry');
     if (retry.maxWorkerAttempts !== undefined) config.retry.maxWorkerAttempts = positiveInteger(retry.maxWorkerAttempts, 'backendPolicy.retry.maxWorkerAttempts');
     if (retry.maxReviewCycles !== undefined) config.retry.maxReviewCycles = positiveInteger(retry.maxReviewCycles, 'backendPolicy.retry.maxReviewCycles');
-  }
-  if (backendPolicy.integration !== undefined) {
-    const integration = object(backendPolicy.integration, 'backendPolicy.integration');
-    allowedKeys(integration, ['allowedPaths'], 'backendPolicy.integration');
-    if (integration.allowedPaths !== undefined) config.integration.allowedPaths = stringArray(integration.allowedPaths, 'backendPolicy.integration.allowedPaths');
   }
 
   const validation = validateAgents(config);

@@ -1,4 +1,4 @@
-import { basename, join, resolve } from 'node:path';
+import { basename, resolve } from 'node:path';
 import type { AgentBackend } from '../agent/types.js';
 import type { BackendPool } from '../agent/registry.js';
 import { ApprovalCollector, partitionGrants, type GrantDecisionMap, type RunExitMode } from './approval-collector.js';
@@ -6,28 +6,32 @@ import { applyContractRevision } from './contract-revision.js';
 import { StateDatabase } from './db.js';
 import { DEFAULT_CONFIG } from './defaults.js';
 import { createExecutionRun } from './execution-run.js';
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { readJson } from './files.js';
-import { git } from './git.js';
-import { ensureAgentTeamHome, resolveAgentTeamHome, type AgentTeamHome } from './home.js';
+import { canonicalJson, readJson } from './files.js';
+import { ensureGitRepo, git } from './git.js';
+import { assertHomeOutsideRepo, ensureAgentTeamHome, resolveAgentTeamHome, type AgentTeamHome } from './home.js';
 import { writeHandoff } from './handoff.js';
 import { runOrchestrator } from './orchestrator.js';
 import { ProjectRegistry, type JsonValue, type ProjectRecord } from './project-registry.js';
 import { runnerConfigFromProjectPolicy } from './project-runtime.js';
+import { acquireRunLock, releaseRunLock } from './run-lock.js';
 import {
   blockersPath,
   classifyRunExit,
   contractBlockers,
+  grantsItemPath,
   handoffPath,
   pendingItemPath,
+  readGrantsFileSync,
   readPendingFileSync,
   writeBlockersFileSync,
+  writeGrantsFileSync,
   writePendingFileSync,
   type ContractBlocker,
+  type GrantedPermission,
   type PendingItem,
   type RunExitKind
 } from './run-exit.js';
-import type { BackendId, ExecutionContract, TaskRecord } from './types.js';
+import type { BackendId, ExecutionContract, TaskRecord, TaskStatus } from './types.js';
 import { assertExecutionContractFields } from './validation.js';
 
 export const DEFAULT_EAGER_DEBOUNCE_MS = 10_000;
@@ -117,10 +121,13 @@ export interface RunCommandOutcome {
  */
 export async function executeRunCommand(options: RunCommandOptions): Promise<RunCommandOutcome> {
   const home = options.home ?? resolveAgentTeamHome();
-  ensureAgentTeamHome(home);
   const rawContract = readJson(options.contractPath) as unknown;
   assertExecutionContractFields(rawContract, 'contract');
   const contract = rawContract as ExecutionContract;
+  // 目录创建之前先做 home/仓库隔离判定：home 指向项目仓库内时，
+  // state.sqlite、runs/、worktrees/ 会写进项目目录，违反 ADR 0002。
+  assertHomeOutsideRepo(home, contract.project.repoRoot);
+  ensureAgentTeamHome(home);
 
   const db = new StateDatabase(home.stateDb);
   const registry = new ProjectRegistry(home.stateDb);
@@ -149,6 +156,7 @@ export async function executeRunCommand(options: RunCommandOptions): Promise<Run
       }
     }
     const pendingPath = pendingItemPath(home.runsDir, runId);
+    const grantsPath = grantsItemPath(home.runsDir, runId);
 
     // 同一 runId 的进程互斥：锁文件写入存活 pid；崩溃残留（pid 不存活）可原子接管。
     acquireRunLock(home, runId);
@@ -161,7 +169,7 @@ export async function executeRunCommand(options: RunCommandOptions): Promise<Run
     if (options.grantPath !== undefined) {
       const decisions = readGrantDecisions(options.grantPath);
       const carried = readPendingFileSync(pendingPath)?.pending ?? [];
-      pending = applyGrants({ db, registry, project, policy, runId, pendingPath, pending: carried, decisions });
+      pending = applyGrants({ db, registry, project, policy, runId, pendingPath, grantsPath, pending: carried, decisions });
       project = registry.getProject(project.id);
       policy = registry.getProjectPolicy(project.id);
       config = runnerConfigFromProjectPolicy(policy, project, home);
@@ -181,6 +189,7 @@ export async function executeRunCommand(options: RunCommandOptions): Promise<Run
     collector = new ApprovalCollector({
       runId,
       pendingPath,
+      grantsPath,
       debounceMs: options.debounceMs ?? DEFAULT_EAGER_DEBOUNCE_MS,
       exitMode: options.exitMode ?? 'eager',
       allowedPrefixes: config.verification.allowedCommandPrefixes,
@@ -278,72 +287,6 @@ export function withRunId(error: unknown, runId: string): Error {
   return annotated;
 }
 
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/** 同一 runId 的进程互斥锁：runs/<id>/lock/pid 记录持有者，崩溃残留可被接管。 */
-function acquireRunLock(home: AgentTeamHome, runId: string): void {
-  const lockDir = join(home.runsDir, runId, 'lock');
-  const pidFile = join(lockDir, 'pid');
-  mkdirSync(lockDir, { recursive: true });
-  // 抢占上限：锁文件只在「判定残留 → 原子拿走」之间有限轮转，不可能无限竞争。
-  for (let attempt = 0; attempt < 32; attempt += 1) {
-    // 独占创建（wx）是唯一的所有权判定点：两个进程同时创建只会有一个成功。
-    try {
-      writeFileSync(pidFile, String(process.pid), { flag: 'wx' });
-      return;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-    }
-    const holder = readLockPid(pidFile);
-    if (holder !== undefined && isProcessAlive(holder)) {
-      throw new Error(`Run ${runId} is already executing in another process (pid ${holder})`);
-    }
-    // 原子接管：rename 拿走残留锁文件，输家得到 ENOENT 回到重试。
-    // 竞争者因此不可能删掉我们刚创建的锁（TOCTOU：读到的 pid 已死 ≠ 现在的文件还是它）。
-    const stolen = `${pidFile}.steal-${process.pid}`;
-    try {
-      renameSync(pidFile, stolen);
-    } catch {
-      continue; // 锁已被其他接管者拿走：按最新状态重新判定。
-    }
-    try {
-      const stolenPid = readLockPid(stolen);
-      if (stolenPid !== holder) {
-        // 判死之后锁已被并发接管者刷新：把锁还回去，按新持有者重新判定。
-        try {
-          renameSync(stolen, pidFile);
-        } catch {
-          // 还回失败（新持有者已重建锁文件）：按最新状态重新判定。
-        }
-        continue;
-      }
-    } finally {
-      rmSync(stolen, { force: true });
-    }
-  }
-  throw new Error(`Run ${runId} lock is contended by concurrent takeover attempts`);
-}
-
-function readLockPid(pidFile: string): number | undefined {
-  try {
-    const parsed = Number(readFileSync(pidFile, 'utf8'));
-    return Number.isSafeInteger(parsed) ? parsed : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function releaseRunLock(home: AgentTeamHome, runId: string): void {
-  rmSync(join(home.runsDir, runId, 'lock'), { recursive: true, force: true });
-}
-
 export function readGrantDecisions(grantPath: string): GrantDecisionMap {
   const raw = readJson(grantPath) as unknown;
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -367,6 +310,7 @@ function applyGrants(input: {
   policy: ReturnType<ProjectRegistry['getProjectPolicy']>;
   runId: string;
   pendingPath: string;
+  grantsPath: string;
   pending: PendingItem[];
   decisions: GrantDecisionMap;
 }): PendingItem[] {
@@ -381,6 +325,8 @@ function applyGrants(input: {
   const { approved, denied, unresolved } = partitionGrants(input.pending, input.decisions);
   const prefixes = new Set(input.policy.verificationAllowedCommandPrefixes);
   let allowlistChanged = false;
+  const grants = [...(readGrantsFileSync(input.grantsPath)?.grants ?? [])];
+  let grantsChanged = false;
   for (const item of approved) {
     for (const command of item.commands ?? []) {
       if (!prefixes.has(command)) {
@@ -388,10 +334,34 @@ function applyGrants(input: {
         allowlistChanged = true;
       }
     }
-    if (item.taskId !== null) input.db.updateTask(input.runId, item.taskId, { status: 'pending' });
+    if ((item.commands ?? []).length === 0 && item.tool !== undefined) {
+      const permission: GrantedPermission = { tool: item.tool, input: item.input };
+      const known = grants.some((grant) =>
+        grant.tool === permission.tool && canonicalJson(grant.input ?? null) === canonicalJson(permission.input ?? null)
+      );
+      if (!known) {
+        grants.push(permission);
+        grantsChanged = true;
+      }
+    }
+    // approved 不可重跑、blocked_on_contract 只能由契约修订恢复：
+    // 否则批准一条陈旧审批就能绕过「契约缺口只能修订恢复」与「approved 不重跑」的规则。
+    if (item.taskId !== null) {
+      const task = input.db.getTask(input.runId, item.taskId);
+      if (NON_GRANTABLE_TASK_STATUSES.has(task.status)) {
+        input.db.addEvent(input.runId, item.taskId, 'GRANT_SKIPPED_TASK_STATE', { status: task.status });
+      } else {
+        input.db.updateTask(input.runId, item.taskId, { status: 'pending' });
+      }
+    }
   }
   for (const item of denied) {
     if (item.taskId !== null) {
+      const task = input.db.getTask(input.runId, item.taskId);
+      if (NON_GRANTABLE_TASK_STATUSES.has(task.status)) {
+        input.db.addEvent(input.runId, item.taskId, 'GRANT_SKIPPED_TASK_STATE', { status: task.status });
+        continue;
+      }
       input.db.updateTask(input.runId, item.taskId, {
         status: 'failed',
         lastError: `Denied by outer decision: ${item.subject}`,
@@ -415,14 +385,25 @@ function applyGrants(input: {
     });
     input.db.updateRun(input.runId, { projectPolicyRevisionId: updated.currentPolicyRevisionId });
   }
+  if (grantsChanged) writeGrantsFileSync(input.grantsPath, { runId: input.runId, grants });
   writePendingFileSync(input.pendingPath, { runId: input.runId, pending: unresolved });
   return unresolved;
 }
 
+/**
+ * grant 不可重置的任务状态：approved 不可重跑，blocked_on_contract 只能由契约修订恢复。
+ * 其余状态（含 deny-and-collect 之后的 blocked、崩溃残留的 running）都可由外层 grant 重置重跑。
+ */
+const NON_GRANTABLE_TASK_STATUSES = new Set<TaskStatus>(['approved', 'blocked_on_contract']);
+
 async function registerContractProject(registry: ProjectRegistry, contract: ExecutionContract): Promise<ProjectRecord> {
   const repoRoot = contract.project.repoRoot;
+  // 注册是全局持久状态：必须在校验 Git 仓库之后再写入，否则非 Git 目录会留下
+  // 错误注册，后续同 project ID 的正常提交会一直撞上它。
+  await ensureGitRepo(repoRoot);
   const commonDir = await git(repoRoot, ['rev-parse', '--git-common-dir'], true);
-  const gitCommonDir = commonDir.stdout.trim() === '' ? repoRoot : resolve(repoRoot, commonDir.stdout.trim());
+  // 仓库根上输出为 '.'，链接工作树上输出主仓库 .git 的绝对路径；resolve 对两者都成立。
+  const gitCommonDir = resolve(repoRoot, commonDir.stdout.trim());
   const remote = await git(repoRoot, ['remote', 'get-url', 'origin'], true);
   const gitIdentity: JsonValue = remote.stdout.trim() === '' ? { root: repoRoot } : { remote: remote.stdout.trim() };
   const registered = registry.registerProject({
@@ -450,14 +431,4 @@ async function registerContractProject(registry: ProjectRegistry, contract: Exec
     );
   }
   return registered;
-}
-
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  if (value && typeof value === 'object') {
-    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b));
-    return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(',')}}`;
-  }
-  /* istanbul ignore next -- undefined never survives JSON round-trips. */
-  return JSON.stringify(value) ?? 'null';
 }

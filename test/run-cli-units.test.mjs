@@ -1,10 +1,11 @@
 import { test, vi } from 'vitest';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, symlinkSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { git } from '../src/core/git.ts';
-import { resolveAgentTeamHome } from '../src/core/home.ts';
+import { assertHomeOutsideRepo, resolveAgentTeamHome } from '../src/core/home.ts';
+import { DEFAULT_CONFIG } from '../src/core/defaults.ts';
 import { StateDatabase } from '../src/core/db.ts';
 import { ProjectRegistry } from '../src/core/project-registry.ts';
 import { runnerConfigFromProjectPolicy } from '../src/core/project-runtime.ts';
@@ -12,8 +13,10 @@ import { validateExecutionContract, assertExecutionContractFields } from '../src
 import { createExecutionRun } from '../src/core/execution-run.ts';
 import { applyContractRevision } from '../src/core/contract-revision.ts';
 import { readHandoff, writeHandoff } from '../src/core/handoff.ts';
-import { agentLogReadError, readAgentLog, reconnectAgentLogs } from '../src/core/agent-log.ts';
+import { agentLogReadError, readAgentLog } from '../src/core/agent-log.ts';
 import { cleanRunArtifacts } from '../src/core/run-clean.ts';
+import { acquireRunLock, releaseRunLock } from '../src/core/run-lock.ts';
+import { assertAllowedCommand, isAllowlistedCommand, isExactAllowlistEntry } from '../src/core/shell.ts';
 import {
   ApprovalCollector,
   extractCommands,
@@ -23,8 +26,11 @@ import {
   blockersPath,
   classifyRunExit,
   contractBlockers,
+  writeGrantsFileSync,
+  grantsItemPath,
   handoffPath,
   pendingItemPath,
+  readGrantsFileSync,
   readPendingFileSync,
   renderMachineSummary,
   renderRunSummary,
@@ -141,7 +147,8 @@ test('ApprovalCollector denies with guidance, persists items, and drives eager a
 
   const aborts = [];
   const collector = new ApprovalCollector({
-    runId: 'run-a', pendingPath, debounceMs: 0, exitMode: 'eager', allowedPrefixes: [], onEagerAbort: () => aborts.push('a')
+    runId: 'run-a', pendingPath, grantsPath: join(dir, 'grants.json'), debounceMs: 0, exitMode: 'eager',
+    allowedPrefixes: [], onEagerAbort: () => aborts.push('a')
   });
   assert.equal(collector.pending.length, 1);
   assert.equal(collector.hasPending, true);
@@ -173,7 +180,8 @@ test('ApprovalCollector denies with guidance, persists items, and drives eager a
 
   collector.dispose();
   const quiescent = new ApprovalCollector({
-    runId: 'other-run', pendingPath, debounceMs: 50, exitMode: 'quiescence', allowedPrefixes: [], onEagerAbort: () => aborts.push('never')
+    runId: 'other-run', pendingPath, grantsPath: join(dir, 'grants.json'), debounceMs: 50, exitMode: 'quiescence',
+    allowedPrefixes: [], onEagerAbort: () => aborts.push('never')
   });
   assert.equal(quiescent.pending.length, 0, 'items from another run are not carried over');
   await quiescent.requestApproval({
@@ -229,6 +237,17 @@ test('agent log rejects paths outside the managed run directory and non-files', 
 
   db.startAgentExecution({ runId: 'r1', agentId: 'w3', role: 'worker', backend: 'claude', logPath: join(home.runsDir, 'r1', 'missing.log') });
   await assert.rejects(readAgentLog(db, home.runsDir, 'r1', 'w3', 10, 1024), /does not exist/);
+
+  // realpath 通过之后 open 失败（权限拒绝）：按不可读分类。
+  const lockedLog = join(home.runsDir, 'r1', 'locked.log');
+  writeFileSync(lockedLog, 'secret\n', 'utf8');
+  chmodSync(lockedLog, 0o000);
+  db.startAgentExecution({ runId: 'r1', agentId: 'w4', role: 'worker', backend: 'claude', logPath: lockedLog });
+  try {
+    await assert.rejects(readAgentLog(db, home.runsDir, 'r1', 'w4', 10, 1024), /not readable/);
+  } finally {
+    chmodSync(lockedLog, 0o644);
+  }
   db.close();
 });
 
@@ -258,7 +277,7 @@ test('clean removes task and integration worktrees and branches, then cancels th
     });
     db.updateTask('r1', 'T001', { branch: integrationBranch, worktree: worktreePath });
     db.updateRun('r1', { integrationBranch, integrationWorktree: worktreePath });
-    result = await cleanRunArtifacts(db, 'r1');
+    result = await cleanRunArtifacts(db, home, 'r1');
     assert.deepEqual(result.removedWorktrees, [worktreePath]);
     assert.deepEqual(result.removedBranches, [integrationBranch]);
     const run = db.getRun('r1');
@@ -267,9 +286,46 @@ test('clean removes task and integration worktrees and branches, then cancels th
     const listed = await git(repoRoot, ['worktree', 'list', '--porcelain'], true);
     assert.doesNotMatch(listed.stdout, /agent-team\/r1\/integration/);
 
-    const second = await cleanRunArtifacts(db, 'r1');
+    const second = await cleanRunArtifacts(db, home, 'r1');
     assert.deepEqual(second.removedWorktrees, []);
     assert.deepEqual(second.removedBranches, []);
+    assert.equal(db.getRun('r1').status, 'cancelled');
+  } finally {
+    db.close();
+  }
+});
+
+test('clean takes the run lock: refuses live runners, takes over crash residue', async () => {
+  const repoRoot = scratch('agent-team-clean-lock-repo-');
+  writeFileSync(join(repoRoot, 'base.txt'), 'base\n', 'utf8');
+  await git(repoRoot, ['init', '-q']);
+  await git(repoRoot, ['config', 'user.email', 't@e.com']);
+  await git(repoRoot, ['config', 'user.name', 't']);
+  await git(repoRoot, ['add', '-A']);
+  await git(repoRoot, ['commit', '-q', '-m', 'base']);
+
+  const parent = scratch('agent-team-clean-lock-home-');
+  const home = resolveAgentTeamHome({ env: { AGENT_TEAM_HOME: join(parent, 'home') } });
+  const db = new StateDatabase(home.stateDb);
+  try {
+    db.createRun({ id: 'r1', repoRoot, goalFile: 'g', baseRef: 'HEAD', baseSha: 'base', adapter: 'external' });
+    db.insertTask('r1', {
+      id: 'T001', title: 't', description: 'd', dependsOn: [], allowedPaths: ['**'], blockedPaths: [],
+      acceptance: ['a'], verificationCommands: []
+    });
+    db.updateRun('r1', { status: 'running' });
+
+    // 活跃 runner 持有锁：clean 不得删除其 worktree/分支。
+    mkdirSync(join(home.runsDir, 'r1', 'lock'), { recursive: true });
+    writeFileSync(join(home.runsDir, 'r1', 'lock', 'pid'), String(process.pid), 'utf8');
+    await assert.rejects(cleanRunArtifacts(db, home, 'r1'), /already executing/);
+    assert.equal(db.getRun('r1').status, 'running', 'a live run must not be cancelled');
+
+    // 崩溃残留（pid 不存活）：接管锁后正常清理。
+    writeFileSync(join(home.runsDir, 'r1', 'lock', 'pid'), '999999', 'utf8');
+    const result = await cleanRunArtifacts(db, home, 'r1');
+    assert.deepEqual(result.removedWorktrees, []);
+    assert.deepEqual(result.removedBranches, []);
     assert.equal(db.getRun('r1').status, 'cancelled');
   } finally {
     db.close();
@@ -481,6 +537,11 @@ test('contract revision is atomic: a mid-flight failure leaves DB and files unto
     const revised = JSON.parse(JSON.stringify(contract));
     revised.tasks[0].acceptance = ['changed'];
     revised.tasks[1].acceptance = ['changed too'];
+    // 新增任务：回滚必须连带删除新暂存的产物（previous === null 分支）。
+    revised.tasks.push({
+      id: 'T003', title: 'n', description: 'new', dependsOn: ['T001'], allowedPaths: ['extra/**'],
+      blockedPaths: [], acceptance: ['new'], verificationCommands: []
+    });
 
     assert.throws(
       () => applyContractRevision({ db: exploding, projectRegistry: registry, home, runId, contract: revised }),
@@ -491,6 +552,7 @@ test('contract revision is atomic: a mid-flight failure leaves DB and files unto
     assert.deepEqual(JSON.parse(db.getTask(runId, 'T001').specJson).acceptance, ['first']);
     assert.deepEqual(JSON.parse(db.getTask(runId, 'T002').specJson).acceptance, ['docs']);
     assert.equal(db.getRun(runId).contractRevision, 1);
+    assert.throws(() => db.getTask(runId, 'T003'), /Task not found/);
 
     // 磁盘未留下半套状态：contract.json 与任务 Markdown 仍是旧版，且无临时文件残留。
     const stored = JSON.parse(readFileSync(join(home.runsDir, runId, 'contract.json'), 'utf8'));
@@ -614,22 +676,6 @@ test('agent log guards symlinks, empty files, CRLF, and non-regular targets', as
   ];
   for (const [message, pattern] of errorArms) assert.match(message, pattern);
 
-  const successDb = new StateDatabase(join(scratch('agent-team-agent-log-success-'), 'state.sqlite'));
-  successDb.createRun({ id: 'r2', repoRoot: parent, goalFile: 'g', baseRef: 'HEAD', baseSha: 's', adapter: 'external' });
-  mkdirSync(join(home.runsDir, 'r2', 'logs'), { recursive: true });
-  const okLog = join(home.runsDir, 'r2', 'logs', 'ok.log');
-  writeFileSync(okLog, 'ok-line', 'utf8');
-  successDb.startAgentExecution({ runId: 'r2', agentId: 'w', role: 'worker', backend: 'claude', logPath: okLog });
-  const reconnected = await reconnectAgentLogs(successDb, home.runsDir, 'r2', [
-    { runId: 'r2', agentId: 'w', role: 'worker', backend: 'claude', logPath: okLog, status: 'running' }
-  ]);
-  assert.equal(reconnected[0].status, 'available');
-  const failedReconnect = await reconnectAgentLogs(successDb, home.runsDir, 'r2', [
-    { runId: 'r2', agentId: 'ghost', role: 'worker', backend: 'claude', logPath: '/tmp/x', status: 'running' }
-  ], async () => { throw 'boom'; });
-  assert.equal(failedReconnect[0].status, 'unavailable');
-  assert.match(failedReconnect[0].reason, /unavailable: r2\/ghost/);
-  successDb.close();
 });
 
 test('ApprovalCollector tolerates non-numeric ids, null question tasks, and circular inputs', async () => {
@@ -640,7 +686,8 @@ test('ApprovalCollector tolerates non-numeric ids, null question tasks, and circ
     pending: [{ id: 'legacy-item', kind: 'question', taskId: null, agentId: 'w', subject: 'old', reason: 'r' }]
   });
   const collector = new ApprovalCollector({
-    runId: 'r1', pendingPath, debounceMs: 50, exitMode: 'quiescence', onEagerAbort: () => {}
+    runId: 'r1', pendingPath, grantsPath: join(dir, 'grants.json'), debounceMs: 50, exitMode: 'quiescence',
+    allowedPrefixes: [], onEagerAbort: () => {}
   });
   assert.equal(collector.pending[0].id, 'legacy-item');
 
@@ -661,25 +708,71 @@ test('ApprovalCollector tolerates non-numeric ids, null question tasks, and circ
   assert.equal(readPendingFileSync(pendingPath).pending.length, 3);
 });
 
-test('agent log maps unknown errno codes and reconnect Error instances', async () => {
+test('agent log maps unknown errno codes', () => {
   assert.match(agentLogReadError('r', 'a', { code: 'EIO' }).message, /unavailable: r\/a \(EIO\)/);
+});
 
-  const parent = scratch('agent-team-agent-log-reconnect-');
+test('command matchers accept the platform default and the lock rethrows real errors', () => {
+  // 缺省 platform 参数的调用形态（审批收集器即如此使用）。
+  assert.equal(isAllowlistedCommand('npm test', ['npm test', 'go test']), true);
+  assert.equal(isAllowlistedCommand('cargo build', ['npm test', 'go test']), false);
+  assert.equal(isExactAllowlistEntry('npm test', ['npm test -- --filter api']), false);
+  assert.equal(isExactAllowlistEntry('go test ./...', ['npm test', 'go test ./...']), true);
+
+  const parent = scratch('agent-team-lock-eisdir-');
   const home = resolveAgentTeamHome({ env: { AGENT_TEAM_HOME: join(parent, 'home') } });
-  const db = new StateDatabase(home.stateDb);
-  db.createRun({ id: 'r3', repoRoot: parent, goalFile: 'g', baseRef: 'HEAD', baseSha: 's', adapter: 'external' });
-  const failed = await reconnectAgentLogs(db, home.runsDir, 'r3', [
-    { runId: 'r3', agentId: 'ghost', role: 'worker', backend: 'claude', logPath: '/tmp/none', status: 'running' }
-  ]);
-  assert.equal(failed[0].status, 'unavailable');
-  assert.match(failed[0].reason, /not recorded: r3\/ghost/);
-  db.close();
+  // lock 目录不可写：wx 创建失败且不是 EEXIST，必须原样抛出而不是被当成锁竞争吞掉。
+  const lockDir = join(home.runsDir, 'r1', 'lock');
+  mkdirSync(lockDir, { recursive: true });
+  chmodSync(lockDir, 0o500);
+  try {
+    assert.throws(() => acquireRunLock(home, 'r1'), /EACCES|permission denied/i);
+  } finally {
+    chmodSync(lockDir, 0o755);
+  }
+});
+
+test('run lock treats unreadable pid files as crash residue and takes over', () => {
+  const parent = scratch('agent-team-lock-garbage-');
+  const home = resolveAgentTeamHome({ env: { AGENT_TEAM_HOME: join(parent, 'home') } });
+  mkdirSync(join(home.runsDir, 'r1', 'lock'), { recursive: true });
+  writeFileSync(join(home.runsDir, 'r1', 'lock', 'pid'), 'not-a-pid', 'utf8');
+  // 非数字 pid 读不出来（undefined ≠ 存活进程）：按残留接管，锁最终被本进程持有。
+  acquireRunLock(home, 'r1');
+  assert.equal(readFileSync(join(home.runsDir, 'r1', 'lock', 'pid'), 'utf8'), String(process.pid));
+  releaseRunLock(home, 'r1');
+});
+
+test('grants state file rejects malformed content and quarantines it', () => {
+  const dir = scratch('agent-team-grants-validate-');
+  const valid = join(dir, 'valid.json');
+  writeGrantsFileSync(valid, { runId: 'r1', grants: [{ tool: 'webfetch', input: { pattern: 'https://x' } }] });
+  assert.deepEqual(readGrantsFileSync(valid), { runId: 'r1', grants: [{ tool: 'webfetch', input: { pattern: 'https://x' } }] });
+
+  const malformed = [
+    JSON.stringify(['not', 'an', 'object']),
+    JSON.stringify({ grants: [] }),
+    JSON.stringify({ runId: 'r1', grants: 'nope' }),
+    JSON.stringify({ runId: 'r1', grants: ['not-an-object'] }),
+    JSON.stringify({ runId: 'r1', grants: [{ input: {} }] }),
+    JSON.stringify({ runId: 'r1', grants: [['odd']] })
+  ];
+  for (const [index, body] of malformed.entries()) {
+    const name = `malformed-${index}.json`;
+    writeFileSync(join(dir, name), body, 'utf8');
+    assert.equal(readGrantsFileSync(join(dir, name)), undefined, body);
+    // 损坏文件被隔离备份，原路径按不存在处理。
+    assert.ok(readdirSync(dir).some((entry) => entry.startsWith(`${name}.corrupt-`)), body);
+    assert.equal(existsSync(join(dir, name)), false, body);
+  }
+  assert.equal(readGrantsFileSync(join(dir, 'absent.json')), undefined);
 });
 
 test('ApprovalCollector records undefined tool input as unknown', async () => {
   const dir = scratch('agent-team-collector-undefined-');
   const collector = new ApprovalCollector({
-    runId: 'r1', pendingPath: join(dir, 'pending.json'), debounceMs: 0, exitMode: 'eager', allowedPrefixes: ['pnpm test'], onEagerAbort: () => {}
+    runId: 'r1', pendingPath: join(dir, 'pending.json'), grantsPath: join(dir, 'grants.json'), debounceMs: 0,
+    exitMode: 'eager', allowedPrefixes: ['pnpm test'], onEagerAbort: () => {}
   });
   const allowlisted = await collector.requestApproval({
     backend: 'claude', role: 'worker', cwd: '/w', kind: 'command', tool: 'Bash',
@@ -698,13 +791,13 @@ test('ApprovalCollector records undefined tool input as unknown', async () => {
 test('ApprovalCollector re-checks dangerous arguments even when the prefix is allowlisted', async () => {
   const dir = scratch('agent-team-collector-unsafe-');
   const collector = new ApprovalCollector({
-    runId: 'r1', pendingPath: join(dir, 'pending.json'), debounceMs: 0, exitMode: 'quiescence',
-    allowedPrefixes: ['git status', 'npm run'], onEagerAbort: () => {}
+    runId: 'r1', pendingPath: join(dir, 'pending.json'), grantsPath: join(dir, 'grants.json'), debounceMs: 0,
+    exitMode: 'quiescence', allowedPrefixes: ['git status', 'npm run build'], onEagerAbort: () => {}
   });
   const requests = [
     // 批准过 `git status` 不等于批准 `git status --ext-diff`（helper 执行）
     { command: 'git status --ext-diff' },
-    // 批准过 `npm run` 不等于批准携带路径/配置覆盖的变体
+    // 批准过 `npm run build` 不等于批准携带路径覆盖的变体
     { command: 'npm run build --prefix /elsewhere' }
   ];
   for (const input of requests) {
@@ -723,5 +816,82 @@ test('ApprovalCollector re-checks dangerous arguments even when the prefix is al
   });
   assert.equal(safe, 'once');
   assert.equal(collector.pending.length, requests.length);
+  collector.dispose();
+});
+
+test('ApprovalCollector auto-approves granted non-command permissions on replay', async () => {
+  const dir = scratch('agent-team-collector-grants-');
+  const pendingPath = join(dir, 'pending.json');
+  const grantsPath = join(dir, 'grants.json');
+  // 既有授权缺 input 字段：匹配必须把 undefined 归一为 null，而不是崩溃或误判。
+  writeGrantsFileSync(grantsPath, { runId: 'other-run', grants: [{ tool: 'untouched' }] });
+
+  // 第一轮：非命令权限（网络、外部目录）没有 allowlist 载体 → deny 并记录。
+  const first = new ApprovalCollector({
+    runId: 'r1', pendingPath, grantsPath, debounceMs: 0, exitMode: 'quiescence',
+    allowedPrefixes: [], onEagerAbort: () => {}
+  });
+  assert.equal(await first.requestApproval({
+    backend: 'opencode', role: 'worker', cwd: '/w', kind: 'network', tool: 'webfetch',
+    input: { pattern: 'https://example.test' }, allowSession: false
+  }), 'deny');
+  assert.equal(first.pending.length, 1);
+  assert.equal(first.pending[0].tool, 'webfetch');
+  first.dispose();
+
+  // 外层批准沉淀为 run 内授权：重放对 tool+input 精确匹配的请求直接放行。
+  writeGrantsFileSync(grantsPath, {
+    runId: 'r1',
+    grants: [{ tool: 'webfetch', input: { pattern: 'https://example.test' } }]
+  });
+  const second = new ApprovalCollector({
+    runId: 'r1', pendingPath, grantsPath, debounceMs: 0, exitMode: 'quiescence',
+    allowedPrefixes: [], onEagerAbort: () => {}
+  });
+  assert.equal(await second.requestApproval({
+    backend: 'opencode', role: 'worker', cwd: '/w', kind: 'network', tool: 'webfetch',
+    input: { pattern: 'https://example.test' }, allowSession: false
+  }), 'once');
+  // 同 tool 但 input 不同（或 runId 不同）不匹配。
+  assert.equal(await second.requestApproval({
+    backend: 'opencode', role: 'worker', cwd: '/w', kind: 'network', tool: 'webfetch',
+    input: { pattern: 'https://other.test' }, allowSession: false
+  }), 'deny');
+  // 沉淀过的授权本身没有 input：无 input 的同工具请求凭归一化 null 匹配。
+  writeGrantsFileSync(grantsPath, { runId: 'r1', grants: [{ tool: 'bare-tool' }] });
+  const third = new ApprovalCollector({
+    runId: 'r1', pendingPath, grantsPath, debounceMs: 0, exitMode: 'quiescence',
+    allowedPrefixes: [], onEagerAbort: () => {}
+  });
+  assert.equal(await third.requestApproval({
+    backend: 'opencode', role: 'worker', cwd: '/w', kind: 'tool', tool: 'bare-tool',
+    input: undefined, allowSession: false
+  }), 'once');
+  third.dispose();
+  second.dispose();
+});
+
+test('default allowlist does not auto-approve arbitrary npm scripts or pass-through arguments', async () => {
+  const dir = scratch('agent-team-collector-npm-defaults-');
+  const collector = new ApprovalCollector({
+    runId: 'r1', pendingPath: join(dir, 'pending.json'), grantsPath: join(dir, 'grants.json'),
+    debounceMs: 0, exitMode: 'quiescence',
+    allowedPrefixes: DEFAULT_CONFIG.verification.allowedCommandPrefixes, onEagerAbort: () => {}
+  });
+  // 任意 npm script 不再被 `npm run` 盲目前缀放行。
+  assert.equal(await collector.requestApproval({
+    backend: 'claude', role: 'worker', cwd: '/w', kind: 'command', tool: 'Bash',
+    input: { command: 'npm run deploy' }, allowSession: false
+  }), 'deny');
+  // `npm test -- -u`（快照写入等透传参数）必须走审批。
+  assert.equal(await collector.requestApproval({
+    backend: 'claude', role: 'worker', cwd: '/w', kind: 'command', tool: 'Bash',
+    input: { command: 'npm test -- -u' }, allowSession: false
+  }), 'deny');
+  // 无透传参数的标准测试命令仍直接放行。
+  assert.equal(await collector.requestApproval({
+    backend: 'claude', role: 'worker', cwd: '/w', kind: 'command', tool: 'Bash',
+    input: { command: 'npm test' }, allowSession: false
+  }), 'once');
   collector.dispose();
 });

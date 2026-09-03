@@ -6,7 +6,8 @@ const control = vi.hoisted(() => ({
   runOutcome: null,
   cleaned: [],
   logs: [],
-  failNext: false
+  failNext: false,
+  failRunId: undefined
 }));
 
 vi.mock('../src/core/run-execute.ts', async (importOriginal) => {
@@ -15,7 +16,7 @@ vi.mock('../src/core/run-execute.ts', async (importOriginal) => {
     ...actual,
     executeRunCommand: async (options) => {
       control.runOptions.push(options);
-      if (control.failNext) throw new Error('boom');
+      if (control.failNext) throw Object.assign(new Error('boom'), { runId: control.failRunId });
       if (control.runOutcome) return control.runOutcome;
       return {
         runId: 'r9', exitCode: 0, kind: 'done', runStatus: 'done', contractRevision: 1,
@@ -27,8 +28,8 @@ vi.mock('../src/core/run-execute.ts', async (importOriginal) => {
 });
 
 vi.mock('../src/core/run-clean.ts', () => ({
-  cleanRunArtifacts: async (_db, runId) => {
-    control.cleaned.push(runId);
+  cleanRunArtifacts: async (_db, home, runId) => {
+    control.cleaned.push({ home, runId });
     return { removedWorktrees: [`/wt/${runId}`], removedBranches: [`agent-team/${runId}/integration`] };
   }
 }));
@@ -117,13 +118,25 @@ test('run reports a machine-readable terminal state when execution throws', asyn
   const errSpy = vi.spyOn(console, 'error').mockImplementation((value = '') => errors.push(String(value)));
   const previousExitCode = process.exitCode;
   try {
+    // 错误携带 runId：失败 JSON 带上它，外层才能定位已创建的 run。
+    control.failRunId = 'r-crash';
     await runCli(['run', 'boom.json']);
     assert.equal(process.exitCode, 1);
     assert.match(errors.join('\n'), /"kind":"failed"/);
+    expect(JSON.parse(errors.at(-1))).toMatchObject({ kind: 'failed', exit: 1, runId: 'r-crash' });
+
+    // runId 尚未确定的异常（例如契约读取失败）：JSON 不带 runId 字段。
+    control.failRunId = undefined;
+    errors.length = 0;
+    await runCli(['run', 'boom.json']);
+    assert.equal(process.exitCode, 1);
+    const payload = JSON.parse(errors.at(-1));
+    assert.deepEqual(payload, { kind: 'failed', exit: 1, error: 'Error: boom' });
   } finally {
     process.exitCode = previousExitCode;
     errSpy.mockRestore();
     control.failNext = false;
+    control.failRunId = undefined;
   }
 });
 
@@ -175,7 +188,13 @@ test('log tails a recorded agent log with bounds validation', async () => {
 test('clean removes run artifacts through the core cleaner', async () => {
   control.cleaned = [];
   const { output } = await capture(['clean', 'r1', '--home', '/tmp/clean-home']);
-  assert.deepEqual(control.cleaned, ['r1']);
+  assert.deepEqual(control.cleaned, [{
+    home: {
+      root: '/tmp/clean-home', runsDir: '/tmp/clean-home/runs',
+      stateDb: '/tmp/clean-home/state.sqlite', worktreesDir: '/tmp/clean-home/worktrees'
+    },
+    runId: 'r1'
+  }]);
   assert.match(output.join('\n'), /Removed 1 worktree\(s\) and 1 branch\(es\) for run r1\./);
   await assert.rejects(runCli(['clean']), /Usage:/);
   await assert.rejects(runCli(['clean', 'r1', 'extra']), /Unknown clean argument/);

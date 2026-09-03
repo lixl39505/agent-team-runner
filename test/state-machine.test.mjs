@@ -30,7 +30,7 @@ function configFor(repoRoot) {
     concurrency: 1,
     retry: { ...DEFAULT_CONFIG.retry, maxWorkerAttempts: 2, maxReviewCycles: 2 },
     integration: { ...DEFAULT_CONFIG.integration },
-    verification: { ...DEFAULT_CONFIG.verification, globalCommands: [] }
+    verification: { ...DEFAULT_CONFIG.verification }
   };
 }
 
@@ -197,16 +197,9 @@ test('orchestrator waits for dependencies and injects their commits into worktre
   }
 });
 
-test('orchestrator records a failed run when global integration verification fails', async () => {
+test('orchestrator replays a run that crashed while integrating', async () => {
   const repoRoot = await repository();
-  const config = {
-    ...configFor(repoRoot),
-    verification: {
-      ...DEFAULT_CONFIG.verification,
-      allowedCommandPrefixes: ['node -e'],
-      globalCommands: ['node -e "process.exit(1)"']
-    }
-  };
+  const config = configFor(repoRoot);
   const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   const manifest = { version: 1, title: 'Run', summary: 'test run', tasks: [task()] };
   const backend = new ScriptBackend((spec) => {
@@ -219,12 +212,15 @@ test('orchestrator records a failed run when global integration verification fai
   });
   try {
     await createPlannedRun(db, config, manifest);
-    await assert.rejects(
-      runOrchestrator({ config, db, runId: 'run', backends: backendPool(backend) }),
-      /Global verification failed \(1\)/
-    );
-    assert.equal(db.getRun('run').status, 'failed');
-    assert.equal(eventTypes(db, 'run').includes('RUN_FAILED'), true);
+    await runOrchestrator({ config, db, runId: 'run', backends: backendPool(backend) });
+    assert.equal(db.getRun('run').status, 'done');
+
+    // 进程在集成途中崩溃：run 停在 integrating。集成工作区会在重放时从 baseSha 强制重建。
+    db.updateRun('run', { status: 'integrating', error: 'crashed mid-integration', finishedAt: null, integrationCommit: null });
+    await runOrchestrator({ config, db, runId: 'run', backends: backendPool(backend) });
+    assert.equal(db.getRun('run').status, 'done');
+    assert.notEqual(db.getRun('run').integrationCommit, null);
+    assert.equal(eventTypes(db, 'run').filter((type) => type === 'INTEGRATION_COMPLETED').length, 2);
   } finally {
     db.close();
   }

@@ -52,3 +52,20 @@ test('database rolls back failed contract revisions and lease acquisitions', () 
     db.close();
   }
 });
+
+test('nested transactions roll back to savepoints and keep the connection usable', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'agent-team-db-nested-tx-'));
+  const db = new StateDatabase(join(directory, 'state.sqlite'));
+  try {
+    assert.throws(() => db.transaction(() => {
+      db.transaction(() => { throw new Error('inner boom'); });
+    }), /inner boom/);
+    // 嵌套 SAVEPOINT 回滚之后，连接的嵌套深度与新事务都必须恢复正常。
+    db.createRun({
+      id: 'after-nested', repoRoot: directory, goalFile: 'goal.md', baseRef: 'HEAD', baseSha: 'base', adapter: 'cli'
+    });
+    assert.equal(db.getRun('after-nested').id, 'after-nested');
+  } finally {
+    db.close();
+  }
+});

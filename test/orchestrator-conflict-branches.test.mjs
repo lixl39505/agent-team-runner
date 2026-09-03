@@ -32,7 +32,7 @@ function configFor(repoRoot, overrides = {}) {
     retry: { ...DEFAULT_CONFIG.retry, maxWorkerAttempts: 2, ...retry },
     status: { ...DEFAULT_CONFIG.status, ...status },
     integration: { ...DEFAULT_CONFIG.integration },
-    verification: { ...DEFAULT_CONFIG.verification, globalCommands: [] },
+    verification: { ...DEFAULT_CONFIG.verification },
     ...rest
   };
 }
@@ -188,19 +188,16 @@ test('orchestrator lets the integrator resolve a real cherry-pick conflict withi
     name: 'merge', role: 'integrator', source: 'project', path: '/stored/merge/SKILL.md', sha256: 'integrator-sha', content: 'Use the stored integrator snapshot.'
   }]]]));
   try {
-    const events = [];
     await runOrchestrator({
       config: setup.config,
       db: setup.db,
       runId: 'run',
-      backends: backendPool(setup.backend),
-      onAgentEvent: (execution, event) => events.push([execution.role, event.type])
+      backends: backendPool(setup.backend)
     });
 
     const run = setup.db.getRun('run');
     assert.equal(run.status, 'done');
     assert.equal(setup.backend.specs.length, 1);
-    assert.deepEqual(events, [['integrator', 'activity']]);
     assert.equal(readFileSync(join(run.integrationWorktree, 'src', 'feature.txt'), 'utf8'), 'resolved\n');
     assert.equal((await git(run.integrationWorktree, ['status', '--porcelain'])).stdout, '');
   } finally {

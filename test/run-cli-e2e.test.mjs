@@ -8,7 +8,7 @@ import { resolveAgentTeamHome } from '../src/core/home.ts';
 import { ProjectRegistry } from '../src/core/project-registry.ts';
 import { StateDatabase } from '../src/core/db.ts';
 import { executeRunCommand } from '../src/core/run-execute.ts';
-import { blockersPath, pendingItemPath } from '../src/core/run-exit.ts';
+import { blockersPath, grantsItemPath, pendingItemPath } from '../src/core/run-exit.ts';
 
 async function repository(prefix) {
   const repoRoot = mkdtempSync(join(tmpdir(), `${prefix}-`));
@@ -352,4 +352,213 @@ test('a failure after run creation persists exit artifacts and reports the runId
   assert.deepEqual(pending.pending, []);
   const blockers = JSON.parse(readFileSync(blockersPath(home.runsDir, first.runId), 'utf8'));
   assert.deepEqual(blockers.blockers.map((blocker) => blocker.taskId), ['T001']);
+});
+
+test('grants never unblock contract-blocked tasks; only a revision does', async () => {
+  const repoRoot = await repository('agent-team-run-grant-block-');
+  const home = tempHome();
+  const contractPath = join(repoRoot, 'contract.json');
+  writeFileSync(contractPath, JSON.stringify(contractFor(repoRoot)));
+
+  const first = await executeRunCommand({
+    contractPath, home, backends: pool(workerHandler({ approvals: 0, contractBlock: true })), exitMode: 'quiescence'
+  });
+  assert.equal(first.exitCode, 11);
+
+  // 伪造一条指向 blocked_on_contract 任务的陈旧审批：grant approve 不得把它打回 pending。
+  const pendingPath = pendingItemPath(home.runsDir, first.runId);
+  const pendingFile = JSON.parse(readFileSync(pendingPath, 'utf8'));
+  pendingFile.pending.push({
+    id: 'p1', kind: 'approval', taskId: 'T001', agentId: 'worker:claude',
+    subject: 'stale approval', reason: 'r', commands: ['pnpm add zod']
+  });
+  writeFileSync(pendingPath, JSON.stringify(pendingFile), 'utf8');
+  const decisionsPath = join(repoRoot, 'decisions.json');
+  writeFileSync(decisionsPath, JSON.stringify({ p1: 'approve' }));
+
+  const second = await executeRunCommand({
+    contractPath, runId: first.runId, grantPath: decisionsPath, home,
+    backends: pool(workerHandler({ approvals: 0 })), exitMode: 'quiescence'
+  });
+  assert.equal(second.exitCode, 11, 'approve must not bypass the revision-only recovery rule');
+  assert.deepEqual(second.tasks.map((task) => task.status), ['blocked_on_contract']);
+  const db = new StateDatabase(home.stateDb);
+  const events = db.db.prepare("SELECT event_type FROM events WHERE run_id = ? AND task_id = 'T001' ORDER BY id").all(first.runId);
+  db.close();
+  assert.ok(events.some((row) => row.event_type === 'GRANT_SKIPPED_TASK_STATE'));
+
+  // 修订契约（不带 grant）是唯一恢复路径，且修订成功。
+  const revised = contractFor(repoRoot);
+  revised.tasks[0].allowedPaths = ['src/**', 'docs/**'];
+  const revisedPath = join(repoRoot, 'contract-v2.json');
+  writeFileSync(revisedPath, JSON.stringify(revised));
+  const third = await executeRunCommand({
+    contractPath: revisedPath, runId: first.runId, home,
+    backends: pool(workerHandler({ approvals: 0 })), exitMode: 'quiescence'
+  });
+  assert.equal(third.exitCode, 0);
+  assert.equal(third.contractRevision, 2);
+  assert.deepEqual(third.tasks.map((task) => task.status), ['approved']);
+});
+
+test('grants and a revised contract can be combined in one reentry', async () => {
+  const repoRoot = await repository('agent-team-run-grant-revise-');
+  const home = tempHome();
+  const contractPath = join(repoRoot, 'contract.json');
+  writeFileSync(contractPath, JSON.stringify(contractFor(repoRoot)));
+
+  const first = await executeRunCommand({
+    contractPath, home, backends: pool(workerHandler({ approvals: 0, contractBlock: true })), exitMode: 'quiescence'
+  });
+  assert.equal(first.exitCode, 11);
+  const pendingPath = pendingItemPath(home.runsDir, first.runId);
+  const pendingFile = JSON.parse(readFileSync(pendingPath, 'utf8'));
+  pendingFile.pending.push({
+    id: 'p1', kind: 'approval', taskId: 'T001', agentId: 'worker:claude',
+    subject: 'stale approval', reason: 'r', commands: ['pnpm add zod']
+  });
+  writeFileSync(pendingPath, JSON.stringify(pendingFile), 'utf8');
+
+  const revised = contractFor(repoRoot);
+  revised.tasks[0].allowedPaths = ['src/**', 'docs/**'];
+  const revisedPath = join(repoRoot, 'contract-v2.json');
+  writeFileSync(revisedPath, JSON.stringify(revised));
+  const decisionsPath = join(repoRoot, 'decisions.json');
+  writeFileSync(decisionsPath, JSON.stringify({ p1: 'approve' }));
+
+  const second = await executeRunCommand({
+    contractPath: revisedPath, runId: first.runId, grantPath: decisionsPath, home,
+    backends: pool(workerHandler({ approvals: 0 })), exitMode: 'quiescence'
+  });
+  // grant 沉淀 allowlist 但不触碰 blocked 任务；修订负责重置并完成 run。
+  assert.equal(second.exitCode, 0);
+  assert.equal(second.contractRevision, 2);
+  assert.deepEqual(second.tasks.map((task) => task.status), ['approved']);
+  const registry = new ProjectRegistry(home.stateDb);
+  const policy = registry.getProjectPolicy('e2e-project');
+  registry.close();
+  assert.ok(policy.verificationAllowedCommandPrefixes.includes('pnpm add zod'));
+});
+
+test('approving a stale pending item never reruns an approved task', async () => {
+  const repoRoot = await repository('agent-team-run-approved-grant-');
+  const home = tempHome();
+  const contract = contractFor(repoRoot);
+  contract.tasks.push({
+    id: 'T002', title: 'Follow-up', description: 'Add the follow-up file.',
+    dependsOn: ['T001'], allowedPaths: ['src/**'], blockedPaths: [],
+    acceptance: ['follow-up exists'], verificationCommands: []
+  });
+  const contractPath = join(repoRoot, 'contract.json');
+  writeFileSync(contractPath, JSON.stringify(contract));
+
+  const workerRuns = [];
+  const handler = async (spec) => {
+    if (spec.role === 'worker') {
+      workerRuns.push(spec.taskId);
+      if (spec.taskId === 'T001') writeFileSync(join(spec.cwd, 'src', 'feature.txt'), 'changed\n', 'utf8');
+      else writeFileSync(join(spec.cwd, 'src', 'followup.txt'), 'follow-up\n', 'utf8');
+      if (spec.taskId === 'T002') {
+        const decision = await spec.requestApproval({
+          backend: 'claude', role: 'worker', cwd: spec.cwd, taskId: spec.taskId,
+          kind: 'command', tool: 'Bash', input: { command: 'pnpm add zod' }, allowSession: false
+        });
+        if (decision === 'deny') {
+          return { status: 'blocked', summary: 'needs pnpm add zod', testsRun: [], knownRisks: [], blockedReason: 'denied' };
+        }
+      }
+      return WORKER_COMPLETED;
+    }
+    return spec.role === 'reviewer' ? APPROVED_REVIEW : WORKER_COMPLETED;
+  };
+
+  const first = await executeRunCommand({ contractPath, home, backends: pool(handler), exitMode: 'quiescence' });
+  assert.equal(first.exitCode, 10);
+  assert.deepEqual(workerRuns, ['T001', 'T002']);
+
+  // T001 已 approved：指向它的陈旧 pending 被 grant approve 后不得复活。
+  const pendingPath = pendingItemPath(home.runsDir, first.runId);
+  const pendingFile = JSON.parse(readFileSync(pendingPath, 'utf8'));
+  pendingFile.pending.push({
+    id: 'p2', kind: 'approval', taskId: 'T001', agentId: 'worker:claude',
+    subject: 'stale approval', reason: 'r', commands: ['npm run docs']
+  });
+  writeFileSync(pendingPath, JSON.stringify(pendingFile), 'utf8');
+  const decisionsPath = join(repoRoot, 'decisions.json');
+  writeFileSync(decisionsPath, JSON.stringify({ p1: 'approve', p2: 'approve' }));
+
+  const workerRunsBeforeReplay = workerRuns.length;
+  const second = await executeRunCommand({
+    contractPath, runId: first.runId, grantPath: decisionsPath, home, backends: pool(handler), exitMode: 'quiescence'
+  });
+  assert.equal(second.exitCode, 0);
+  assert.equal(second.runStatus, 'done');
+  assert.equal(workerRuns.filter((taskId) => taskId === 'T001').length, 1, 'approved tasks never rerun');
+  assert.deepEqual(workerRuns.slice(workerRunsBeforeReplay), ['T002']);
+  const db = new StateDatabase(home.stateDb);
+  const t001 = db.getTask(first.runId, 'T001');
+  const t002 = db.getTask(first.runId, 'T002');
+  db.close();
+  assert.equal(t001.status, 'approved');
+  assert.equal(t002.status, 'approved');
+});
+
+test('a granted non-command permission auto-approves the same request on replay', async () => {
+  const repoRoot = await repository('agent-team-run-permission-grant-');
+  const home = tempHome();
+  const contractPath = join(repoRoot, 'contract.json');
+  writeFileSync(contractPath, JSON.stringify(contractFor(repoRoot)));
+
+  const handler = async (spec) => {
+    if (spec.role === 'worker') {
+      writeFileSync(join(spec.cwd, 'src', 'feature.txt'), 'changed\n', 'utf8');
+      const decision = await spec.requestApproval({
+        backend: 'claude', role: 'worker', cwd: spec.cwd, taskId: spec.taskId,
+        kind: 'network', tool: 'WebFetch', input: { url: 'https://example.test' }, allowSession: false
+      });
+      if (decision === 'deny') {
+        return { status: 'blocked', summary: 'needs WebFetch', testsRun: [], knownRisks: [], blockedReason: 'WebFetch was denied' };
+      }
+      return WORKER_COMPLETED;
+    }
+    return spec.role === 'reviewer' ? APPROVED_REVIEW : WORKER_COMPLETED;
+  };
+
+  const first = await executeRunCommand({ contractPath, home, backends: pool(handler), exitMode: 'quiescence' });
+  assert.equal(first.exitCode, 10);
+  assert.equal(first.pending[0].tool, 'WebFetch');
+  assert.equal(first.pending[0].commands, undefined);
+
+  const decisionsPath = join(repoRoot, 'decisions.json');
+  writeFileSync(decisionsPath, JSON.stringify({ p1: 'approve' }));
+  const second = await executeRunCommand({
+    contractPath, runId: first.runId, grantPath: decisionsPath, home, backends: pool(handler), exitMode: 'quiescence'
+  });
+  // 非命令授权沉淀为 run 内授权：重放不再重复 exit 10。
+  assert.equal(second.exitCode, 0);
+  assert.equal(second.runStatus, 'done');
+  const grants = JSON.parse(readFileSync(grantsItemPath(home.runsDir, first.runId), 'utf8'));
+  assert.deepEqual(grants.grants, [{ tool: 'WebFetch', input: { url: 'https://example.test' } }]);
+});
+
+test('home inside the project repository is rejected before any state is written', async () => {
+  const repoRoot = await repository('agent-team-run-home-guard-');
+  const contractPath = join(repoRoot, 'contract.json');
+  writeFileSync(contractPath, JSON.stringify(contractFor(repoRoot)));
+
+  // home 指向仓库内的子目录：拒绝，且仓库内不得出现任何 runner 状态。
+  const nestedHome = resolveAgentTeamHome({ env: { AGENT_TEAM_HOME: join(repoRoot, 'runner-state') } });
+  await assert.rejects(
+    executeRunCommand({ contractPath, home: nestedHome, backends: pool(workerHandler({ approvals: 0 })) }),
+    /must never live inside the repository/
+  );
+  assert.equal(existsSync(join(repoRoot, 'runner-state')), false);
+
+  // home 恰好等于仓库根同样拒绝。
+  const repoHome = resolveAgentTeamHome({ env: { AGENT_TEAM_HOME: repoRoot } });
+  await assert.rejects(
+    executeRunCommand({ contractPath, home: repoHome, backends: pool(workerHandler({ approvals: 0 })) }),
+    /must never live inside the repository/
+  );
+  assert.equal(existsSync(join(repoRoot, 'state.sqlite')), false);
 });

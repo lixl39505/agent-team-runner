@@ -13,6 +13,7 @@ import { createExecutionRun } from '../src/core/execution-run.ts';
 import { applyContractRevision } from '../src/core/contract-revision.ts';
 import { readHandoff } from '../src/core/handoff.ts';
 import { cleanRunArtifacts } from '../src/core/run-clean.ts';
+import { grantsItemPath, writeGrantsFileSync } from '../src/core/run-exit.ts';
 import { readPendingFileSync } from '../src/core/run-exit.ts';
 import { executeRunCommand } from '../src/core/run-execute.ts';
 
@@ -526,7 +527,7 @@ test('auto-registration rejects a contract id that collides with an existing pro
   );
 });
 
-test('auto-registration tolerates repositories without remotes or git metadata', async () => {
+test('auto-registration rejects non-Git directories before writing global registration', async () => {
   const plainDir = scratch('agent-team-cov-plain-');
   const previousHome = process.env.AGENT_TEAM_HOME;
   process.env.AGENT_TEAM_HOME = join(scratch('agent-team-cov-plain-home-'), 'home');
@@ -535,17 +536,36 @@ test('auto-registration tolerates repositories without remotes or git metadata',
   try {
     await assert.rejects(
       executeRunCommand({ contractPath, backends: { claude: {}, codex: {}, opencode: {} } }),
-      /git/i
+      /not a Git repository|git rev-parse/i
     );
+    // 注册表必须保持干净：残留的错误注册会让后续同 ID 的正常提交永远撞上它。
     const registry = new ProjectRegistry(join(process.env.AGENT_TEAM_HOME, 'state.sqlite'));
-    const project = registry.getProject('cov-project');
-    assert.deepEqual(project.gitIdentity, { root: plainDir });
-    assert.equal(project.gitCommonDir, plainDir);
+    assert.throws(() => registry.getProject('cov-project'), /Project not found: cov-project/);
     registry.close();
   } finally {
     if (previousHome === undefined) delete process.env.AGENT_TEAM_HOME;
     else process.env.AGENT_TEAM_HOME = previousHome;
   }
+});
+
+test('auto-registration tolerates repositories without remotes', async () => {
+  const repoRoot = scratch('agent-team-cov-noremote-repo-');
+  writeFileSync(join(repoRoot, 'base.txt'), 'base\n', 'utf8');
+  await git(repoRoot, ['init', '-q']);
+  await git(repoRoot, ['config', 'user.email', 't@e.com']);
+  await git(repoRoot, ['config', 'user.name', 't']);
+  await git(repoRoot, ['add', '-A']);
+  await git(repoRoot, ['commit', '-q', '-m', 'base']);
+  const home = resolveAgentTeamHome({ env: { AGENT_TEAM_HOME: join(scratch('agent-team-cov-noremote-home-'), 'home') } });
+  const contractPath = join(repoRoot, 'contract.json');
+  writeFileSync(contractPath, JSON.stringify(contractFor(repoRoot, (c) => { c.tasks[0].allowedPaths = ['**']; })));
+  // 空 backend 记录让任务失败（exit 1），但注册本身发生在编排之前。
+  const outcome = await executeRunCommand({ contractPath, home, backends: { claude: {}, codex: {}, opencode: {} } });
+  assert.equal(outcome.exitCode, 1);
+  const registry = new ProjectRegistry(home.stateDb);
+  const project = registry.getProject('cov-project');
+  assert.deepEqual(project.gitIdentity, { root: repoRoot });
+  registry.close();
 });
 
 test('clean skips tasks without worktrees and runs without integration artifacts', async () => {
@@ -561,10 +581,94 @@ test('clean skips tasks without worktrees and runs without integration artifacts
   try {
     db.createRun({ id: 'r2', repoRoot, goalFile: 'g', baseRef: 'HEAD', baseSha: 'base', adapter: 'external' });
     db.insertTask('r2', { id: 'T001', title: 't', description: 'd', dependsOn: [], allowedPaths: ['**'], blockedPaths: [], acceptance: ['a'], verificationCommands: [] });
-    const result = await cleanRunArtifacts(db, 'r2');
+    const result = await cleanRunArtifacts(db, home, 'r2');
     assert.deepEqual(result.removedWorktrees, []);
     assert.deepEqual(result.removedBranches, []);
     assert.equal(db.getRun('r2').status, 'cancelled');
+  } finally {
+    db.close();
+  }
+});
+
+test('grant sedimentation dedupes permissions and respects terminal task states', async () => {
+  const repoRoot = scratch('agent-team-cov-grant-dedup-repo-');
+  writeFileSync(join(repoRoot, 'base.txt'), 'base\n', 'utf8');
+  await git(repoRoot, ['init', '-q']);
+  await git(repoRoot, ['config', 'user.email', 't@e.com']);
+  await git(repoRoot, ['config', 'user.name', 't']);
+  await git(repoRoot, ['add', '-A']);
+  await git(repoRoot, ['commit', '-q', '-m', 'base']);
+  const home = resolveAgentTeamHome({ env: { AGENT_TEAM_HOME: join(scratch('agent-team-cov-grant-dedup-home-'), 'home') } });
+  const contractPath = join(repoRoot, 'contract.json');
+  writeFileSync(contractPath, JSON.stringify(contractFor(repoRoot, (c) => { c.tasks[0].allowedPaths = ['**']; })));
+
+  const backend = {
+    id: 'claude', capabilities: { maxTurns: true, resumeSession: true },
+    async discover() { return { backend: 'claude', installed: true, authed: true }; },
+    async listModels() { return []; },
+    async probe() { return { ok: true, latencyMs: 1 }; },
+    async openSession(spec) {
+      return {
+        async interrupt() {},
+        async close() {},
+        completion: async () => {
+          if (spec.role === 'worker') writeFileSync(join(spec.cwd, 'base.txt'), 'changed\n', 'utf8');
+          const output = spec.role === 'reviewer'
+            ? { decision: 'approved', summary: 'ok', findings: [], requiredChanges: [] }
+            : { status: 'completed', summary: 'did it', testsRun: [], knownRisks: [] };
+          return { ok: true, output, timedOut: false, stalled: false };
+        }
+      };
+    }
+  };
+  const backends = { claude: backend, codex: backend, opencode: backend };
+
+  const first = await executeRunCommand({ contractPath, home, backends, exitMode: 'quiescence' });
+  assert.equal(first.exitCode, 0);
+  const taskId = first.tasks[0].taskId;
+
+  // 已有授权（无 input 字段）：重复沉淀必须被去重。
+  const grantsPath = grantsItemPath(home.runsDir, first.runId);
+  writeGrantsFileSync(grantsPath, { runId: first.runId, grants: [{ tool: 'WebFetch' }] });
+
+  const pendingPath = join(home.runsDir, first.runId, 'pending.json');
+  writeFileSync(pendingPath, JSON.stringify({
+    runId: first.runId,
+    pending: [
+      { id: 'p1', kind: 'approval', taskId: null, agentId: 'worker:claude', subject: 'same tool', reason: 'r', tool: 'WebFetch' },
+      { id: 'p2', kind: 'approval', taskId: null, agentId: 'worker:claude', subject: 'new permission', reason: 'r', tool: 'WebFetch', input: { url: 'https://x.test' } },
+      { id: 'p3', kind: 'approval', taskId: taskId, agentId: 'worker:claude', subject: 'approved task', reason: 'r', commands: ['npm run docs'] },
+      { id: 'p4', kind: 'approval', taskId: taskId, agentId: 'worker:claude', subject: 'denied on approved task', reason: 'r', tool: 'Shell' }
+    ]
+  }), 'utf8');
+  const decisionsPath = join(repoRoot, 'decisions.json');
+  writeFileSync(decisionsPath, JSON.stringify({ p1: 'approve', p2: 'approve', p3: 'approve', p4: 'deny' }), 'utf8');
+
+  const second = await executeRunCommand({
+    contractPath, runId: first.runId, grantPath: decisionsPath, home, backends, exitMode: 'quiescence'
+  });
+  assert.equal(second.exitCode, 0);
+  assert.equal(second.runStatus, 'done');
+
+  // p1 与既有授权逐字去重；p2 是新授权，随后追加。
+  const grants = JSON.parse(readFileSync(grantsPath, 'utf8'));
+  assert.deepEqual(grants.grants, [
+    { tool: 'WebFetch' },
+    { tool: 'WebFetch', input: { url: 'https://x.test' } }
+  ]);
+  // p3 命令沉淀进 allowlist；approved 任务不被重置。
+  const registry = new ProjectRegistry(home.stateDb);
+  const policy = registry.getProjectPolicy('cov-project');
+  registry.close();
+  assert.ok(policy.verificationAllowedCommandPrefixes.includes('npm run docs'));
+
+  const db = new StateDatabase(home.stateDb);
+  try {
+    assert.equal(db.getTask(first.runId, taskId).status, 'approved');
+    const skipped = db.db.prepare(
+      "SELECT payload_json FROM events WHERE run_id = ? AND task_id = ? AND event_type = 'GRANT_SKIPPED_TASK_STATE' ORDER BY id"
+    ).all(first.runId, taskId);
+    assert.deepEqual(skipped.map((row) => JSON.parse(row.payload_json).status), ['approved', 'approved']);
   } finally {
     db.close();
   }

@@ -29,7 +29,6 @@ export type TaskStatus =
 export interface BackendConfig {
   /** CLI 二进制名或路径，缺省用 backend id 本身 */
   command?: string;
-  extraArgs?: string[];
   /** Native Windows only: fail closed unless degraded unsandboxed execution is explicitly allowed. */
   nativeWindowsSandbox?: NativeWindowsSandboxPolicy;
 }
@@ -93,10 +92,6 @@ export interface RunnerConfig {
   roles: Partial<Record<AgentRole, string>>;
   verification: {
     allowedCommandPrefixes: string[];
-    globalCommands: string[];
-  };
-  integration: {
-    allowedPaths: string[];
   };
 }
 
@@ -298,12 +293,4 @@ export interface RunEventRecord {
   eventType: string;
   payload: unknown | null;
   createdAt: string;
-}
-
-/** Hook payload for forwarding a worker contract escalation to an outer service. */
-export interface ContractBlockReport {
-  run: RunRecord;
-  task: TaskRecord;
-  agentExecution: AgentExecutionRecord;
-  reason: ContractBlockReason;
 }

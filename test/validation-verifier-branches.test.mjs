@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { validateIntegrationResult, validateReviewResult, validateWorkerResult } from '../src/core/validation.ts';
 import { DEFAULT_CONFIG } from '../src/core/defaults.ts';
-import { verifyTaskWorktree, runGlobalVerification } from '../src/core/verifier.ts';
+import { verifyTaskWorktree } from '../src/core/verifier.ts';
 
 function task(overrides = {}) {
   return {
@@ -39,13 +39,13 @@ test('result validators preserve optional fields and reject every malformed resu
   assert.throws(() => validateIntegrationResult({ status: 'completed', testsRun: [1] }));
 });
 
-test('verification rejects unsafe commands and global verification handles failures without mutation', async () => {
+test('verification rejects unsafe commands and reports nonzero exits', async () => {
   const repo = repository();
   try {
     writeFileSync(join(repo, 'src.txt'), 'changed\n');
     const startSha = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).stdout.trim();
     const logs = mkdtempSync(join(tmpdir(), 'agent-team-verifier-logs-'));
-    const config = { ...DEFAULT_CONFIG, verification: { ...DEFAULT_CONFIG.verification, allowedCommandPrefixes: ['node -e'], globalCommands: ['node -e "process.exit(1)"'] } };
+    const config = { ...DEFAULT_CONFIG, verification: { ...DEFAULT_CONFIG.verification, allowedCommandPrefixes: ['node -e'] } };
     const unsafe = await verifyTaskWorktree({
       worktree: repo, task: task({ allowedPaths: ['src.txt'], verificationCommands: ['rm -rf /'] }), startSha, config,
       logPath: join(logs, 'unsafe.log')
@@ -59,7 +59,6 @@ test('verification rejects unsafe commands and global verification handles failu
     });
     assert.equal(failed.ok, false);
     assert.match(failed.error, /Verification command failed \(2\)/);
-    await assert.rejects(runGlobalVerification({ worktree: repo, config, logPath: join(logs, 'global.log') }), /Global verification failed \(1\)/);
     rmSync(logs, { recursive: true, force: true });
   } finally {
     rmSync(repo, { recursive: true, force: true });

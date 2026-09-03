@@ -138,7 +138,7 @@ async function main(): Promise<void> {
     const runId = argv.shift();
     if (!runId) throw new Error('Usage: agent-team clean RUN_ID');
     if (argv.length > 0) throw new Error(`Unknown clean argument: ${argv[0]}`);
-    const result = await withStateDatabase(home, (db) => cleanRunArtifacts(db, runId));
+    const result = await withStateDatabase(home, (db) => cleanRunArtifacts(db, home, runId));
     console.log(`Removed ${result.removedWorktrees.length} worktree(s) and ${result.removedBranches.length} branch(es) for run ${runId}.`);
     return;
   }

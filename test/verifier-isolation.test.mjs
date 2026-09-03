@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { verifyTaskWorktree, runGlobalVerification } from '../src/core/verifier.ts';
+import { verifyTaskWorktree } from '../src/core/verifier.ts';
 
 function repository() {
   const dir = mkdtempSync(join(tmpdir(), 'agent-team-verifier-isolation-'));
@@ -12,7 +12,6 @@ function repository() {
   writeFileSync(join(dir, 'src', 'allowed.txt'), 'base\n');
   writeFileSync(join(dir, 'mutate-task.mjs'), "import { writeFileSync } from 'node:fs'; writeFileSync('outside.txt', 'escaped\\n');\n");
   writeFileSync(join(dir, 'mutate-fail.mjs'), "import { writeFileSync } from 'node:fs'; writeFileSync('outside.txt', 'escaped\\n'); process.exit(1);\n");
-  writeFileSync(join(dir, 'mutate-global.mjs'), "import { appendFileSync } from 'node:fs'; appendFileSync('src/allowed.txt', 'mutated\\n');\n");
   execFileSync('git', ['init', '-q'], { cwd: dir });
   execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir });
   execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir });
@@ -59,22 +58,4 @@ test('task verification still inspects protected state after a nonzero exit', as
   });
   assert.equal(result.ok, false);
   assert.match(result.error, /failed \(1\) and changed protected state/);
-});
-
-test('global verification rejects any worktree mutation', async () => {
-  const worktree = repository();
-  const logs = mkdtempSync(join(tmpdir(), 'agent-team-verifier-logs-'));
-  await assert.rejects(
-    runGlobalVerification({
-      worktree,
-      config: {
-        verification: {
-          allowedCommandPrefixes: ['node mutate-global.mjs'],
-          globalCommands: ['node mutate-global.mjs']
-        }
-      },
-      logPath: join(logs, 'global-verification.log')
-    }),
-    /modified the worktree or Git state/
-  );
 });

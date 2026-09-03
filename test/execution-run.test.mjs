@@ -31,7 +31,7 @@ function configFor(repoRoot, overrides = {}) {
       worktreesDir: join(repoRoot, '.worktrees'),
       ...workspace
     },
-    verification: { ...DEFAULT_CONFIG.verification, globalCommands: [], ...verification },
+    verification: { ...DEFAULT_CONFIG.verification, ...verification },
     ...rest
   };
 }
@@ -211,7 +211,7 @@ test('rejects contracts for a different repository before creating a run', async
 
 test('rejects commands outside the configured allowlist before creating a run', async () => {
   const repoRoot = repository();
-  const config = configFor(repoRoot, { verification: { allowedCommandPrefixes: ['npm test'], globalCommands: [] } });
+  const config = configFor(repoRoot, { verification: { allowedCommandPrefixes: ['npm test'] } });
   const db = new StateDatabase(join(config.workspace.stateDir, 'state.sqlite'));
   try {
     await assert.rejects(

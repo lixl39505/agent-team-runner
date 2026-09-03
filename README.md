@@ -57,8 +57,10 @@ early. `--exit-mode quiescence` runs to a natural stopping point and batches
 everything collected.
 
 Approved commands are sedimented into the project's persisted allowlist, so
-friction decreases run over run. Frequent approvals are a contract smell: widen
-the project allowlist or fix the DAG, not the mechanism.
+friction decreases run over run. Approved non-command permissions (network,
+external directories, tools) are recorded per run in `grants.json` and
+auto-approved when the same request re-occurs on replay. Frequent approvals are
+a contract smell: widen the project allowlist or fix the DAG, not the mechanism.
 
 ## Commands
 
@@ -90,7 +92,7 @@ Everything lives under `$AGENT_TEAM_HOME` (default `~/.agent-team`):
   state.sqlite                 # runs, tasks, events, agent executions, contract
                                # revisions, registered projects and policy revisions
   runs/<run-id>/               # contract.json, tasks/, results/, reviews/, logs/,
-                               # pending.json, blockers.json, handoff.json+md
+                               # pending.json, grants.json, blockers.json, handoff.json+md
   worktrees/<repo>/<run-id>/   # task and integration worktrees
 ```
 

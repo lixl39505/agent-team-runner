@@ -36,10 +36,8 @@ function configFor(repoRoot) {
     roles: { reviewer: 'review-agent' },
     verification: {
       ...DEFAULT_CONFIG.verification,
-      allowedCommandPrefixes: [...DEFAULT_CONFIG.verification.allowedCommandPrefixes, 'git status'],
-      globalCommands: []
-    },
-    integration: { ...DEFAULT_CONFIG.integration }
+      allowedCommandPrefixes: [...DEFAULT_CONFIG.verification.allowedCommandPrefixes, 'git status']
+    }
   };
 }
 

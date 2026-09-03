@@ -1,9 +1,15 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { TaskSpec } from './types.js';
 
 const packageRoot = fileURLToPath(new URL('../../', import.meta.url));
+
+/** path 是否落在 directory 内（含相等）。realpath 由调用方按需先行解析。 */
+export function isWithinDirectory(path: string, directory: string): boolean {
+  const relativePath = relative(directory, path);
+  return relativePath === '' || (!relativePath.startsWith(`..${sep}`) && relativePath !== '..' && !isAbsolute(relativePath));
+}
 
 export function ensureDir(path: string): void {
   mkdirSync(path, { recursive: true });
@@ -20,6 +26,17 @@ export function readJson<T>(path: string): T {
 
 export function readText(path: string): string {
   return readFileSync(path, 'utf8');
+}
+
+/** 规范化 JSON（键序稳定）：用于深度相等比较，例如审批决定与已沉淀授权的匹配。 */
+export function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b));
+    return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(',')}}`;
+  }
+  /* istanbul ignore next -- undefined never survives JSON round-trips. */
+  return JSON.stringify(value) ?? 'null';
 }
 
 export function skillPath(role: 'worker' | 'reviewer' | 'integrator'): string {

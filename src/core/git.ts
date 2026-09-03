@@ -92,9 +92,13 @@ export async function changedFiles(worktree: string): Promise<string[]> {
     const path = entry.slice(3);
     if (status.includes('R') || status.includes('C')) {
       // -z 格式下 rename/copy 记录为「XY 目标\0源\0」：目标（新写入位置）在本条目内，
-      // 下一条目是源路径，只用于占位跳过。路径策略必须校验目标——否则 worker 可把
-      // 受控文件改名/复制到未授权路径，而验收只看到未越界的源路径。
-      if (entries[index + 1] !== undefined) index += 1;
+      // 下一条目是源路径。两端都必须进入路径策略——只看目标会让 worker 把 blockedPaths
+      // 中的文件改名/复制到允许路径后蒙混过关，只看源则看不到实际写入位置。
+      const sourcePath = entries[index + 1];
+      if (sourcePath !== undefined) {
+        files.push(sourcePath);
+        index += 1;
+      }
       files.push(path);
     } else {
       files.push(path);

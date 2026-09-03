@@ -89,5 +89,6 @@ test('changedFiles records rename/copy targets so path policy sees the destinati
   const files = await changedFiles(repoRoot);
   assert.ok(files.includes('unauthorized/b.ts'), `rename target should be listed, got: ${files.join(', ')}`);
   assert.ok(files.includes('leak.txt'));
-  assert.ok(!files.includes('src/a.ts'), 'rename source must not shadow the target path');
+  // 源路径同样可见：blockedPaths 中的文件被改名/复制走时，删除动作本身必须被路径策略发现。
+  assert.ok(files.includes('src/a.ts'), 'rename source must be listed so blocked paths cannot silently move');
 });

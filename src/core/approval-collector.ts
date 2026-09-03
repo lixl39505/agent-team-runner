@@ -1,5 +1,13 @@
 import type { ApprovalHandler, UserInputHandler } from '../agent/approval.js';
-import { readPendingFileSync, writePendingFileSync, type PendingFile, type PendingItem } from './run-exit.js';
+import { canonicalJson } from './files.js';
+import {
+  readGrantsFileSync,
+  readPendingFileSync,
+  writePendingFileSync,
+  type GrantedPermission,
+  type PendingFile,
+  type PendingItem
+} from './run-exit.js';
 import { isSafeAllowlistedCommand } from './shell.js';
 
 export type RunExitMode = 'eager' | 'quiescence';
@@ -7,6 +15,8 @@ export type RunExitMode = 'eager' | 'quiescence';
 export interface ApprovalCollectorOptions {
   runId: string;
   pendingPath: string;
+  /** 已沉淀的非命令授权文件；重放时对精确匹配的请求直接放行。 */
+  grantsPath: string;
   debounceMs: number;
   exitMode: RunExitMode;
   /** 当前项目 allowlist；命中的命令直接放行（grant 沉淀后重放即由此通过）。 */
@@ -29,6 +39,7 @@ export const denialGuidance = [
  */
 export class ApprovalCollector {
   readonly pending: PendingItem[];
+  private readonly grantedPermissions: GrantedPermission[];
   private sequence: number;
   private timer: NodeJS.Timeout | undefined;
 
@@ -39,6 +50,8 @@ export class ApprovalCollector {
       const match = /^p(\d+)$/.exec(item.id);
       return match ? Math.max(max, Number(match[1])) : max;
     }, 0);
+    const grants = readGrantsFileSync(options.grantsPath);
+    this.grantedPermissions = grants?.runId === options.runId ? [...grants.grants] : [];
   }
 
   get hasPending(): boolean {
@@ -53,13 +66,19 @@ export class ApprovalCollector {
     if (commands.length > 0 && commands.every((command) => isSafeAllowlistedCommand(command, this.options.allowedPrefixes))) {
       return 'once';
     }
+    // 非命令权限（网络、外部目录、工具等）没有 allowlist 载体：grant approve 沉淀为
+    // run 内授权，重放对 tool+input 精确匹配的同一请求放行，否则每次重放都会再 exit 10。
+    if (commands.length === 0 && this.isGrantedPermission(request.tool, request.input)) {
+      return 'once';
+    }
     this.record({
       kind: 'approval',
       taskId: request.taskId ?? null,
       agentId: `${request.role}:${request.backend}`,
       subject: `${request.kind} ${request.tool}: ${describeInput(request.input)}`,
       reason: request.reason ?? denialGuidance,
-      commands
+      tool: request.tool,
+      ...(commands.length > 0 ? { commands } : { input: serializableInput(request.input) })
     });
     return 'deny';
   };
@@ -83,6 +102,13 @@ export class ApprovalCollector {
 
   dispose(): void {
     this.stopTimer();
+  }
+
+  /** 已沉淀授权匹配：tool 一致且 input 规范化后逐字相同。 */
+  private isGrantedPermission(tool: string, input: unknown): boolean {
+    return this.grantedPermissions.some((grant) =>
+      grant.tool === tool && canonicalJson(grant.input ?? null) === canonicalJson(serializableInput(input))
+    );
   }
 
   private pendingFile(): PendingFile {
@@ -144,6 +170,15 @@ function describeInput(input: unknown): string {
     return JSON.stringify(input) ?? 'unknown input';
   } catch {
     return 'unknown input';
+  }
+}
+
+/** pending/grants 都要落 JSON：循环引用等不可序列化输入归一为 null，匹配两侧同构。 */
+function serializableInput(input: unknown): unknown {
+  try {
+    return JSON.parse(JSON.stringify(input ?? null)) as unknown;
+  } catch {
+    return null;
   }
 }
 

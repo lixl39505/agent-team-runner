@@ -12,6 +12,10 @@ export interface PendingItem {
   /** 外层批准/拒绝的对象:审批为工具/命令描述,提问为问题列表。 */
   subject: string;
   reason: string;
+  /** 发起审批的工具名;非命令审批 grant approve 时按 tool+input 沉淀进 run 授权。 */
+  tool?: string;
+  /** 审批请求的原始输入;与 tool 一起构成非命令授权的精确匹配键。 */
+  input?: unknown;
   /** 审批对应的原始命令;grant approve 时按原样沉淀进项目 allowlist。 */
   commands?: string[];
   /** question 明细(id + 问题文本),供外层通过契约修订(implementationGuidance)作答。 */
@@ -21,6 +25,17 @@ export interface PendingItem {
 export interface PendingFile {
   runId: string;
   pending: PendingItem[];
+}
+
+/** 非命令权限的已沉淀授权：grant approve 后同 run 重放对精确匹配的请求直接放行。 */
+export interface GrantedPermission {
+  tool: string;
+  input?: unknown;
+}
+
+export interface GrantedPermissionsFile {
+  runId: string;
+  grants: GrantedPermission[];
 }
 
 export interface GrantDecisions {
@@ -64,19 +79,7 @@ export function contractBlockers(tasks: readonly TaskRecord[]): ContractBlocker[
 }
 
 export function readPendingFileSync(path: string): PendingFile | undefined {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(path, 'utf8'));
-  } catch {
-    // 读取失败（缺失或损坏）：把损坏文件移到 .corrupt 备份，避免覆盖丢失证据。
-    quarantine(path);
-    return undefined;
-  }
-  if (!isValidPendingFile(parsed)) {
-    quarantine(path);
-    return undefined;
-  }
-  return parsed as PendingFile;
+  return readRunJsonFileSync<PendingFile>(path, isValidPendingFile);
 }
 
 function isValidPendingFile(value: unknown): value is PendingFile {
@@ -85,8 +88,43 @@ function isValidPendingFile(value: unknown): value is PendingFile {
   return typeof file.runId === 'string' && Array.isArray(file.pending);
 }
 
+export function readGrantsFileSync(path: string): GrantedPermissionsFile | undefined {
+  return readRunJsonFileSync<GrantedPermissionsFile>(path, isValidGrantsFile);
+}
+
+function isValidGrantsFile(value: unknown): value is GrantedPermissionsFile {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const file = value as { runId?: unknown; grants?: unknown };
+  if (typeof file.runId !== 'string' || !Array.isArray(file.grants)) return false;
+  return file.grants.every((grant) =>
+    grant !== null && typeof grant === 'object' && !Array.isArray(grant)
+    && typeof (grant as { tool?: unknown }).tool === 'string'
+  );
+}
+
+/** run 目录状态文件的统一读取：缺失/损坏时隔离现场并按不存在处理。 */
+function readRunJsonFileSync<T>(path: string, isValid: (value: unknown) => value is T): T | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    // 读取失败（缺失或损坏）：把损坏文件移到 .corrupt 备份，避免覆盖丢失证据。
+    quarantine(path);
+    return undefined;
+  }
+  if (!isValid(parsed)) {
+    quarantine(path);
+    return undefined;
+  }
+  return parsed;
+}
+
 /** 原子写：先写同目录临时文件，再 rename 覆盖，中断不会留下半截 JSON。 */
 export function writePendingFileSync(path: string, file: PendingFile): void {
+  writeJsonAtomically(path, file);
+}
+
+export function writeGrantsFileSync(path: string, file: GrantedPermissionsFile): void {
   writeJsonAtomically(path, file);
 }
 
@@ -159,6 +197,10 @@ export function renderMachineSummary(input: {
 
 export function pendingItemPath(runsDir: string, runId: string): string {
   return join(runsDir, runId, 'pending.json');
+}
+
+export function grantsItemPath(runsDir: string, runId: string): string {
+  return join(runsDir, runId, 'grants.json');
 }
 
 export function blockersPath(runsDir: string, runId: string): string {

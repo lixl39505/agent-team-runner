@@ -106,3 +106,19 @@ test('runs commands through the isolated environment and handles spawn lifecycle
   await assert.rejects(failure, /spawn failed/);
   assert.equal(existsSync(failedHome), false);
 });
+
+test('npm-family pass-through arguments require an exact allowlist entry', () => {
+  const prefixes = ['npm test', 'yarn build'];
+  // 前缀命中但带 `--` 透传：脚本自定义语义（jest -u、快照更新等）不可凭默认前缀放行。
+  assert.throws(() => assertAllowedCommand('npm test -- -u', prefixes), /pass-through/);
+  assert.throws(() => assertAllowedCommand('npm test -- --filter api', prefixes), /pass-through/);
+  assert.throws(() => assertAllowedCommand('yarn build -- --outdir /tmp', prefixes), /pass-through/);
+  // 非 npm 族命令不受该规则约束。
+  assert.doesNotThrow(() => assertAllowedCommand('go test -run TestX ./...', ['go test']));
+  // 项目策略逐字沉淀同一条命令后即可放行（grant approve 的沉淀路径）。
+  assert.doesNotThrow(() => assertAllowedCommand('npm test -- --filter api', ['npm test -- --filter api']));
+  // 逐字沉淀不会豁免其他危险参数校验。
+  assert.throws(() => assertAllowedCommand('npm test --prefix /elsewhere', ['npm test --prefix /elsewhere']), /Unsafe command arguments/);
+  // 等长但令牌不同：既非逐字条目，也未命中前缀。
+  assert.throws(() => assertAllowedCommand('npm test --watch', ['npm test --bail']), /not allowlisted|pass-through/);
+});

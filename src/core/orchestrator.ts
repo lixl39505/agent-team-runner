@@ -2,7 +2,6 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import type {
   BackendId,
-  ContractBlockReport,
   IntegrationResult,
   ReviewResult,
   ResolvedSkill,
@@ -16,7 +15,7 @@ import type { AgentBackend, AgentEvent } from '../agent/types.js';
 import type { ApprovalHandler, UserInputHandler } from '../agent/approval.js';
 import { StateDatabase } from './db.js';
 import { buildBackends, disposeBackends, type BackendPool, resolveAgentWithSnapshot, resolveTaskAgent } from '../agent/registry.js';
-import { executionInfo, runTrackedAgent, type AgentEventSink } from './agent-execution.js';
+import { executionInfo, runTrackedAgent } from './agent-execution.js';
 import {
   INTEGRATION_SCHEMA,
   REVIEW_SCHEMA,
@@ -41,7 +40,7 @@ import {
 } from './git.js';
 import { integrationPrompt, reviewFeedback, reviewerPrompt, workerPrompt } from './prompts.js';
 import { checkPaths } from './path-policy.js';
-import { runGlobalVerification, verifyTaskWorktree } from './verifier.js';
+import { verifyTaskWorktree } from './verifier.js';
 
 function safeSegment(input: string): string {
   return input.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-|-$/g, '');
@@ -74,16 +73,16 @@ export async function runOrchestrator(input: {
   runId: string;
   requestApproval?: ApprovalHandler;
   requestUserInput?: UserInputHandler;
-  onAgentEvent?: AgentEventSink;
-  /** Optional outer-service hook for worker requests to change the execution contract. */
-  reportContractBlock?: (report: ContractBlockReport) => void | Promise<void>;
   signal?: AbortSignal | undefined;
   /** Test seam: production creates its own managed backend pool. */
   backends?: Record<BackendId, AgentBackend> | BackendPool | undefined;
 }): Promise<{ interrupted: boolean; signalInterrupted: boolean }> {
   const { config, db, runId } = input;
   let run = db.getRun(runId);
-  if (!['planned', 'running', 'needs_attention', 'failed'].includes(run.status)) {
+  // integrating 也在可重放之列：进程在集成途中崩溃会停在 integrating，而
+  // integrateRun 每次进入都用 resetWorktree 从 baseSha 强制重建集成分支/工作区，
+  // 重放等价于重跑整个集成阶段。
+  if (!['planned', 'running', 'needs_attention', 'failed', 'integrating'].includes(run.status)) {
     if (run.status === 'done') return { interrupted: false, signalInterrupted: false };
     throw new Error(`Run ${runId} cannot start from status ${run.status}`);
   }
@@ -143,9 +142,7 @@ export async function runOrchestrator(input: {
           config, db, runId, backends, record: candidate,
             signal: input.signal,
             ...(input.requestApproval ? { requestApproval: input.requestApproval } : {}),
-            ...(input.requestUserInput ? { requestUserInput: input.requestUserInput } : {}),
-            ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {}),
-            ...(input.reportContractBlock ? { reportContractBlock: input.reportContractBlock } : {})
+            ...(input.requestUserInput ? { requestUserInput: input.requestUserInput } : {})
         })
           .catch((error) => {
             db.updateTask(runId, candidate.taskId, {
@@ -174,8 +171,7 @@ export async function runOrchestrator(input: {
       isInterrupted: () => interrupted,
       signal: input.signal,
       ...(input.requestApproval ? { requestApproval: input.requestApproval } : {}),
-      ...(input.requestUserInput ? { requestUserInput: input.requestUserInput } : {}),
-      ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {})
+      ...(input.requestUserInput ? { requestUserInput: input.requestUserInput } : {})
     });
   } catch (error) {
     if (interrupted) return { interrupted: true, signalInterrupted };
@@ -214,8 +210,6 @@ async function executeTask(input: {
   record: TaskRecord;
   requestApproval?: ApprovalHandler;
   requestUserInput?: UserInputHandler;
-  onAgentEvent?: AgentEventSink;
-  reportContractBlock?: (report: ContractBlockReport) => void | Promise<void>;
   signal?: AbortSignal | undefined;
 }): Promise<void> {
   const { config, db, runId, backends } = input;
@@ -264,7 +258,6 @@ async function executeTask(input: {
     db,
     execution: workerExecution,
     signal: input.signal,
-    ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {}),
     backend: await getBackend(backends, workerBinding),
     spec: {
       role: 'worker', cwd: worktreeInfo.path,
@@ -297,18 +290,6 @@ async function executeTask(input: {
     const finishedAt = new Date().toISOString();
     db.updateTask(runId, task.id, { status: 'blocked_on_contract', phase: 'worker', lastError: workerResult.contractBlock!.message, finishedAt });
     db.addEvent(runId, task.id, 'WORKER_BLOCKED_ON_CONTRACT', workerResult);
-    if (input.reportContractBlock) {
-      try {
-        await input.reportContractBlock({
-          run,
-          task: db.getTask(runId, task.id),
-          agentExecution: db.getAgentExecution(runId, workerExecution.agentId),
-          reason: workerResult.contractBlock!
-        });
-      } catch (error) {
-        db.addEvent(runId, task.id, 'WORKER_CONTRACT_BLOCK_REPORT_FAILED', { error: String(error) });
-      }
-    }
     return;
   }
   if (workerResult.status === 'failed') {
@@ -341,7 +322,6 @@ async function executeTask(input: {
     db,
     execution: executionInfo(runId, `${task.id}-reviewer-${reviewCycle}`, 'reviewer', reviewerBinding.backend, reviewLogPath, reviewerBinding.model, task.id),
     signal: input.signal,
-    ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {}),
     backend: await getBackend(backends, reviewerBinding),
     spec: {
       role: 'reviewer', cwd: worktreeInfo.path,
@@ -515,7 +495,6 @@ async function integrateRun(input: {
   backends: Record<BackendId, AgentBackend> | BackendPool;
   requestApproval?: ApprovalHandler;
   requestUserInput?: UserInputHandler;
-  onAgentEvent?: AgentEventSink;
   isInterrupted: () => boolean;
   signal?: AbortSignal | undefined;
 }): Promise<void> {
@@ -547,7 +526,6 @@ async function integrateRun(input: {
       db,
       execution: executionInfo(runId, `integrator-conflict-${task.id}`, 'integrator', integratorBinding.backend, conflictLogPath, integratorBinding.model, task.id),
       signal: input.signal,
-      ...(input.onAgentEvent ? { onAgentEvent: input.onAgentEvent } : {}),
       backend: integratorBackend,
       spec: {
         role: 'integrator', cwd: worktree,
@@ -590,8 +568,6 @@ async function integrateRun(input: {
     await git(worktree, ['cherry-pick', '--continue']);
   }
 
-  await runGlobalVerification({ worktree, config, logPath: join(runDir, 'logs', 'integration-verification.log') });
-  if (input.isInterrupted()) return;
   const integrationCommit = await currentHead(worktree);
   db.updateRun(runId, { status: 'done', integrationCommit, error: null, finishedAt: new Date().toISOString() });
   db.addEvent(runId, null, 'INTEGRATION_COMPLETED', { branch, worktree, integrationCommit });

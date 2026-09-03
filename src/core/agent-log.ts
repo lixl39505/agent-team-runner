@@ -1,7 +1,7 @@
-import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { resolve } from 'node:path';
 import { open, realpath } from 'node:fs/promises';
 import { StateDatabase } from './db.js';
-import type { AgentExecutionRecord } from './types.js';
+import { isWithinDirectory } from './files.js';
 
 export const DEFAULT_AGENT_LOG_LINES = 100;
 export const MAX_AGENT_LOG_LINES = 200;
@@ -15,11 +15,6 @@ export interface AgentLogTail {
   lineCount: number;
   byteCount: number;
   truncated: boolean;
-}
-
-export function isWithinDirectory(path: string, directory: string): boolean {
-  const relativePath = relative(directory, path);
-  return relativePath === '' || (!relativePath.startsWith(`..${sep}`) && relativePath !== '..' && !isAbsolute(relativePath));
 }
 
 export async function readAgentLog(
@@ -84,39 +79,6 @@ export async function readAgentLog(
   } finally {
     await handle?.close();
   }
-}
-
-export async function reconnectAgentLogs(
-  db: StateDatabase,
-  runsDir: string,
-  runId: string,
-  agentExecutions: readonly AgentExecutionRecord[],
-  readTail: typeof readAgentLog = readAgentLog
-): Promise<Array<{
-  agentId: string;
-  status: 'available';
-  tail: AgentLogTail;
-} | {
-  agentId: string;
-  status: 'unavailable';
-  reason: string;
-}>> {
-  return await Promise.all(agentExecutions.map(async (agent) => {
-    try {
-      // Reuse the recorded-path and symlink checks used by readAgentLog.
-      return {
-        agentId: agent.agentId,
-        status: 'available' as const,
-        tail: await readTail(db, runsDir, runId, agent.agentId, DEFAULT_AGENT_LOG_LINES, DEFAULT_AGENT_LOG_BYTES)
-      };
-    } catch (error) {
-      return {
-        agentId: agent.agentId,
-        status: 'unavailable' as const,
-        reason: error instanceof Error ? error.message : `Agent log is unavailable: ${runId}/${agent.agentId}`
-      };
-    }
-  }));
 }
 
 export function agentLogReadError(runId: string, agentId: string, error: unknown): Error {

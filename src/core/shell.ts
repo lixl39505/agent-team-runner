@@ -48,7 +48,7 @@ export function splitCommand(input: string, platform: NodeJS.Platform = process.
 
 export function assertAllowedCommand(command: string, prefixes: string[], platform: NodeJS.Platform = process.platform): void {
   const tokens = splitCommand(command, platform);
-  assertNoCapabilityBearingArguments(tokens);
+  assertNoCapabilityBearingArguments(tokens, isExactAllowlistEntry(command, prefixes, platform));
   if (!isAllowlistedCommand(command, prefixes, platform)) {
     throw new Error(`Verification command is not allowlisted: ${command}`);
   }
@@ -73,8 +73,22 @@ export function isAllowlistedCommand(command: string, prefixes: readonly string[
   });
 }
 
+/**
+ * 逐字等于某条 allowlist 条目（而非仅前缀命中）。npm 族带 `--` 透传参数的命令
+ * 只有被项目策略逐字沉淀（grant 批准整条命令）时才可放行。
+ */
+export function isExactAllowlistEntry(command: string, prefixes: readonly string[], platform: NodeJS.Platform = process.platform): boolean {
+  const tokens = splitCommand(command, platform);
+  return prefixes.some((prefix) => {
+    const prefixTokens = splitCommand(prefix, platform);
+    return prefixTokens.length === tokens.length && prefixTokens.every((token, index) => tokens[index] === token);
+  });
+}
+
+const PACKAGE_MANAGERS = new Set(['npm', 'pnpm', 'yarn', 'bun']);
+
 /** Reject options that turn nominally read/test commands into write, exec, or policy-escalation primitives. */
-function assertNoCapabilityBearingArguments(tokens: string[]): void {
+function assertNoCapabilityBearingArguments(tokens: string[], exactAllowlistEntry: boolean): void {
   const [program, subcommand] = tokens;
   const args = tokens.slice(1);
   const reject = (reason: string): never => {
@@ -97,6 +111,11 @@ function assertNoCapabilityBearingArguments(tokens: string[]): void {
   }
   if (program === 'sort' && hasOption(['-o', '--output'])) reject('sort output file');
   if (program === 'npm' && hasOption(['--prefix', '--userconfig', '--globalconfig', '--script-shell'])) reject('npm path, config, or shell override');
+  // npm 族的 `--` 之后是原样透传给 package.json 脚本的参数（jest -u、脚本自定义语义均可写），
+  // 副作用无法逐一枚举：默认前缀只放行无透传形态；确需透传的命令必须被项目策略逐字沉淀。
+  if (!exactAllowlistEntry && PACKAGE_MANAGERS.has(String(program)) && args.includes('--')) {
+    reject('package-manager pass-through arguments');
+  }
   if (program === 'pnpm' && hasOption(['--dir', '-C', '--global-dir', '--config'])) reject('pnpm directory or config override');
   if (program === 'yarn' && hasOption(['--cwd', '--use-yarnrc', '--install-state-path'])) reject('yarn directory or config override');
   if (program === 'go' && subcommand === 'test' && hasOption(['-C', '-exec', '-toolexec', '-o', '-modfile', '-overlay'])) reject('go test helper, path, or output override');

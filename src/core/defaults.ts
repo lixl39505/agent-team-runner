@@ -37,7 +37,6 @@ export const DEFAULT_CONFIG: RunnerConfig = {
       'pnpm typecheck',
       'pnpm build',
       'npm test',
-      'npm run',
       'yarn test',
       'yarn lint',
       'yarn build',
@@ -45,10 +44,6 @@ export const DEFAULT_CONFIG: RunnerConfig = {
       'go test',
       'cargo test',
       'make test'
-    ],
-    globalCommands: []
-  },
-  integration: {
-    allowedPaths: ['specs/**']
+    ]
   }
 };

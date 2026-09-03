@@ -157,8 +157,10 @@ export function applyContractRevision(input: ApplyContractRevisionInput): Contra
     // 文件回滚尽力而为：恢复旧内容或删除新增文件，并清理残留的临时文件。
     for (const { tmp, final, previous } of staged) {
       try {
+        // 新增产物直接删除；既有产物恢复旧内容（即便文件在竞争窗口内被外部删除，
+        // 重建旧内容同样是正确的回滚结果）。
         if (previous === null) rmSync(final, { force: true });
-        else if (existsSync(final)) writeFileSync(final, previous, 'utf8');
+        else writeFileSync(final, previous, 'utf8');
       } catch {
         // 原始错误更有诊断价值。
       }

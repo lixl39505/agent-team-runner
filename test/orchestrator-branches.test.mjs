@@ -32,7 +32,7 @@ function configFor(repoRoot, overrides = {}) {
     retry: { ...DEFAULT_CONFIG.retry, maxWorkerAttempts: 2, maxReviewCycles: 2, ...retry },
     status: { ...DEFAULT_CONFIG.status, ...status },
     integration: { ...DEFAULT_CONFIG.integration },
-    verification: { ...DEFAULT_CONFIG.verification, globalCommands: [] },
+    verification: { ...DEFAULT_CONFIG.verification },
     ...rest
   };
 }
@@ -220,7 +220,6 @@ test('orchestrator uses a supplied backend pool and forwards worker and reviewer
     return approvedReview();
   });
   const requested = [];
-  const events = [];
   const pool = {
     get: async (binding) => {
       requested.push(binding);
@@ -234,13 +233,11 @@ test('orchestrator uses a supplied backend pool and forwards worker and reviewer
       config,
       db,
       runId: 'run',
-      backends: pool,
-      onAgentEvent: (execution, event) => events.push([execution.role, event.type])
+      backends: pool
     });
 
     assert.equal(db.getRun('run').status, 'done');
     assert.deepEqual(requested.map((binding) => binding.agent), ['default-claude', 'default-claude']);
-    assert.deepEqual(events, [['worker', 'activity'], ['reviewer', 'activity']]);
   } finally {
     db.close();
   }

@@ -32,7 +32,7 @@ function configFor(repoRoot, overrides = {}) {
     retry: { ...DEFAULT_CONFIG.retry, maxWorkerAttempts: 1, maxReviewCycles: 2, ...retry },
     status: { ...DEFAULT_CONFIG.status, ...status },
     integration: { ...DEFAULT_CONFIG.integration },
-    verification: { ...DEFAULT_CONFIG.verification, globalCommands: [] },
+    verification: { ...DEFAULT_CONFIG.verification },
     ...rest
   };
 }

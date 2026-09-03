@@ -1,6 +1,14 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { OpenCodeBackend, editPatternWithinWorkspace, mapOpenCodeSessionStatus } from '../src/agent/opencode/sdk.ts';
+
+// edit 权限的工作区包含性检查按 realpath 解析：自动放行场景必须使用真实存在的目录。
+const REAL_WORKSPACE = mkdtempSync(join(tmpdir(), 'opencode-workspace-'));
+mkdirSync(join(REAL_WORKSPACE, 'src'), { recursive: true });
+writeFileSync(join(REAL_WORKSPACE, 'src', 'feature.ts'), 'export {};\n', 'utf8');
 
 function sessionSpec(overrides = {}) {
   return {
@@ -169,7 +177,7 @@ test('OpenCode permissions enforce role policy and map approvals', async () => {
   assert.deepEqual(approved.calls.permissions, [{ path: { id: 'session-1', permissionID: 'p2' }, body: { response: 'always' } }]);
   assert.equal(approved.calls.events.at(-1).allowed, true);
 
-  const edit = await open({ data: { info: { structured: {} } } });
+  const edit = await open({ data: { info: { structured: {} } } }, { cwd: REAL_WORKSPACE });
   await edit.session.answerPermission('p3', { type: 'edit', pattern: 'src/feature.ts' });
   assert.equal(edit.calls.permissions[0].body.response, 'once');
 
@@ -216,14 +224,30 @@ test('OpenCode questions reject without a handler and reply with normalized answ
   assert.equal(answered.calls.events.at(-1).type, 'activity');
 });
 
-test('editPatternWithinWorkspace judges literal prefixes and rejects unknown targets', () => {
-  assert.equal(editPatternWithinWorkspace(['src/**', 'docs/a.md'], '/workspace'), true);
-  assert.equal(editPatternWithinWorkspace('*.ts', '/workspace'), true);
-  assert.equal(editPatternWithinWorkspace('/workspace/src/a.ts', '/workspace'), true);
-  assert.equal(editPatternWithinWorkspace('../outside.txt', '/workspace'), false);
-  assert.equal(editPatternWithinWorkspace(['/etc/passwd'], '/workspace'), false);
-  assert.equal(editPatternWithinWorkspace(undefined, '/workspace'), false);
-  assert.equal(editPatternWithinWorkspace([], '/workspace'), false);
-  assert.equal(editPatternWithinWorkspace([''], '/workspace'), false);
-  assert.equal(editPatternWithinWorkspace('src/**', '/workspace'), true);
+test('editPatternWithinWorkspace judges literal prefixes, resolves symlinks, and rejects unknown targets', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'opencode-edit-'));
+  mkdirSync(join(workspace, 'src', 'nested'), { recursive: true });
+  writeFileSync(join(workspace, 'src', 'a.ts'), 'export {};\n', 'utf8');
+  // 工作区内的目录软链接指向区外：词法在区内，realpath 在区外，必须拒绝。
+  symlinkSync(tmpdir(), join(workspace, 'escape-link'));
+
+  assert.equal(await editPatternWithinWorkspace(['src/**', 'docs/a.md'], workspace), true);
+  assert.equal(await editPatternWithinWorkspace('*.ts', workspace), true);
+  assert.equal(await editPatternWithinWorkspace(join(workspace, 'src', 'a.ts'), workspace), true);
+  // 新文件（目标不存在）：上探到最近存在祖先判定。
+  assert.equal(await editPatternWithinWorkspace('src/nested/new-file.ts', workspace), true);
+  // 目录软链接：字面在区内、解析在区外。
+  assert.equal(await editPatternWithinWorkspace('escape-link/steal.txt', workspace), false);
+  // 软链接目录下更深的新文件同样不允许（上探命中软链接目录）。
+  assert.equal(await editPatternWithinWorkspace('escape-link/deep/new.txt', workspace), false);
+  assert.equal(await editPatternWithinWorkspace('../outside.txt', workspace), false);
+  assert.equal(await editPatternWithinWorkspace(['/etc/passwd'], workspace), false);
+  assert.equal(await editPatternWithinWorkspace(undefined, workspace), false);
+  assert.equal(await editPatternWithinWorkspace([], workspace), false);
+  assert.equal(await editPatternWithinWorkspace([''], workspace), false);
+  // 工作区根自身是软链接时，以解析后的根做包含判定。
+  const linkRoot = join(workspace, 'root-link');
+  symlinkSync(workspace, linkRoot);
+  assert.equal(await editPatternWithinWorkspace('src/a.ts', linkRoot), true);
+  assert.equal(await editPatternWithinWorkspace('../outside.txt', linkRoot), false);
 });

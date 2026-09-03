@@ -55,8 +55,7 @@ vi.mock('../src/core/git.ts', () => ({
 }));
 vi.mock('../src/core/path-policy.ts', () => ({ checkPaths: (...args) => control.paths(...args) }));
 vi.mock('../src/core/verifier.ts', () => ({
-  verifyTaskWorktree: (...args) => control.verify(...args),
-  runGlobalVerification: (...args) => control.global(...args)
+  verifyTaskWorktree: (...args) => control.verify(...args)
 }));
 vi.mock('../src/core/prompts.ts', () => ({
   workerPrompt: () => 'worker', reviewerPrompt: () => 'reviewer', integrationPrompt: () => 'integration', reviewFeedback: (review) => review.summary
@@ -102,14 +101,13 @@ function config() {
     retry: { maxPlanAttempts: 2, maxWorkerAttempts: 1, maxReviewCycles: 2 },
     status: { pollIntervalMs: 2000 },
     concurrency: 1, taskTimeoutMs: 1, staleAfterMs: 1,
-    integration: { allowedPaths: ['docs/**'] }, verification: { globalCommands: [] }
+    verification: { allowedCommandPrefixes: ['npm test'] }
   };
 }
 
 function reset() {
   control.runAgent = async () => ({ ok: true, output: { status: 'blocked', summary: 'blocked' }, timedOut: false, stalled: false });
   control.verify = async () => ({ ok: true, changedFiles: ['src/file.ts'] });
-  control.global = async () => {};
   control.cherryPick = async () => ({ code: 0, stderr: '' });
   control.conflicts = async () => [];
   control.changed = async () => [];
@@ -350,9 +348,9 @@ test('orchestrator covers integration failures, resolver outcomes, and interrupt
     await run(afterConflictAgent);
 
     reset();
-    const afterVerification = new Database([record(spec('T1'), { status: 'approved', commitSha: 'one' })]);
-    control.global = async () => { process.emit('SIGINT'); };
-    await run(afterVerification);
+    const afterIntegrationHead = new Database([record(spec('T1'), { status: 'approved', commitSha: 'one' })]);
+    control.currentHead = async () => { process.emit('SIGINT'); return 'head'; };
+    await run(afterIntegrationHead);
   } finally {
     process.exitCode = exitCode;
   }
