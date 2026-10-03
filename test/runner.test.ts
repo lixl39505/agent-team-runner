@@ -97,18 +97,19 @@ function seedRun(fx: Fixture, runId = RUN): void {
   }
 }
 
+function envFor(fx: Fixture, runId = RUN) {
+  return {
+    home: { root: fx.home, dbPath: join(fx.home, 'state.sqlite'), runsDir: join(fx.home, 'runs'), config: fx.config },
+    db: fx.db,
+    client: fx.fake,
+    config: fx.config,
+    runId,
+    contract: fx.contract,
+  };
+}
+
 function engineFor(fx: Fixture, runId = RUN): RunnerEngine {
-  return new RunnerEngine(
-    {
-      home: { root: fx.home, dbPath: join(fx.home, 'state.sqlite'), runsDir: join(fx.home, 'runs'), config: fx.config },
-      db: fx.db,
-      client: fx.fake,
-      config: fx.config,
-      runId,
-      contract: fx.contract,
-    },
-    { tickMs: 5 },
-  );
+  return new RunnerEngine(envFor(fx, runId), { tickMs: 5 });
 }
 
 async function tickUntil(engine: RunnerEngine, fx: Fixture, pred: () => boolean, maxTicks = 600): Promise<void> {
@@ -343,4 +344,22 @@ describe('RunnerEngine — full delivery chain', () => {
     const engine = engineFor(fx);
     await expect(engine.runUntilTerminal()).rejects.toThrow(/lease/);
   });
+
+  test('detach/reattach: prompt_sent_at guard prevents re-prompting a live execution', async () => {
+    const fx = track(await makeFixture(happyScripts()));
+    seedRun(fx);
+    // simulate the predecessor runner: scheduled + prompted, then vanished
+    const { startExecution } = await import('../src/runner/executions.ts');
+    fx.db.run("UPDATE tasks SET status = 'running', attempts = 1 WHERE run_id = ? AND task_id = 'API'", [RUN]);
+    const scheduled = getTask(fx.db, RUN, 'API')!;
+    await startExecution(envFor(fx), { role: 'worker', task: scheduled, attemptNo: 1, cycleNo: 0, entry: { kind: 'claude' } });
+    expect(fx.fake.promptCount(wName('API'))).toBe(1);
+
+    const engine = engineFor(fx);
+    await tickUntil(engine, fx, () => TERMINALS.includes(getRun(fx.db, RUN)!.status));
+    expect(getRun(fx.db, RUN)!.status).toBe('done');
+    // still exactly one prompt for the API worker; no new attempt was created
+    expect(fx.fake.promptCount(wName('API'))).toBe(1);
+    expect(listExecutions(fx.db, RUN).filter((e) => e.taskId === 'API' && e.role === 'worker')).toHaveLength(1);
+  }, 30_000);
 });

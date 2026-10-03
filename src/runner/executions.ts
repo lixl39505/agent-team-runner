@@ -12,6 +12,7 @@ import type { AteamHome } from '../config.ts';
 import { resolveAgentEntry, type AgentEntry, type AteamConfig } from '../config.ts';
 import type { HerdrRuntimeClient } from '../herdr/client.ts';
 import { HerdrError } from '../herdr/types.ts';
+import { agentStartArgs } from '../herdr/agent-args.ts';
 import { buildRolePrompt } from '../results/prompts.ts';
 import { resultPathFor, sha256Hex } from '../results/files.ts';
 import { resolveSkills, writeBrief } from './briefs.ts';
@@ -165,7 +166,7 @@ export async function startExecution(env: RunnerEnv, input: StartExecutionInput)
     name,
     kind: input.entry.kind,
     paneId: pane.paneId,
-    args: [...(input.entry.model ? ['--model', input.entry.model] : []), ...(input.entry.args ?? [])],
+    args: agentStartArgs(input.entry),
   });
 
   const record = insertExecution(env.db, {
