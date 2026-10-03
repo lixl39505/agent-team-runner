@@ -41,10 +41,11 @@ export interface BriefContext {
   specJson: string;
   skillSnapshots: Array<{ name: string; content: string }>;
   retry?: {
-    attemptNo: number;
+    attemptNo?: number;
     lastWorkerSummary?: string;
     lastReview?: unknown;
   };
+  notes?: string;
   resultSchemaExample: string;
   verificationCommands?: string[];
   acceptance?: string[];
@@ -86,6 +87,9 @@ export function buildBriefMarkdown(ctx: BriefContext): string {
       parts.push('\nReviewer verdict (address every required change):\n```json\n' + JSON.stringify(ctx.retry.lastReview, null, 2) + '\n```');
     }
     sections.push(parts.join('\n'));
+  }
+  if (ctx.notes) {
+    sections.push(`## Runner notes\n${ctx.notes}`);
   }
 
   sections.push(
