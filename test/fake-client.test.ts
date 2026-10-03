@@ -1,9 +1,12 @@
 import { afterAll, describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
+import { readFile } from 'node:fs/promises';
 import { FakeHerdrClient, parseResultFilePath } from '../src/herdr/fake-client.ts';
-import { cleanupTempDir, makeTempDir } from './helpers.ts';
+import { cleanupTempDir, initRepo, makeTempDir } from './helpers.ts';
 
 const fsRoot = await makeTempDir('ateam-fake-');
+const repoRoot = join(fsRoot, 'repo');
+await initRepo(repoRoot);
 
 afterAll(async () => {
   await cleanupTempDir(fsRoot);
@@ -16,36 +19,42 @@ function promptForResult(): string {
 }
 
 describe('FakeHerdrClient', () => {
-  test('worktree workspace creates all four resources with distinct ids', async () => {
-    const fake = new FakeHerdrClient({ fsRoot });
-    const handle = await fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: 'ateam/r1/API' });
-    expect(handle.workspace.workspaceId).not.toBe('');
-    expect(handle.tab.tabId).toContain(handle.workspace.workspaceId);
-    expect(handle.rootPane.paneId).not.toBe('');
+  test('worktree workspace creates a real git worktree', async () => {
+    const fake = new FakeHerdrClient({ fsRoot, repoRoot });
+    const handle = await fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: 'ateam/t1/API' });
     expect(handle.worktree.path.startsWith(fsRoot)).toBe(true);
+    const head = await readFile(join(handle.worktree.path, 'README.md'), 'utf8');
+    expect(head.replace(/\r\n/g, '\n')).toBe('# test\n');
   });
 
-  test('scripted agent walks states and writes result file', async () => {
+  test('scripted agent walks states, edits files and writes result', async () => {
     const fake = new FakeHerdrClient({
       fsRoot,
+      repoRoot,
       scripts: {
-        'at-test-w1': {
+        'at-t1-api-w1': {
           kind: 'claude',
-          sequence: ['working', 'working', 'done'],
+          sequence: ['working', 'done'],
           stepMs: 5,
-          onState: { done: { writeResultFile: { status: 'completed', summary: 'ok' } } },
+          onState: {
+            done: {
+              editFiles: [['src/api/x.ts', 'export const a = 1;\n']],
+              writeResultFile: { status: 'completed', summary: 'ok' },
+            },
+          },
         },
       },
     });
-    const pane = await fake.splitPane({ paneId: (await fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: 'b' })).rootPane.paneId });
-    await fake.startAgent({ name: 'at-test-w1', kind: 'claude', paneId: pane.paneId, args: [] });
+    const ws = await fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: 'ateam/t2/API' });
+    const pane = await fake.splitPane({ paneId: ws.rootPane.paneId });
+    await fake.startAgent({ name: 'at-t1-api-w1', kind: 'claude', paneId: pane.paneId, args: [] });
     const wait = await fake.promptAgent({
-      target: 'at-test-w1', text: promptForResult(), wait: true,
+      target: 'at-t1-api-w1', text: promptForResult(), wait: true,
       until: ['done', 'blocked'], timeoutMs: 5000,
     });
     expect(wait.state).toBe('done');
-    // onState writes are fire-and-forget; poll for the commit point
-    const { readFile } = await import('node:fs/promises');
+    const edited = await readFile(join(ws.worktree.path, 'src', 'api', 'x.ts'), 'utf8');
+    expect(edited).toContain('export const a');
     let text: string | null = null;
     for (let i = 0; i < 200 && text === null; i++) {
       try {
@@ -58,28 +67,35 @@ describe('FakeHerdrClient', () => {
     expect(JSON.parse(text!)).toEqual({ status: 'completed', summary: 'ok' });
   });
 
-  test('blocked sequence reaches blocked without result', async () => {
+  test('pauseAt holds the walk until resumeAgent', async () => {
     const fake = new FakeHerdrClient({
       fsRoot,
-      scripts: { 'at-b': { kind: 'codex', sequence: ['working', 'blocked'], stepMs: 5 } },
+      repoRoot,
+      scripts: {
+        'at-b': { kind: 'codex', sequence: ['working', 'blocked', 'working', 'done'], stepMs: 5, pauseAt: 'blocked' },
+      },
     });
-    const ws = await fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: 'b' });
+    const ws = await fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: 'ateam/t3/B' });
     await fake.startAgent({ name: 'at-b', kind: 'codex', paneId: ws.rootPane.paneId, args: [] });
-    await fake.promptAgent({ target: 'at-b', text: 'start work', wait: false, until: [], timeoutMs: 100 });
-    const wait = await fake.waitAgent({ target: 'at-b', until: ['blocked'], timeoutMs: 3000 });
-    expect(wait.state).toBe('blocked');
+    await fake.promptAgent({ target: 'at-b', text: 'start', wait: false, until: [], timeoutMs: 100 });
+    await fake.waitAgent({ target: 'at-b', until: ['blocked'], timeoutMs: 3000 });
+    expect(fake.agentState('at-b')).toBe('blocked');
+    fake.resumeAgent('at-b');
+    const done = await fake.waitAgent({ target: 'at-b', until: ['done'], timeoutMs: 3000 });
+    expect(done.state).toBe('done');
   });
 
   test('fault injection: failAgentStart', async () => {
-    const fake = new FakeHerdrClient({ fsRoot, faults: { failAgentStart: ['doomed'] } });
-    await expect(fake.startAgent({ name: 'doomed', kind: 'claude', paneId: 'w:p1', args: [] })).rejects.toMatchObject({
+    const fake = new FakeHerdrClient({ fsRoot, repoRoot, faults: { failAgentStart: ['doomed'] } });
+    const ws = await fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: 'ateam/t4/X' });
+    await expect(fake.startAgent({ name: 'doomed', kind: 'claude', paneId: ws.rootPane.paneId, args: [] })).rejects.toMatchObject({
       code: 'herdr_error',
     });
   });
 
   test('server restart wipes resources; call log records prompts', async () => {
-    const fake = new FakeHerdrClient({ fsRoot });
-    const ws = await fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: 'b' });
+    const fake = new FakeHerdrClient({ fsRoot, repoRoot });
+    const ws = await fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: 'ateam/t5/Y' });
     await fake.startAgent({ name: 'a1', kind: 'claude', paneId: ws.rootPane.paneId, args: [] });
     await fake.promptAgent({ target: 'a1', text: promptForResult(), wait: false, until: [], timeoutMs: 100 });
     expect(fake.promptCount('a1')).toBe(1);
@@ -90,15 +106,15 @@ describe('FakeHerdrClient', () => {
   });
 
   test('dropPane removes agent too', async () => {
-    const fake = new FakeHerdrClient({ fsRoot });
-    const ws = await fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: 'b' });
+    const fake = new FakeHerdrClient({ fsRoot, repoRoot });
+    const ws = await fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: 'ateam/t6/Z' });
     await fake.startAgent({ name: 'a2', kind: 'claude', paneId: ws.rootPane.paneId, args: [] });
     fake.dropPane(ws.rootPane.paneId);
     expect(await fake.getAgent('a2')).toBeNull();
   });
 
   test('reportAgentState accumulates self-reports', async () => {
-    const fake = new FakeHerdrClient({ fsRoot });
+    const fake = new FakeHerdrClient({ fsRoot, repoRoot });
     await fake.reportAgentState({ paneId: 'me:p', agent: 'me', state: 'working' });
     await fake.reportAgentState({ paneId: 'me:p', agent: 'me', state: 'blocked', message: 'waiting' });
     expect(fake.getSelfReports().map((r) => r.state)).toEqual(['working', 'blocked']);
