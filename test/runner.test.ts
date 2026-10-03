@@ -123,8 +123,9 @@ async function tickUntil(engine: RunnerEngine, fx: Fixture, pred: () => boolean,
   const { readdir } = await import('node:fs/promises');
   const wtRoot = join(fx.fsRoot, 'worktrees');
   const tree = await readdir(wtRoot, { recursive: true, withFileTypes: false }).catch(() => [] as string[]);
+  const agents = (await fx.fake.snapshot()).agents.map((a) => `${a.name}:${a.state}@${a.paneId}`);
   throw new Error(
-    `tickUntil exhausted: run=${getRun(fx.db, RUN)?.status} tasks=${JSON.stringify(listTasks(fx.db, RUN).map((t) => [t.taskId, t.status, t.attempts]))}\nevents:\n${events.join('\n')}\nworktree tree:\n${tree.join('\n')}`,
+    `tickUntil exhausted: run=${getRun(fx.db, RUN)?.status} tasks=${JSON.stringify(listTasks(fx.db, RUN).map((t) => [t.taskId, t.status, t.attempts]))}\nagents: ${agents.join(', ')}\nevents:\n${events.join('\n')}\nworktree tree:\n${tree.join('\n')}`,
   );
 }
 
@@ -370,6 +371,38 @@ describe('RunnerEngine — full delivery chain', () => {
     // idempotent second run
     expect(await cmdClean({ runId: RUN, home: fx.home, json: false, client: fx.fake })).toBe(0);
   }, 30_000);
+
+  test('reconcile: after server restart, lost panes get fresh attempts on rebuilt worktrees', async () => {
+    const fx = track(await makeFixture({
+      ...happyScripts(),
+      [wName('API')]: { kind: 'claude', sequence: ['working', 'done'], stepMs: 5 }, // finishes, no result
+      [wName('API', 2)]: workerScript(['src/api/x.ts', 'export const a = 1;\n'], workerOk('src/api/x.ts', 'export const a = 1;\n', 'recovered')),
+    }, { defaults: { maxParallel: 1 } }));
+    seedRun(fx);
+    const engine = engineFor(fx);
+    // API a1 finishes WITHOUT writing a result (script has no onState)
+    await tickUntil(engine, fx, () => fx.fake.agentState(wName('API')) === 'done');
+    expect(listExecutions(fx.db, RUN).filter((e) => e.taskId === 'API' && e.role === 'worker')).toHaveLength(1);
+
+    // simulate Herdr server restart: runtime registry wiped, worktree dirs remain
+    fx.fake.restartServer();
+
+    const engine2 = engineFor(fx);
+    const dry = await engine2.reconcileOnce({ dryRun: true });
+    expect(dry.some((d) => d.kind === 'pane_lost_new_attempt')).toBe(true);
+    expect(listExecutions(fx.db, RUN).filter((e) => e.taskId === 'API' && e.role === 'worker')).toHaveLength(1); // dry-run: unchanged
+
+    const decisions = await engine2.reconcileOnce({});
+    expect(decisions.some((d) => d.kind === 'pane_lost_new_attempt')).toBe(true);
+
+    await tickUntil(engine2, fx, () => TERMINALS.includes(getRun(fx.db, RUN)!.status));
+    expect(getRun(fx.db, RUN)!.status).toBe('done');
+    const apiWorkers = listExecutions(fx.db, RUN).filter((e) => e.taskId === 'API' && e.role === 'worker');
+    expect(apiWorkers).toHaveLength(2);
+    expect(apiWorkers[0]!.status).toBe('abandoned');
+    expect(fx.fake.promptCount(wName('API'))).toBe(1);
+    expect(fx.fake.promptCount(wName('API', 2))).toBe(1);
+  }, 60_000);
 
   test('runUntilTerminal refuses without a free lease', async () => {    const fx = track(await makeFixture({}));
     seedRun(fx);

@@ -10,7 +10,7 @@ import { getTask, listTasks, updateTask } from '../store/tasks.ts';
 import { listActiveExecutions, listExecutions, updateExecution } from '../store/executions.ts';
 import type { ExecutionRecord } from '../core/types.ts';
 import { addEvent } from '../store/events.ts';
-import { insertResource, markResourceState } from '../store/resources.ts';
+import { insertResource, markResourceState, listActiveResources } from '../store/resources.ts';
 import { heartbeat, acquireLease, releaseLease, leaseHolder } from '../store/lease.ts';
 import { nowIso } from '../store/ids.ts';
 import { readResultFile } from '../results/files.ts';
@@ -28,6 +28,22 @@ import { cleanupTaskResources } from './cleanup.ts';
 import { topologicalTasks } from '../core/contract.ts';
 
 const TERMINAL_RUN: ReadonlySet<string> = new Set(['done', 'cancelled', 'abandoned', 'failed']);
+
+export type ReconcileDecisionKind =
+  | 'result_recovered'
+  | 'pane_lost_new_attempt'
+  | 'pane_lost_no_attempt'
+  | 'cleanup_resumed'
+  | 'resource_lost'
+  | 'resource_orphaned'
+  | 'revision_consumed';
+
+export interface ReconcileDecision {
+  kind: ReconcileDecisionKind;
+  taskId?: string;
+  executionId?: string;
+  detail?: string;
+}
 
 export interface RunnerOptions {
   tickMs?: number;
@@ -216,14 +232,25 @@ export class RunnerEngine {
     if (!read) return;
     if (exec.resultDigest === read.digest) return; // already consumed this exact file
 
+    let result: WorkerResult | ReviewerResult | IntegrationResult;
     try {
-      const result = validateRoleResult(exec.role, read.value);
-      updateExecution(db, exec.id, { resultDigest: read.digest, result, resultReceivedAt: nowIso() });
-      addEvent(db, runId, 'RESULT_ACCEPTED', {
-        taskId: task.taskId,
+      result = validateRoleResult(exec.role, read.value);
+    } catch (err) {
+      // invalid schema: keep the pane, surface for attention; file stays for inspection
+      updateExecution(db, exec.id, { status: 'result_pending' });
+      addEvent(db, runId, 'RECONCILE_DECISION', {
         executionId: exec.id,
-        payload: { role: exec.role, digest: read.digest, status: (result as { status: string }).status },
+        payload: { reason: 'result_schema_rejected', error: String(err) },
       });
+      return;
+    }
+    updateExecution(db, exec.id, { resultDigest: read.digest, result, resultReceivedAt: nowIso() });
+    addEvent(db, runId, 'RESULT_ACCEPTED', {
+      taskId: task.taskId,
+      executionId: exec.id,
+      payload: { role: exec.role, digest: read.digest, status: (result as { status: string }).status },
+    });
+    try {
       if (exec.role === 'worker') {
         await this.applyWorkerResult({ ...exec, resultDigest: read.digest }, task, result as WorkerResult);
       } else if (exec.role === 'reviewer') {
@@ -232,12 +259,12 @@ export class RunnerEngine {
         await this.applyIntegratorResult({ ...exec, resultDigest: read.digest }, task, result as IntegrationResult);
       }
     } catch (err) {
-      // invalid schema: keep the pane, surface for attention; file stays for inspection
-      updateExecution(db, exec.id, { status: 'result_pending' });
+      // transition failures are real faults (missing panes, git errors) — surface, never swallow
       addEvent(db, runId, 'RECONCILE_DECISION', {
         executionId: exec.id,
-        payload: { reason: 'result_schema_rejected', error: String(err) },
+        payload: { reason: 'apply_failed', error: String(err) },
       });
+      updateRunStatus(db, runId, 'needs_attention', `apply failed: ${String(err)}`);
     }
   }
 
@@ -543,6 +570,141 @@ export class RunnerEngine {
       updateRunStatus(db, runId, 'needs_attention', 'integration final verification failed');
     }
   }
+
+  // ------------------------------------------------------------- reconcile
+
+  /** One reconciliation pass: snapshot ∩ ledger, recover, resume cleanups. */
+  async reconcileOnce(opts: { dryRun?: boolean } = {}): Promise<ReconcileDecision[]> {
+    const { db, runId, client } = this.env;
+    const decisions: ReconcileDecision[] = [];
+    const apply = async (fn: () => Promise<void> | void): Promise<void> => {
+      if (!opts.dryRun) await fn();
+    };
+
+    const run = getRun(db, runId);
+    if (!run || TERMINAL_RUN.has(run.status)) return decisions;
+
+    if (run.revisionPending) {
+      decisions.push({ kind: 'revision_consumed', detail: `revision ${run.contractRevision}` });
+      await apply(() => this.consumeContractRevision());
+    }
+
+    const snap = await client.snapshot().catch(() => null);
+    const alivePanes = new Set((snap?.panes ?? []).map((p) => p.paneId));
+    const tasks = listTasks(db, runId);
+    // only resources that existed before this pass may be swept as lost/orphaned
+    const preExistingResources = new Set(listActiveResources(db, runId).map((r) => `${r.kind}:${r.herdrId}`));
+
+    for (const exec of listActiveExecutions(db, runId)) {
+      const paneAlive = exec.paneId ? alivePanes.has(exec.paneId) : false;
+      if (paneAlive) {
+        decisions.push({ kind: 'result_recovered', taskId: exec.taskId, executionId: exec.id, detail: 'pane alive; re-entered result gate' });
+        await apply(() => this.progressExecution(exec, listTasks(db, runId)));
+        continue;
+      }
+      const task = tasks.find((t) => t.taskId === exec.taskId);
+      decisions.push({
+        kind: exec.promptSentAt ? 'pane_lost_new_attempt' : 'pane_lost_no_attempt',
+        taskId: exec.taskId,
+        executionId: exec.id,
+        detail: `pane ${exec.paneId ?? '-'} not in snapshot`,
+      });
+      if (opts.dryRun || !task) continue;
+      updateExecution(db, exec.id, { status: 'abandoned', paneState: 'gone' });
+      addEvent(db, runId, 'RECONCILE_DECISION', {
+        executionId: exec.id,
+        payload: { reason: 'pane_lost', promptSent: !!exec.promptSentAt },
+      });
+      if (!exec.promptSentAt) continue;
+      await this.recoverExecutionOnFreshWorktree(exec, task, decisions);
+    }
+
+    for (const task of listTasks(db, runId).filter((t) => t.status === 'integrated')) {
+      decisions.push({ kind: 'cleanup_resumed', taskId: task.taskId });
+      await apply(async () => {
+        await cleanupTaskResources(this.env, task);
+      });
+    }
+
+    if (snap) {
+      const snapIds = new Set<string>([
+        ...snap.workspaces.map((w) => w.workspaceId),
+        ...snap.panes.map((p) => p.paneId),
+      ]);
+      for (const res of listActiveResources(db, runId)) {
+        if (!preExistingResources.has(`${res.kind}:${res.herdrId}`)) continue;
+        if (snapIds.has(res.herdrId)) continue;
+        decisions.push({
+          kind: res.provenance ? 'resource_lost' : 'resource_orphaned',
+          taskId: res.taskId ?? undefined,
+          detail: `${res.kind}:${res.herdrId}`,
+        });
+        await apply(() => markResourceState(db, res.kind, res.herdrId, res.provenance ? 'lost' : 'orphaned'));
+      }
+    }
+
+    return decisions;
+  }
+
+  /** Recreate a usable worktree (reuse → same-branch rebuild → suffixed rebuild) then re-dispatch. */
+  private async recoverExecutionOnFreshWorktree(
+    exec: ExecutionRecord,
+    task: TaskRecord,
+    decisions: ReconcileDecision[],
+  ): Promise<void> {
+    const { db, runId, client } = this.env;
+    const source = process.env.HERDR_WORKSPACE_ID ?? task.workspaceId ?? '';
+    let handle: Awaited<ReturnType<typeof client.createWorktreeWorkspace>> | null = null;
+
+    if (task.branch) {
+      try {
+        handle = await client.openWorktree({ sourceWorkspaceId: source, branch: task.branch });
+      } catch {
+        /* try rebuilds below */
+      }
+      if (!handle) {
+        for (const suffix of ['', '-r2', '-r3']) {
+          try {
+            handle = await client.createWorktreeWorkspace({
+              sourceWorkspaceId: source, branch: `${task.branch}${suffix}`, focus: false,
+            });
+            break;
+          } catch {
+            /* next suffix */
+          }
+        }
+      }
+    }
+    if (!handle) {
+      decisions.push({ kind: 'pane_lost_no_attempt', taskId: task.taskId, detail: 'worktree unrecoverable; needs manual attention' });
+      updateTask(db, runId, task.taskId, { lastError: 'worktree unrecoverable after pane loss' });
+      return;
+    }
+
+    insertResource(db, {
+      runId, taskId: task.taskId, kind: 'workspace', herdrId: handle.workspace.workspaceId,
+      branch: handle.worktree.branch, path: handle.worktree.path,
+    });
+    insertResource(db, { runId, taskId: task.taskId, kind: 'pane', herdrId: handle.rootPane.paneId });
+    updateTask(db, runId, task.taskId, {
+      workspaceId: handle.workspace.workspaceId,
+      worktreePath: handle.worktree.path,
+      branch: handle.worktree.branch,
+      startSha: null,
+    });
+
+    const current = getTask(db, runId, task.taskId)!;
+    if (exec.role === 'worker') {
+      await this.retryWorker(current, {});
+    } else if (exec.role === 'reviewer') {
+      await this.startReviewer(current);
+    } else {
+      this.integrationStalled = true;
+      updateTask(db, runId, task.taskId, { lastError: 'integrator pane lost mid-conflict; resolve manually' });
+      decisions.push({ kind: 'pane_lost_no_attempt', taskId: task.taskId, detail: 'integrator mid-conflict; needs manual resolution' });
+    }
+  }
+
 
   // ------------------------------------------------------------- aggregate
 

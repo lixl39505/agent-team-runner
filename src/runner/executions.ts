@@ -132,10 +132,9 @@ export async function startExecution(env: RunnerEnv, input: StartExecutionInput)
   const { task } = input;
   const worktreePath = input.targetWorktree?.path ?? (await ensureTaskWorktree(env, task)).worktreePath!;
   const rootPaneId = input.targetWorktree?.rootPaneId ?? findRootPaneId(env, task.taskId);
+  // split panes live on the execution row only — pane resources are reserved
+  // for workspace ROOT panes (the stable split source)
   const pane = await env.client.splitPane({ paneId: rootPaneId, direction: 'right', label: `${task.taskId}:${input.role}` });
-  insertResource(env.db, {
-    runId: env.runId, taskId: input.targetWorktree ? null : task.taskId, kind: 'pane', herdrId: pane.paneId,
-  });
 
   const attemptNo = input.attemptNo;
   const cycleNo = input.cycleNo;
@@ -223,10 +222,11 @@ function getExecutionRow(env: RunnerEnv, executionId: string) {
   return row;
 }
 
-/** The workspace root pane of a task (created first, split source for agents). */
+/** The workspace root pane of a task — newest registration wins (older
+ * registrations may belong to worktrees lost to a Herdr restart). */
 export function findRootPaneId(env: RunnerEnv, taskId: string): string {
   const panes = listActiveResources(env.db, env.runId).filter((r) => r.kind === 'pane' && r.taskId === taskId);
-  const root = panes.find((p) => p.executionId === null);
+  const root = panes.at(-1);
   if (!root) throw new HerdrError('not_found', `no root pane recorded for task ${taskId}`);
   return root.herdrId;
 }

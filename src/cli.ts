@@ -222,9 +222,16 @@ async function main(argv: readonly string[]): Promise<number> {
       return await cmdClean({ runId, home: globals.home, json: globals.json });
     }
 
-    case 'reconcile':
-      console.error('`reconcile` is not implemented yet (planned milestone M5).');
-      return 1;
+    case 'reconcile': {
+      const { cmdReconcile } = await import('./commands/reconcile-cli.ts');
+      return await cmdReconcile({
+        runId: typeof flags['run-id'] === 'string' ? flags['run-id'] : undefined,
+        home: globals.home,
+        json: globals.json,
+        dryRun: flags['dry-run'] === true,
+        herdrPath: typeof flags.herdr === 'string' ? flags.herdr : undefined,
+      });
+    }
 
     case 'results':
       console.error('`results` is not implemented yet.');
