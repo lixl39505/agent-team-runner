@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ateam.dev/schemas/reviewer-result.v1.json",
+  "title": "Reviewer result v1",
+  "description": "Read-only review verdict. changes_requested requires non-empty requiredChanges.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "summary", "findings", "requiredChanges", "reviewedFiles"],
+  "properties": {
+    "status": { "enum": ["approved", "changes_requested"] },
+    "summary": { "type": "string", "minLength": 1 },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "file", "message"],
+        "properties": {
+          "severity": { "enum": ["critical", "high", "medium", "low"] },
+          "file": { "type": "string" },
+          "line": { "type": "integer", "minimum": 1 },
+          "message": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "requiredChanges": { "type": "array", "items": { "type": "string" } },
+    "reviewedFiles": { "type": "array", "items": { "type": "string" } }
+  }
+}

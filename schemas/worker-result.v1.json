@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ateam.dev/schemas/worker-result.v1.json",
+  "title": "Worker result v1",
+  "description": "Authoritative worker deliverable, written atomically to the RESULT FILE path. Unknown fields are rejected by the runner (see src/results/validate.ts).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "summary", "testsRun", "knownRisks", "changedPaths"],
+  "properties": {
+    "status": { "enum": ["completed", "blocked", "blocked_on_contract", "failed"] },
+    "summary": { "type": "string", "minLength": 1 },
+    "testsRun": { "type": "array", "items": { "type": "string" } },
+    "knownRisks": { "type": "array", "items": { "type": "string" } },
+    "changedPaths": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "self-reported; the runner recomputes mechanically"
+    },
+    "blockedReason": {
+      "type": "string",
+      "description": "required for blocked|failed; forbidden for blocked_on_contract"
+    },
+    "contractBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "requestedContractChanges", "affectedPaths"],
+      "properties": {
+        "code": {
+          "enum": ["out_of_scope", "missing_requirement", "conflicting_requirement", "dependency_change", "missing_access", "other"]
+        },
+        "message": { "type": "string", "minLength": 1 },
+        "requestedContractChanges": { "type": "array", "items": { "type": "string" } },
+        "affectedPaths": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "blocked_on_contract" } } },
+      "then": { "required": ["contractBlock"] }
+    },
+    {
+      "if": { "properties": { "status": { "enum": ["blocked", "failed"] } } },
+      "then": { "required": ["blockedReason"] }
+    }
+  ]
+}

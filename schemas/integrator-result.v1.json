@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ateam.dev/schemas/integrator-result.v1.json",
+  "title": "Integrator result v1",
+  "description": "Conflict-resolution outcome for the integration phase. blocked|failed require blockedReason.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "summary", "testsRun", "knownRisks", "resolvedConflicts"],
+  "properties": {
+    "status": { "enum": ["completed", "blocked", "failed"] },
+    "summary": { "type": "string", "minLength": 1 },
+    "testsRun": { "type": "array", "items": { "type": "string" } },
+    "knownRisks": { "type": "array", "items": { "type": "string" } },
+    "resolvedConflicts": { "type": "array", "items": { "type": "string" } },
+    "blockedReason": { "type": "string", "minLength": 1 }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "project": {
+    "id": "demo",
+    "repoRoot": "D:/Workspace/demo",
+    "baseRef": "main"
+  },
+  "tasks": [
+    {
+      "id": "API",
+      "title": "Add /health endpoint",
+      "description": "Return {status:'ok'} on GET /health.",
+      "allowedPaths": ["src/routes/health.ts", "src/app.ts"],
+      "acceptance": ["GET /health responds 200"],
+      "verificationCommands": ["bun test"]
+    },
+    {
+      "id": "DOCS",
+      "title": "Document /health endpoint",
+      "dependsOn": ["API"],
+      "allowedPaths": ["docs/health.md"],
+      "allowNoChanges": false
+    }
+  ]
+}

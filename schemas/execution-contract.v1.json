@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ateam.dev/schemas/execution-contract.v1.json",
+  "title": "ExecutionContract v1",
+  "description": "Versioned delivery contract accepted by the ATeam runner. The authoritative validator is hand-written TypeScript (src/core/contract.ts); unknown fields are rejected.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "project", "tasks"],
+  "properties": {
+    "version": { "const": 1 },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "repoRoot", "baseRef"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "repoRoot": { "type": "string", "description": "absolute path of the bound repository" },
+        "baseRef": { "type": "string", "minLength": 1 }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "documents": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "reference"],
+            "properties": {
+              "kind": { "type": "string" },
+              "reference": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "tasks": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/task" }
+    }
+  },
+  "$defs": {
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "allowedPaths"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[A-Z][A-Z0-9_-]{1,31}$" },
+        "externalId": { "type": "string" },
+        "title": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "agent": { "type": "string", "description": "agent registry key; defaults to roles.worker" },
+        "dependsOn": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "allowedPaths": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" },
+          "description": "globs with exclusive ownership; must not overlap other tasks"
+        },
+        "blockedPaths": { "type": "array", "items": { "type": "string" } },
+        "acceptance": { "type": "array", "items": { "type": "string" } },
+        "verificationCommands": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "each command must pass the shell allowlist"
+        },
+        "implementationSkills": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name"],
+            "properties": {
+              "name": { "type": "string" },
+              "role": { "enum": ["worker", "reviewer", "integrator"] },
+              "required": { "type": "boolean" },
+              "source": { "type": "string" },
+              "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+            }
+          }
+        },
+        "implementationGuidance": { "type": "string" },
+        "allowNoChanges": { "type": "boolean" }
+      }
+    }
+  }
+}
