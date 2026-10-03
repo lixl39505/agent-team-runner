@@ -1,0 +1,19 @@
+{
+  "name": "agent-team",
+  "version": "0.1.0",
+  "description": "ATeam: Herdr-native delivery control plane",
+  "type": "module",
+  "bin": {
+    "agent-team": "./src/cli.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "check": "bun run typecheck && bun test",
+    "doctor": "bun src/cli.ts doctor --runtime herdr"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2"
+  }
+}
