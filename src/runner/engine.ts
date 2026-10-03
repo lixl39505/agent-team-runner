@@ -10,6 +10,7 @@ import { getTask, listTasks, updateTask } from '../store/tasks.ts';
 import { listActiveExecutions, listExecutions, updateExecution } from '../store/executions.ts';
 import type { ExecutionRecord } from '../core/types.ts';
 import { addEvent } from '../store/events.ts';
+import { insertResource, markResourceState } from '../store/resources.ts';
 import { heartbeat, acquireLease, releaseLease, leaseHolder } from '../store/lease.ts';
 import { nowIso } from '../store/ids.ts';
 import { readResultFile } from '../results/files.ts';
@@ -23,6 +24,7 @@ import { resolveAgentEntry } from '../config.ts';
 import type { RunnerEnv, StartExecutionInput } from './executions.ts';
 import { startExecution, resolveReviewerEntry, closePaneSafe } from './executions.ts';
 import { verifyTaskWork } from './phases/verify.ts';
+import { cleanupTaskResources } from './cleanup.ts';
 import { topologicalTasks } from '../core/contract.ts';
 
 const TERMINAL_RUN: ReadonlySet<string> = new Set(['done', 'cancelled', 'abandoned', 'failed']);
@@ -44,6 +46,8 @@ export class RunnerEngine {
   private conflictTaskId: string | null = null;
   /** Integrator gave up: needs human/reconcile intervention. */
   private integrationStalled = false;
+  /** Final verification passed; remaining work is resource reclamation. */
+  private finalVerified = false;
 
   constructor(env: RunnerEnv, opts: RunnerOptions = {}) {
     this.env = env;
@@ -399,6 +403,10 @@ export class RunnerEngine {
     const tasks = listTasks(db, runId);
     if (tasks.length === 0) return;
     if (this.integrationStalled) return;
+    if (this.finalVerified) {
+      await this.runCleanupPhase();
+      return;
+    }
     const active = listActiveExecutions(db, runId);
     if (active.length > 0) return; // finish execution work first
 
@@ -422,6 +430,31 @@ export class RunnerEngine {
     }
   }
 
+  /** Reclaim integrated tasks step by step; done once everything is reclaimed. */
+  private async runCleanupPhase(): Promise<void> {
+    const { db, runId, client } = this.env;
+    const tasks = listTasks(db, runId);
+    for (const task of tasks.filter((t) => t.status === 'integrated')) {
+      await cleanupTaskResources(this.env, task);
+    }
+    // run-level temp resource: the integration worktree itself
+    if (this.integrationWorkspaceId && listTasks(db, runId).every((t) => t.status === 'reclaimed')) {
+      try {
+        await client.removeWorktree({ workspaceId: this.integrationWorkspaceId, force: true });
+        markResourceState(db, 'workspace', this.integrationWorkspaceId, 'reclaimed');
+        this.integrationWorkspaceId = null;
+        this.integrationPath = null;
+      } catch {
+        /* retried on the next tick / by clean */
+      }
+    }
+    const remaining = listTasks(db, runId);
+    if (remaining.every((t) => t.status === 'reclaimed') && !this.integrationWorkspaceId) {
+      updateRunStatus(db, runId, 'done');
+      addEvent(db, runId, 'RUN_FINISHED', { payload: { status: 'done' } });
+    }
+  }
+
   private async ensureIntegrationWorktree(tasks: TaskRecord[]): Promise<void> {
     if (this.integrationPath) return;
     const firstWithWorkspace = tasks.find((t) => t.workspaceId);
@@ -436,7 +469,13 @@ export class RunnerEngine {
     this.integrationPath = handle.worktree.path;
     this.integrationRootPaneId = handle.rootPane.paneId;
     this.integrationBaseSha = await revParse(handle.worktree.path, 'HEAD');
+    insertResource(this.env.db, {
+      runId: this.env.runId, kind: 'workspace', herdrId: handle.workspace.workspaceId, branch, path: handle.worktree.path,
+    });
+    this.integrationWorkspaceId = handle.workspace.workspaceId;
   }
+
+  private integrationWorkspaceId: string | null = null;
 
   private async integrateTask(task: TaskRecord): Promise<void> {
     const { db, runId, config } = this.env;
@@ -499,8 +538,7 @@ export class RunnerEngine {
       payload: { phase: 'integration_final', violations: outcome.violations, logPath: outcome.logPath },
     });
     if (outcome.ok) {
-      updateRunStatus(db, runId, 'done');
-      addEvent(db, runId, 'RUN_FINISHED', { payload: { status: 'done' } });
+      this.finalVerified = true;
     } else {
       updateRunStatus(db, runId, 'needs_attention', 'integration final verification failed');
     }

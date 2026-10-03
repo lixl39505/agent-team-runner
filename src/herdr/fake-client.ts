@@ -292,7 +292,7 @@ export class FakeHerdrClient implements HerdrRuntimeClient {
     this.record('removeWorktree', input);
     const handle = this.workspaces.get(input.workspaceId);
     if (handle) {
-      await git(this.opts.repoRoot, ['worktree', 'remove', handle.worktree.path]);
+      await git(this.opts.repoRoot, ['worktree', 'remove', ...(input.force ? ['--force'] : []), handle.worktree.path]);
       this.workspaces.delete(input.workspaceId);
       this.panes.delete(handle.rootPane.paneId);
     }

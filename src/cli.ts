@@ -8,6 +8,7 @@ import { cmdRun, type RunCommandOptions } from './commands/run.ts';
 import { cmdSubmit } from './commands/submit.ts';
 import { cmdRunnerEntry } from './commands/runner-entry.ts';
 import { cmdContract } from './commands/contract-cmd.ts';
+import { cmdClean } from './commands/clean.ts';
 import { renderStatus, renderLog, snapshot, attachTargets } from './commands/status.ts';
 import { openDatabase } from './store/db.ts';
 import { loadHome } from './config.ts';
@@ -212,9 +213,17 @@ async function main(argv: readonly string[]): Promise<number> {
       }
     }
 
+    case 'clean': {
+      const runId = positional[0] ?? (typeof flags['run-id'] === 'string' ? flags['run-id'] : undefined);
+      if (!runId) {
+        console.error('clean requires RUN_ID');
+        return 1;
+      }
+      return await cmdClean({ runId, home: globals.home, json: globals.json });
+    }
+
     case 'reconcile':
-    case 'clean':
-      console.error(`\`${command}\` is not implemented yet (planned milestone M4/M5).`);
+      console.error('`reconcile` is not implemented yet (planned milestone M5).');
       return 1;
 
     case 'results':

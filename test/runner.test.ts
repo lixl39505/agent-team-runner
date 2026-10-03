@@ -163,7 +163,8 @@ describe('RunnerEngine — full delivery chain', () => {
 
     expect(getRun(fx.db, RUN)!.status).toBe('done');
     const tasks = listTasks(fx.db, RUN);
-    expect(tasks.every((t) => t.status === 'integrated')).toBe(true);
+    // full lifecycle: integrated AND reclaimed with audited cleanup
+    expect(tasks.every((t) => t.status === 'reclaimed')).toBe(true);
     expect(tasks.every((t) => t.commitSha && t.integrationCommit)).toBe(true);
 
     const execs = listExecutions(fx.db, RUN);
@@ -174,6 +175,14 @@ describe('RunnerEngine — full delivery chain', () => {
       expect(fx.fake.promptCount(exec.agentName)).toBe(1);
     }
     expect(fx.fake.agentCount()).toBe(0);
+
+    // temp resources reclaimed: branches deleted, worktrees gone (only the fake's base workspace remains)
+    const { branchExists } = await import('../src/core/git.ts');
+    for (const task of tasks) {
+      expect(await branchExists(fx.repoRoot, task.branch!)).toBe(false);
+    }
+    const workspaces = (await fx.fake.snapshot()).workspaces;
+    expect(workspaces.filter((w) => w.workspaceId !== 'w0')).toHaveLength(0);
   }, 30_000);
 
   test('native blocked: no new attempt, resumes in the same execution', async () => {
@@ -336,8 +345,33 @@ describe('RunnerEngine — full delivery chain', () => {
     expect((api.review as { status: string }).status).toBe('approved');
   }, 30_000);
 
-  test('runUntilTerminal refuses without a free lease', async () => {
+  test('clean reclaims integrated-but-unfinished resources and abandons the run', async () => {
     const fx = track(await makeFixture({}));
+    seedRun(fx);
+    // simulate: API reached "integrated" then the runner died before cleanup
+    const ws = await fx.fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: `ateam/${RUN}/task/API` });
+    fx.db.run(
+      `UPDATE tasks SET status='integrated', branch=?, worktree_path=?, workspace_id=?,
+       start_sha='s0', commit_sha='c1', integration_commit='i1' WHERE run_id=? AND task_id='API'`,
+      [`ateam/${RUN}/task/API`, ws.worktree.path, ws.workspace.workspaceId, RUN],
+    );
+    const { insertResource } = await import('../src/store/resources.ts');
+    insertResource(fx.db, { runId: RUN, taskId: 'API', kind: 'workspace', herdrId: ws.workspace.workspaceId, branch: ws.worktree.branch, path: ws.worktree.path });
+    fx.db.run("UPDATE runs SET status='needs_attention' WHERE id = ?", [RUN]);
+
+    const { cmdClean } = await import('../src/commands/clean.ts');
+    const exit = await cmdClean({ runId: RUN, home: fx.home, json: false, client: fx.fake });
+    expect(exit).toBe(0);
+    expect(getRun(fx.db, RUN)!.status).toBe('abandoned');
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('reclaimed');
+    const { branchExists } = await import('../src/core/git.ts');
+    expect(await branchExists(fx.repoRoot, `ateam/${RUN}/task/API`)).toBe(false);
+    expect((await fx.fake.snapshot()).workspaces.filter((w) => w.workspaceId !== 'w0')).toHaveLength(0);
+    // idempotent second run
+    expect(await cmdClean({ runId: RUN, home: fx.home, json: false, client: fx.fake })).toBe(0);
+  }, 30_000);
+
+  test('runUntilTerminal refuses without a free lease', async () => {    const fx = track(await makeFixture({}));
     seedRun(fx);
     expect(acquireLease(fx.db, RUN)).toBe(true);
     fx.db.run("UPDATE runner_leases SET holder = '99999@other' WHERE run_id = ?", [RUN]);
