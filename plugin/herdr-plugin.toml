@@ -1,0 +1,29 @@
+# ATeam Herdr 插件清单（ADR 0001 §Herdr 插件）
+#
+# 安装（本地开发）：herdr plugin link /path/to/agent-team-runner/plugin
+# 动态 Agent pane 一律由 Runner 通过 Herdr API 创建；本清单只声明固定入口。
+
+id = "ateam"
+name = "ATeam Delivery Control Plane"
+version = "0.1.0"
+description = "Run and reconcile ATeam delivery runs from inside Herdr"
+platforms = ["linux", "macos", "windows"]
+min_herdr_version = "0.7.0"
+
+# action 即固定 CLI 入口；上下文经 HERDR_PLUGIN_CONTEXT_JSON 注入，
+# `agent-team run` 会解析它获取自身 pane id（Runner 状态自报用）。
+[[actions]]
+id = "run-team-swarm"
+title = "Run team swarm"
+contexts = ["workspace"]
+command = ["bun", "run", "src/cli.ts", "run", "--claim"]
+
+[[actions]]
+id = "reconcile-team-runs"
+title = "Reconcile team runs"
+contexts = ["workspace"]
+command = ["bun", "run", "src/cli.ts", "reconcile"]
+
+# startup hook：server 重启/插件启动后无副作用检查未终结 run 并汇报
+[[startup]]
+command = ["bun", "run", "src/cli.ts", "reconcile", "--dry-run"]
