@@ -153,7 +153,7 @@ const MIGRATIONS: string[] = [
 ];
 
 export function openDatabase(path: string): SqliteDb {
-  mkdirSync(dirname(path), { recursive: true });
+  if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path, { create: true });
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA foreign_keys = ON');
