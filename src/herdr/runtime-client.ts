@@ -5,6 +5,7 @@
 import type { HerdrRuntimeClient } from './client.ts';
 import { HerdrCliTransport, bunSpawner } from './cli-transport.ts';
 import { HerdrError } from './types.ts';
+import { HerdrSocketTransport } from './socket-transport.ts';
 import type {
   AgentRecord,
   AgentWaitResult,
@@ -275,11 +276,7 @@ export class HerdrCliRuntimeClient implements HerdrRuntimeClient {
 
   async snapshot(): Promise<HerdrSessionSnapshot> {
     const result = unwrapResult<AnyRecord>(await this.cli.callJson<unknown>(['api', 'snapshot', '--json']));
-    const workspaces = Array.isArray(pick(result, 'workspaces')) ? (pick(result, 'workspaces') as AnyRecord[]).map(mapWorkspace) : [];
-    const tabs = Array.isArray(pick(result, 'tabs')) ? (pick(result, 'tabs') as AnyRecord[]).map(mapTab) : [];
-    const panes = Array.isArray(pick(result, 'panes')) ? (pick(result, 'panes') as AnyRecord[]).map(mapPane) : [];
-    const agents = Array.isArray(pick(result, 'agents')) ? (pick(result, 'agents') as AnyRecord[]).map(mapAgent) : [];
-    return { version: str(pick(result, 'version')), workspaces, tabs, panes, agents };
+    return normalizeSnapshot(result);
   }
 
   async subscribe(): Promise<never> {
@@ -288,4 +285,86 @@ export class HerdrCliRuntimeClient implements HerdrRuntimeClient {
       'event subscription requires the socket transport (M5); use polling for now',
     );
   }
+}
+
+/** Normalize a raw session.snapshot result body into domain records. */
+export function normalizeSnapshot(result: unknown): HerdrSessionSnapshot {
+  const body = (typeof result === 'object' && result !== null ? result : {}) as AnyRecord;
+  const workspaces = Array.isArray(pick(body, 'workspaces')) ? (pick(body, 'workspaces') as AnyRecord[]).map(mapWorkspace) : [];
+  const tabs = Array.isArray(pick(body, 'tabs')) ? (pick(body, 'tabs') as AnyRecord[]).map(mapTab) : [];
+  const panes = Array.isArray(pick(body, 'panes')) ? (pick(body, 'panes') as AnyRecord[]).map(mapPane) : [];
+  const agents = Array.isArray(pick(body, 'agents')) ? (pick(body, 'agents') as AnyRecord[]).map(mapAgent) : [];
+  return { version: str(pick(body, 'version')), workspaces, tabs, panes, agents };
+}
+
+/**
+ * Hybrid client: CLI wrappers for lifecycle operations, raw socket for the
+ * two operations that need a persistent connection (snapshot/subscribe).
+ * Selected via ATEAM_HERDR_TRANSPORT=socket or a CLI client lacking
+ * sessionSnapshot capability.
+ */
+export class HerdrHybridRuntimeClient implements HerdrRuntimeClient {
+  constructor(
+    private readonly cli: HerdrRuntimeClient,
+    private readonly socket: HerdrSocketTransport,
+  ) {}
+
+  probe(): Promise<HerdrProbe> {
+    return this.cli.probe();
+  }
+  createWorktreeWorkspace(input: Parameters<HerdrRuntimeClient['createWorktreeWorkspace']>[0]) {
+    return this.cli.createWorktreeWorkspace(input);
+  }
+  openWorktree(input: Parameters<HerdrRuntimeClient['openWorktree']>[0]) {
+    return this.cli.openWorktree(input);
+  }
+  removeWorktree(input: { workspaceId: string; force?: boolean }) {
+    return this.cli.removeWorktree(input);
+  }
+  splitPane(input: { paneId: string; direction?: 'right' | 'down'; label?: string }) {
+    return this.cli.splitPane(input);
+  }
+  async closePane(paneId: string): Promise<void> {
+    await this.cli.closePane(paneId);
+  }
+  async focusPane(paneId: string): Promise<void> {
+    await this.cli.focusPane(paneId);
+  }
+  startAgent(input: Parameters<HerdrRuntimeClient['startAgent']>[0]) {
+    return this.cli.startAgent(input);
+  }
+  promptAgent(input: Parameters<HerdrRuntimeClient['promptAgent']>[0]) {
+    return this.cli.promptAgent(input);
+  }
+  waitAgent(input: Parameters<HerdrRuntimeClient['waitAgent']>[0]) {
+    return this.cli.waitAgent(input);
+  }
+  getAgent(target: string) {
+    return this.cli.getAgent(target);
+  }
+  readPane(input: Parameters<HerdrRuntimeClient['readPane']>[0]) {
+    return this.cli.readPane(input);
+  }
+  reportAgentState(input: Parameters<HerdrRuntimeClient['reportAgentState']>[0]) {
+    return this.cli.reportAgentState(input);
+  }
+  async snapshot(): Promise<HerdrSessionSnapshot> {
+    try {
+      return normalizeSnapshot(unwrapResult<AnyRecord>(await this.socket.snapshot()));
+    } catch (err) {
+      if (err instanceof HerdrError && (err.code === 'herdr_not_running' || err.code === 'timeout')) throw err;
+      return this.cli.snapshot();
+    }
+  }
+  subscribe(filter?: { paneId?: string }) {
+    return this.socket.subscribe(filter);
+  }
+}
+
+export function createRuntimeClient(opts: { herdrPath?: string; preferSocket?: boolean } = {}): HerdrRuntimeClient {
+  const cli = new HerdrCliRuntimeClient(opts.herdrPath ? { herdrPath: opts.herdrPath } : {});
+  if (opts.preferSocket ?? process.env.ATEAM_HERDR_TRANSPORT === 'socket') {
+    return new HerdrHybridRuntimeClient(cli, new HerdrSocketTransport());
+  }
+  return cli;
 }
