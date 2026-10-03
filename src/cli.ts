@@ -4,6 +4,13 @@
 
 import { AteamError, exitCodeOf } from './core/errors.ts';
 import { renderDoctorReport, runDoctor } from './commands/doctor.ts';
+import { cmdRun, type RunCommandOptions } from './commands/run.ts';
+import { cmdSubmit } from './commands/submit.ts';
+import { cmdRunnerEntry } from './commands/runner-entry.ts';
+import { cmdContract } from './commands/contract-cmd.ts';
+import { renderStatus, renderLog, snapshot, attachTargets } from './commands/status.ts';
+import { openDatabase } from './store/db.ts';
+import { loadHome } from './config.ts';
 
 interface GlobalFlags {
   home?: string;
@@ -51,9 +58,18 @@ function usage(): string {
     'agent-team — Herdr-native delivery control plane',
     '',
     'Usage:',
-    '  agent-team doctor --runtime herdr [--json] [--home PATH]',
+    '  agent-team run --contract PATH [--run-id ID] [--max-parallel N] [--json]',
+    '  agent-team submit --contract PATH [--json]',
+    '  agent-team runner (--run-id ID | --claim) [--self-pane PANE_ID]',
+    '  agent-team doctor --runtime herdr [--json]',
+    '  agent-team status [RUN_ID] [--json]',
+    '  agent-team log RUN_ID [--task ID] [--events] [--lines N]',
+    '  agent-team attach RUN_ID TASK_ID',
+    '  agent-team contract (validate --contract PATH | revise --run-id ID --contract PATH)',
+    '  agent-team reconcile [--run-id ID] [--dry-run]   (M5)',
+    '  agent-team clean RUN_ID                          (M4)',
     '',
-    'More subcommands arrive with later milestones (run/submit/runner/status/...).',
+    'Global flags: --home PATH (default ~/.agent-team), --json',
   ].join('\n');
 }
 
@@ -82,17 +98,127 @@ async function main(argv: readonly string[]): Promise<number> {
       return report.ok ? 0 : 1;
     }
 
-    case 'status':
-    case 'run':
-    case 'submit':
-    case 'runner':
+    case 'run': {
+      const opts: RunCommandOptions = {
+        contract: typeof flags.contract === 'string' ? flags.contract : undefined,
+        runId: typeof flags['run-id'] === 'string' ? flags['run-id'] : undefined,
+        home: globals.home,
+        maxParallel: typeof flags['max-parallel'] === 'string' ? Number(flags['max-parallel']) : undefined,
+        json: globals.json,
+        herdrPath: typeof flags.herdr === 'string' ? flags.herdr : undefined,
+        claim: flags.claim === true,
+      };
+      return await cmdRun(opts);
+    }
+
+    case 'submit': {
+      if (typeof flags.contract !== 'string') {
+        console.error('submit requires --contract PATH');
+        return 1;
+      }
+      return await cmdSubmit({ contract: flags.contract, home: globals.home, json: globals.json });
+    }
+
+    case 'runner': {
+      return await cmdRunnerEntry({
+        runId: typeof flags['run-id'] === 'string' ? flags['run-id'] : undefined,
+        claim: flags.claim === true,
+        home: globals.home,
+        herdrPath: typeof flags.herdr === 'string' ? flags.herdr : undefined,
+      });
+    }
+
+    case 'contract': {
+      const action = positional[0];
+      if (action !== 'validate' && action !== 'revise') {
+        console.error('contract requires action: validate | revise');
+        return 1;
+      }
+      if (typeof flags.contract !== 'string') {
+        console.error('contract requires --contract PATH');
+        return 1;
+      }
+      return await cmdContract({
+        action,
+        contract: flags.contract,
+        runId: typeof flags['run-id'] === 'string' ? flags['run-id'] : undefined,
+        home: globals.home,
+        json: globals.json,
+      });
+    }
+
+    case 'status': {
+      const home = await loadHome(globals.home);
+      const db = openDatabase(home.dbPath);
+      try {
+        let runId = positional[0];
+        if (!runId) {
+          const { listRuns } = await import('./store/runs.ts');
+          runId = listRuns(db, { nonTerminalOnly: true })[0]?.id ?? listRuns(db)[0]?.id;
+        }
+        if (!runId) {
+          console.error('no runs found; submit a contract first');
+          return 1;
+        }
+        const snap = snapshot(db, runId);
+        if (globals.json) {
+          console.log(JSON.stringify(snap, null, 2));
+        } else {
+          console.log(renderStatus(snap));
+        }
+        return 0;
+      } finally {
+        db.close();
+      }
+    }
+
+    case 'log': {
+      const runId = positional[0];
+      if (!runId) {
+        console.error('log requires RUN_ID');
+        return 1;
+      }
+      const home = await loadHome(globals.home);
+      const db = openDatabase(home.dbPath);
+      try {
+        console.log(renderLog(db, runId, {
+          taskId: typeof flags.task === 'string' ? flags.task : undefined,
+          limit: typeof flags.lines === 'string' ? Number(flags.lines) : undefined,
+        }));
+        return 0;
+      } finally {
+        db.close();
+      }
+    }
+
+    case 'attach': {
+      const [runId, taskId] = positional;
+      if (!runId || !taskId) {
+        console.error('attach requires RUN_ID TASK_ID');
+        return 1;
+      }
+      const home = await loadHome(globals.home);
+      const db = openDatabase(home.dbPath);
+      try {
+        const targets = attachTargets(db, runId).filter((t) => t.taskId === taskId);
+        if (targets.length === 0) {
+          console.error(`no attachable pane for task ${taskId} (only retained/open panes qualify)`);
+          return 1;
+        }
+        console.log(`herdr focus ${targets[targets.length - 1]!.paneId}`);
+        return 0;
+      } finally {
+        db.close();
+      }
+    }
+
     case 'reconcile':
     case 'clean':
-    case 'contract':
-    case 'log':
+      console.error(`\`${command}\` is not implemented yet (planned milestone M4/M5).`);
+      return 1;
+
     case 'results':
-    case 'attach':
-      console.error(`\`${command}\` is not implemented yet (planned milestone).`);
+      console.error('`results` is not implemented yet.');
       return 1;
 
     default:
