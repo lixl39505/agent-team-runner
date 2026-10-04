@@ -1,6 +1,7 @@
 // agent-team reconcile — restore the control plane after Runner crash or
-// Herdr server restart: snapshot ∩ ledger, recover executions, resume
-// cleanups. --dry-run is side-effect free (plugin startup hook uses it).
+// Herdr server restart: subscribe → snapshot ∩ ledger, apply persisted
+// results, resume cleanups. Runs under the runner lease, so the plugin
+// startup hook can invoke it for real without racing a live Runner.
 
 import { openDatabase } from '../store/db.ts';
 import { loadHome } from '../config.ts';
@@ -30,7 +31,10 @@ export async function cmdReconcile(opts: ReconcileCommandOptions): Promise<numbe
   const home = await loadHome(opts.home);
   const db = openDatabase(home.dbPath);
   try {
-    const client = opts.client ?? createRuntimeClient({ herdrPath: opts.herdrPath });
+    // socket preferred: the ADR recovery order (subscribe before snapshot)
+    // needs the socket transport; the hybrid client falls back to the CLI
+    // wrapper for snapshot when no socket is available
+    const client = opts.client ?? createRuntimeClient({ herdrPath: opts.herdrPath, preferSocket: true });
     const runs = opts.runId
       ? [getRunOrThrow(db, opts.runId)]
       : listRuns(db, { nonTerminalOnly: true });

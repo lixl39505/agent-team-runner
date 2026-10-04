@@ -63,8 +63,10 @@ describe.skipIf(isWin)('HerdrSocketTransport against a local NDJSON server', () 
     });
     try {
       const transport = new HerdrSocketTransport(sockPath);
-      const snap = (await transport.snapshot()) as { result: { version: string } };
-      expect(snap.result.version).toBe('0.8.0');
+      // request() already unwraps the NDJSON envelope: snapshot() IS the result body
+      const snap = (await transport.snapshot()) as { version: string; panes: unknown[] };
+      expect(snap.version).toBe('0.8.0');
+      expect(snap.panes).toHaveLength(1);
 
       const stream = await transport.subscribe();
       const iterator = stream[Symbol.asyncIterator]();

@@ -81,6 +81,30 @@ describe('validateContract', () => {
       }),
     ).toThrow(/sha256/);
   });
+
+  test('skill names must be a single safe path segment (no traversal)', () => {
+    const base = { ...minimalContract() };
+    const task = {
+      id: 'A1',
+      title: 'x',
+      allowedPaths: ['a/**'],
+    };
+    for (const name of ['../escape', 'a/b', '.hidden', '..', '/abs', 'C:\\x', 'sk ill']) {
+      expect(() =>
+        validateContract({
+          ...base,
+          tasks: [{ ...task, implementationSkills: [{ name }] }],
+        }),
+      ).toThrow(/single safe path segment/);
+    }
+    // safe names pass validation
+    expect(() =>
+      validateContract({
+        ...base,
+        tasks: [{ ...task, implementationSkills: [{ name: 'my-skill.v2' }, { name: 'TDD1' }] }],
+      }),
+    ).not.toThrow();
+  });
 });
 
 describe('topologicalTasks', () => {

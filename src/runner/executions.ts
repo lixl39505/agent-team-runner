@@ -18,7 +18,7 @@ import { resultPathFor, sha256Hex } from '../results/files.ts';
 import { resolveSkills, writeBrief } from './briefs.ts';
 import { cherryPick, revParse } from '../core/git.ts';
 import { topologicalTasks } from '../core/contract.ts';
-import type { AgentKind, ExecutionContract, ExecutionRole, TaskRecord } from '../core/types.ts';
+import type { AgentKind, ExecutionContract, ExecutionRecord, ExecutionRole, TaskRecord } from '../core/types.ts';
 
 export interface RunnerEnv {
   home: AteamHome;
@@ -131,11 +131,6 @@ export interface StartExecutionInput {
 export async function startExecution(env: RunnerEnv, input: StartExecutionInput) {
   const { task } = input;
   const worktreePath = input.targetWorktree?.path ?? (await ensureTaskWorktree(env, task)).worktreePath!;
-  const rootPaneId = input.targetWorktree?.rootPaneId ?? findRootPaneId(env, task.taskId);
-  // split panes live on the execution row only — pane resources are reserved
-  // for workspace ROOT panes (the stable split source)
-  const pane = await env.client.splitPane({ paneId: rootPaneId, direction: 'right', label: `${task.taskId}:${input.role}` });
-
   const attemptNo = input.attemptNo;
   const cycleNo = input.cycleNo;
   const executionId = newExecutionId(env.runId, task.taskId, input.role, attemptNo, cycleNo);
@@ -161,37 +156,9 @@ export async function startExecution(env: RunnerEnv, input: StartExecutionInput)
     skills,
   });
 
-  await env.client.startAgent({
-    name,
-    kind: input.entry.kind,
-    paneId: pane.paneId,
-    args: agentStartArgs(input.entry),
-  });
-
-  const record = insertExecution(env.db, {
-    id: executionId,
-    runId: env.runId,
-    taskId: task.taskId,
-    role: input.role,
-    attemptNo,
-    cycleNo,
-    agentName: name,
-    agentKind: input.entry.kind,
-    model: input.entry.model ?? null,
-    status: 'running',
-    promptSentAt: null,
-    promptDigest: null,
-    resultPath,
-    nativeSessionRef: null,
-    paneId: pane.paneId,
-    tabId: pane.tabId,
-    workspaceId: pane.workspaceId,
-    paneState: 'open',
-    lastAgentState: null,
-    startedAt: nowIso(),
-    finishedAt: null,
-  });
-
+  // Dispatch protocol (review 01 #12): the execution row — including the
+  // prompt digest — is persisted BEFORE any Herdr call, so a crash leaves a
+  // resumable `starting` record instead of an invisible half-dispatch.
   const prompt = buildRolePrompt({
     role: input.role,
     runId: env.runId,
@@ -204,16 +171,72 @@ export async function startExecution(env: RunnerEnv, input: StartExecutionInput)
   if (prompt.length > MAX_PROMPT_CHARS) {
     throw new Error(`prompt for ${executionId} exceeds ${MAX_PROMPT_CHARS} chars — brief overflow`);
   }
-  await env.client.promptAgent({ target: name, text: prompt, wait: false, until: [], timeoutMs: 5000 });
+  insertExecution(env.db, {
+    id: executionId,
+    runId: env.runId,
+    taskId: task.taskId,
+    role: input.role,
+    attemptNo,
+    cycleNo,
+    agentName: name,
+    agentKind: input.entry.kind,
+    model: input.entry.model ?? null,
+    status: 'starting',
+    promptSentAt: null,
+    promptDigest: sha256Hex(prompt),
+    resultPath,
+    nativeSessionRef: null,
+    paneId: null,
+    tabId: null,
+    workspaceId: null,
+    paneState: 'open',
+    lastAgentState: null,
+    startedAt: nowIso(),
+    finishedAt: null,
+  });
 
-  const patch: ExecutionPatch = { promptSentAt: nowIso(), promptDigest: sha256Hex(prompt) };
-  updateExecution(env.db, executionId, patch);
+  const rootPaneId = input.targetWorktree?.rootPaneId ?? findRootPaneId(env, task.taskId);
+  // split panes live on the execution row only — pane resources are reserved
+  // for workspace ROOT panes (the stable split source)
+  const pane = await env.client.splitPane({ paneId: rootPaneId, direction: 'right', label: `${task.taskId}:${input.role}` });
+  updateExecution(env.db, executionId, { paneId: pane.paneId, tabId: pane.tabId, workspaceId: pane.workspaceId });
+
+  await env.client.startAgent({
+    name,
+    kind: input.entry.kind,
+    paneId: pane.paneId,
+    args: agentStartArgs(input.entry),
+  });
+
+  await env.client.promptAgent({ target: name, text: prompt, wait: false, until: [], timeoutMs: 5000 });
+  updateExecution(env.db, executionId, { promptSentAt: nowIso(), status: 'running' });
   addEvent(env.db, env.runId, 'EXECUTION_PROMPTED', {
     taskId: task.taskId,
     executionId,
     payload: { role: input.role, attemptNo, cycleNo, agentName: name, agentKind: input.entry.kind },
   });
   return getExecutionRow(env, executionId);
+}
+
+/** Rebuild the deterministic role prompt for an execution whose dispatch was
+ * interrupted (status 'starting'). Returns null when the inputs no longer
+ * reproduce the persisted prompt digest — that needs a human, not a guess. */
+export function rebuildRolePrompt(
+  env: RunnerEnv,
+  exec: ExecutionRecord,
+  worktreePath: string,
+): string | null {
+  const prompt = buildRolePrompt({
+    role: exec.role,
+    runId: env.runId,
+    taskId: exec.taskId,
+    attemptNo: exec.attemptNo,
+    cycleNo: exec.cycleNo,
+    worktreePath,
+    resultPath: exec.resultPath ?? '',
+  });
+  if (exec.promptDigest && sha256Hex(prompt) !== exec.promptDigest) return null;
+  return prompt;
 }
 
 function getExecutionRow(env: RunnerEnv, executionId: string) {

@@ -150,6 +150,22 @@ const MIGRATIONS: string[] = [
   CREATE INDEX idx_res_run ON herdr_resources(run_id, kind, state);
   CREATE INDEX idx_events_run ON events(run_id, id);
   `,
+  // v2 — review 01 #1/#3: result receipt and application become separate
+  // persisted phases; the Runner integration/final-verification state
+  // machine moves from process memory into the runs row so a fresh Runner
+  // (or `reconcile`) can resume it.
+  `
+  ALTER TABLE executions ADD COLUMN result_applied_digest TEXT;
+  ALTER TABLE runs ADD COLUMN integration_workspace_id TEXT;
+  ALTER TABLE runs ADD COLUMN integration_path TEXT;
+  ALTER TABLE runs ADD COLUMN integration_branch TEXT;
+  ALTER TABLE runs ADD COLUMN integration_root_pane_id TEXT;
+  ALTER TABLE runs ADD COLUMN integration_base_sha TEXT;
+  ALTER TABLE runs ADD COLUMN conflict_task_id TEXT;
+  ALTER TABLE runs ADD COLUMN integration_stalled INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE runs ADD COLUMN final_verified INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE runs ADD COLUMN final_verified_at TEXT;
+  `,
 ];
 
 export function openDatabase(path: string): SqliteDb {

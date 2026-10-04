@@ -33,6 +33,38 @@ export interface AteamConfig {
   verificationAllowlist: string[];
 }
 
+/**
+ * Trust boundary for verification commands (review 01 #9):
+ *
+ * A contract's `verificationCommands` are planner-authored, TRUSTED
+ * executable input — anyone who can submit a contract can run code as the
+ * Runner user, and no argv allowlist can change that (interpreters escape
+ * any prefix policy). The allowlist is therefore defense in depth only:
+ * the defaults admit conventional test invocations and nothing else, so an
+ * accidental or sloppy contract cannot run arbitrary tooling. Granting
+ * wider execution (builds, codegen, custom scripts) is a deliberate,
+ * reviewed config.json change: override `verificationAllowlist` there.
+ */
+const DEFAULT_VERIFICATION_ALLOWLIST = [
+  // JS/TS test runners (prefix entries admit trailing args by design)
+  'bun test',
+  'npm test',
+  'npm run test',
+  'pnpm test',
+  'pnpm run test',
+  // Rust / Go
+  'cargo test',
+  'go test',
+  // Python
+  'pytest',
+  'python -m pytest',
+  // repo-owned task runners, test/check targets only
+  'make test',
+  'make check',
+  'just test',
+  'just check',
+];
+
 export const DEFAULT_CONFIG: AteamConfig = {
   agents: {
     claude: { kind: 'claude' },
@@ -46,7 +78,7 @@ export const DEFAULT_CONFIG: AteamConfig = {
     maxWorkerAttempts: 3,
     maxReviewCycles: 3,
   },
-  verificationAllowlist: ['bun', 'npm *', 'npx *', 'pnpm *', 'cargo *', 'go *', 'pytest *', 'python -m pytest *', 'make *', 'just *'],
+  verificationAllowlist: DEFAULT_VERIFICATION_ALLOWLIST,
 };
 
 export interface AteamHome {
@@ -96,6 +128,8 @@ export async function loadConfig(configPath: string): Promise<AteamConfig> {
   if (raw.verificationAllowlist !== undefined) {
     const list = raw.verificationAllowlist;
     if (Array.isArray(list) && list.every((v) => typeof v === 'string')) {
+      // widening this list grants contracts executable scope beyond tests —
+      // treat the edit like granting code execution (it is)
       config.verificationAllowlist = list as string[];
     }
   }

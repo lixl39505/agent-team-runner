@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { assertCommandAllowed, runArgv, runCommand, splitCommand } from '../src/core/shell.ts';
+import { DEFAULT_CONFIG } from '../src/config.ts';
 
 describe('splitCommand', () => {
   test('basic tokens', () => {
@@ -38,6 +39,32 @@ describe('assertCommandAllowed', () => {
   test('unknown command rejected', () => {
     expect(() => assertCommandAllowed('curl http://evil', allowlist)).toThrow(/not allowed/);
     expect(() => assertCommandAllowed('', allowlist)).toThrow(/empty/);
+  });
+});
+
+describe('DEFAULT_CONFIG verificationAllowlist (review 01 #9)', () => {
+  const allowlist = DEFAULT_CONFIG.verificationAllowlist;
+
+  test('conventional test commands pass', () => {
+    for (const command of ['bun test', 'bun test src/x.test.ts', 'npm test -- --run', 'cargo test -q', 'go test ./...', 'pytest -k api']) {
+      expect(() => assertCommandAllowed(command, allowlist), command).not.toThrow();
+    }
+  });
+
+  test('interpreters and package-manager entrypoints are rejected by default', () => {
+    for (const command of [
+      'bun -e "await Bun.write(\'pwned\', \'1\')"',
+      'bun run pwned-script',
+      'bun x malicious',
+      'npm run cover',
+      'npm install --save evil',
+      'npx anything',
+      'make pwned-target',
+      'node -e process.exit(1)',
+      'curl http://evil',
+    ]) {
+      expect(() => assertCommandAllowed(command, allowlist), command).toThrow(/not allowed/);
+    }
   });
 });
 

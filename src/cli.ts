@@ -59,7 +59,7 @@ function usage(): string {
     'agent-team — Herdr-native delivery control plane',
     '',
     'Usage:',
-    '  agent-team run --contract PATH [--run-id ID] [--max-parallel N] [--json]',
+    '  agent-team run (--contract PATH | --run-id ID | --claim) [--max-parallel N] [--json]',
     '  agent-team submit --contract PATH [--json]',
     '  agent-team runner (--run-id ID | --claim) [--self-pane PANE_ID]',
     '  agent-team doctor --runtime herdr [--json]',

@@ -118,6 +118,21 @@ export interface RunRecord {
   status: RunStatus;
   revisionPending: boolean;
   error: string | null;
+  // Runner state machine, persisted so a fresh Runner process (or
+  // `reconcile`) resumes integration/final verification instead of hanging
+  // or rebuilding resources from scratch (review 01 #3).
+  integrationWorkspaceId: string | null;
+  integrationPath: string | null;
+  integrationBranch: string | null;
+  integrationRootPaneId: string | null;
+  integrationBaseSha: string | null;
+  /** Task currently blocked on an unresolved cherry-pick conflict. */
+  conflictTaskId: string | null;
+  /** Integrator gave up: needs human/reconcile intervention. */
+  integrationStalled: boolean;
+  /** Final mechanical verification passed; remaining work is reclamation. */
+  finalVerified: boolean;
+  finalVerifiedAt: string | null;
   createdAt: string;
   updatedAt: string;
   finishedAt: string | null;
@@ -160,6 +175,10 @@ export interface ExecutionRecord {
   promptDigest: string | null;
   resultPath: string | null;
   resultDigest: string | null;
+  /** Digest of the result that has been APPLIED to the task state machine.
+   * Distinct from resultDigest: a crash between receipt and application
+   * replays from here instead of dropping the result (review 01 #1). */
+  resultAppliedDigest: string | null;
   result: unknown | null;
   resultReceivedAt: string | null;
   nativeSessionRef: string | null;

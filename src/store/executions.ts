@@ -21,6 +21,7 @@ interface ExecutionRow {
   prompt_digest: string | null;
   result_path: string | null;
   result_digest: string | null;
+  result_applied_digest: string | null;
   result_json: string | null;
   result_received_at: string | null;
   native_session_ref: string | null;
@@ -50,6 +51,7 @@ function toRecord(row: ExecutionRow): ExecutionRecord {
     promptDigest: row.prompt_digest,
     resultPath: row.result_path,
     resultDigest: row.result_digest,
+    resultAppliedDigest: row.result_applied_digest,
     result: row.result_json ? JSON.parse(row.result_json) : null,
     resultReceivedAt: row.result_received_at,
     nativeSessionRef: row.native_session_ref,
@@ -64,8 +66,8 @@ function toRecord(row: ExecutionRow): ExecutionRecord {
   };
 }
 
-export type NewExecution = Omit<ExecutionRecord, 'updatedAt' | 'resultDigest' | 'result' | 'resultReceivedAt'> &
-  Partial<Pick<ExecutionRecord, 'resultDigest' | 'result' | 'resultReceivedAt'>>;
+export type NewExecution = Omit<ExecutionRecord, 'updatedAt' | 'resultDigest' | 'resultAppliedDigest' | 'result' | 'resultReceivedAt'> &
+  Partial<Pick<ExecutionRecord, 'resultDigest' | 'resultAppliedDigest' | 'result' | 'resultReceivedAt'>>;
 
 export function insertExecution(db: SqliteDb, record: NewExecution): ExecutionRecord {
   const updatedAt = nowIso();
@@ -81,6 +83,7 @@ export function insertExecution(db: SqliteDb, record: NewExecution): ExecutionRe
   return {
     ...record,
     resultDigest: record.resultDigest ?? null,
+    resultAppliedDigest: record.resultAppliedDigest ?? null,
     result: record.result ?? null,
     resultReceivedAt: record.resultReceivedAt ?? null,
     updatedAt,
@@ -122,6 +125,7 @@ export interface ExecutionPatch {
   promptDigest?: string | null;
   resultPath?: string | null;
   resultDigest?: string | null;
+  resultAppliedDigest?: string | null;
   result?: unknown | null;
   resultReceivedAt?: string | null;
   nativeSessionRef?: string | null;
@@ -144,6 +148,7 @@ export function updateExecution(db: SqliteDb, executionId: string, patch: Execut
   if (patch.promptDigest !== undefined) push('prompt_digest', patch.promptDigest);
   if (patch.resultPath !== undefined) push('result_path', patch.resultPath);
   if (patch.resultDigest !== undefined) push('result_digest', patch.resultDigest);
+  if (patch.resultAppliedDigest !== undefined) push('result_applied_digest', patch.resultAppliedDigest);
   if (patch.result !== undefined) push('result_json', patch.result === null ? null : JSON.stringify(patch.result));
   if (patch.resultReceivedAt !== undefined) push('result_received_at', patch.resultReceivedAt);
   if (patch.nativeSessionRef !== undefined) push('native_session_ref', patch.nativeSessionRef);

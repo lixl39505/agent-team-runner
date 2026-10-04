@@ -10,6 +10,7 @@ import { HerdrCliRuntimeClient } from '../herdr/runtime-client.ts';
 import type { HerdrRuntimeClient } from '../herdr/client.ts';
 import { validateContract, topologicalTasks } from '../core/contract.ts';
 import { revParse } from '../core/git.ts';
+import { MINIMUM_HERDR_VERSION } from '../herdr/versions.ts';
 import { AteamError, DoctorError } from '../core/errors.ts';
 import type { ExecutionContract, RunRecord } from '../core/types.ts';
 import type { RunnerEnv } from '../runner/executions.ts';
@@ -34,6 +35,14 @@ export async function probeOrFailFast(client: HerdrRuntimeClient): Promise<void>
       'start Herdr or run `agent-team doctor --runtime herdr` for details',
     );
   }
+  if (!probe.protocolOk) {
+    // unparseable version or missing/unreadable api schema — both mean the
+    // runtime is below the minimum protocol the runner depends on
+    throw new DoctorError(
+      `herdr ${probe.version} does not satisfy the minimum protocol (>= ${MINIMUM_HERDR_VERSION} with a readable api schema)`,
+      'upgrade Herdr to a version providing the required CLI/socket API surface',
+    );
+  }
   const missing = Object.entries(probe.capabilities).filter(([, ok]) => !ok).map(([k]) => k);
   if (missing.length > 0) {
     throw new DoctorError(
@@ -45,6 +54,27 @@ export async function probeOrFailFast(client: HerdrRuntimeClient): Promise<void>
 
 export function createClient(herdrPath?: string): HerdrRuntimeClient {
   return new HerdrCliRuntimeClient(herdrPath ? { herdrPath } : {});
+}
+
+/** The Runner pane's own pane id: explicit flag > plugin action context
+ * (HERDR_PLUGIN_CONTEXT_JSON, injected per herdr-plugin.toml) > Herdr pane env. */
+export function resolveSelfPaneId(flag?: string): string | undefined {
+  if (flag) return flag;
+  const fromEnv = process.env.HERDR_PANE_ID;
+  const raw = process.env.HERDR_PLUGIN_CONTEXT_JSON;
+  if (!raw) return fromEnv;
+  try {
+    const ctx = JSON.parse(raw) as Record<string, unknown>;
+    const paneOf = (o: Record<string, unknown>): string | undefined =>
+      typeof o.pane_id === 'string' && o.pane_id !== '' ? o.pane_id
+        : typeof o.paneId === 'string' && o.paneId !== '' ? o.paneId : undefined;
+    const nested = typeof ctx.workspace === 'object' && ctx.workspace !== null
+      ? paneOf(ctx.workspace as Record<string, unknown>)
+      : undefined;
+    return paneOf(ctx) ?? nested ?? fromEnv;
+  } catch {
+    return fromEnv;
+  }
 }
 
 /** Persist a run + seed tasks from a validated contract. */

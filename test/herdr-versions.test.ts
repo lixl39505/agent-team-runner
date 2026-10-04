@@ -17,6 +17,9 @@ describe('version comparison', () => {
   test('isVersionAtLeast', () => {
     expect(isVersionAtLeast('0.7.0', '0.7.0')).toBe(true);
     expect(isVersionAtLeast('0.6.9', '0.7.0')).toBe(false);
+    // unparseable versions must fail the floor, never compare equal to it
+    expect(isVersionAtLeast('dev-local', '0.7.0')).toBe(false);
+    expect(isVersionAtLeast('', '0.7.0')).toBe(false);
   });
 });
 

@@ -146,10 +146,13 @@ export async function worktreeBranches(repoRoot: string): Promise<Set<string>> {
   return branches;
 }
 
-/** Delete a branch only after confirming no worktree holds it. */
+/** Delete a branch only after confirming no worktree holds it. A branch
+ * that no longer exists satisfies the postcondition — retries after a
+ * crash mid-cleanup succeed instead of failing forever (review 01 #11). */
 export async function deleteBranchIfFree(repoRoot: string, branch: string): Promise<boolean> {
   const held = await worktreeBranches(repoRoot);
   if (held.has(branch)) return false;
+  if (!(await branchExists(repoRoot, branch))) return true;
   const res = await git(repoRoot, ['branch', '-D', branch]);
   return res.ok;
 }

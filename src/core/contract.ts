@@ -9,6 +9,11 @@ import { ownershipConflict } from './path-policy.ts';
 
 export const TASK_ID_PATTERN = /^[A-Z][A-Z0-9_-]{1,31}$/;
 
+/** Skill refs join into <skillDir>/<name>/SKILL.md — one safe path segment
+ * only (no separators, no leading dot) so a crafted name cannot leave the
+ * repo's skill roots (src/runner/briefs.ts re-checks at resolution time). */
+export const SKILL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
 type Raw = Record<string, unknown>;
 
 function asRaw(value: unknown, what: string, issues: string[]): Raw {
@@ -63,6 +68,10 @@ function validateSkillRef(value: unknown, what: string, issues: string[]): Skill
   const raw = asRaw(value, what, issues);
   const name = str(raw.name, `${what}.name`, issues);
   if (name === undefined) return undefined;
+  if (!SKILL_NAME_PATTERN.test(name)) {
+    issues.push(`${what}.name "${name}" must match ${SKILL_NAME_PATTERN.source} (single safe path segment)`);
+    return undefined;
+  }
   const ref: SkillRef = { name };
   if (raw.role !== undefined) {
     if (raw.role !== 'worker' && raw.role !== 'reviewer' && raw.role !== 'integrator') {

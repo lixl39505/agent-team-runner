@@ -1,5 +1,6 @@
 // runs + contract_revisions repositories.
 
+import type { SQLQueryBindings } from 'bun:sqlite';
 import type { SqliteDb } from './db.ts';
 import { inTransaction } from './db.ts';
 import { nowIso } from './ids.ts';
@@ -15,6 +16,15 @@ interface RunRow {
   status: string;
   revision_pending: number;
   error: string | null;
+  integration_workspace_id: string | null;
+  integration_path: string | null;
+  integration_branch: string | null;
+  integration_root_pane_id: string | null;
+  integration_base_sha: string | null;
+  conflict_task_id: string | null;
+  integration_stalled: number;
+  final_verified: number;
+  final_verified_at: string | null;
   created_at: string;
   updated_at: string;
   finished_at: string | null;
@@ -31,6 +41,15 @@ function toRecord(row: RunRow): RunRecord {
     status: row.status as RunStatus,
     revisionPending: row.revision_pending === 1,
     error: row.error,
+    integrationWorkspaceId: row.integration_workspace_id,
+    integrationPath: row.integration_path,
+    integrationBranch: row.integration_branch,
+    integrationRootPaneId: row.integration_root_pane_id,
+    integrationBaseSha: row.integration_base_sha,
+    conflictTaskId: row.conflict_task_id,
+    integrationStalled: row.integration_stalled === 1,
+    finalVerified: row.final_verified === 1,
+    finalVerifiedAt: row.final_verified_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     finishedAt: row.finished_at,
@@ -118,4 +137,40 @@ export function appendContractRevision(db: SqliteDb, runId: string, contract: Ex
 
 export function clearRevisionPending(db: SqliteDb, runId: string): void {
   db.run('UPDATE runs SET revision_pending = 0, updated_at = ? WHERE id = ?', [nowIso(), runId]);
+}
+
+/** Persisted Runner state-machine fields (review 01 #3): integration
+ * resources, conflict phase and final-verification conclusion survive a
+ * Runner restart and are the only source `reconcile` trusts. */
+export interface RunRuntimeStatePatch {
+  integrationWorkspaceId?: string | null;
+  integrationPath?: string | null;
+  integrationBranch?: string | null;
+  integrationRootPaneId?: string | null;
+  integrationBaseSha?: string | null;
+  conflictTaskId?: string | null;
+  integrationStalled?: boolean;
+  finalVerified?: boolean;
+  finalVerifiedAt?: string | null;
+}
+
+export function updateRunRuntimeState(db: SqliteDb, runId: string, patch: RunRuntimeStatePatch): void {
+  const sets: string[] = [];
+  const values: SQLQueryBindings[] = [];
+  const push = (col: string, value: SQLQueryBindings): void => {
+    sets.push(`${col} = ?`);
+    values.push(value);
+  };
+  if (patch.integrationWorkspaceId !== undefined) push('integration_workspace_id', patch.integrationWorkspaceId);
+  if (patch.integrationPath !== undefined) push('integration_path', patch.integrationPath);
+  if (patch.integrationBranch !== undefined) push('integration_branch', patch.integrationBranch);
+  if (patch.integrationRootPaneId !== undefined) push('integration_root_pane_id', patch.integrationRootPaneId);
+  if (patch.integrationBaseSha !== undefined) push('integration_base_sha', patch.integrationBaseSha);
+  if (patch.conflictTaskId !== undefined) push('conflict_task_id', patch.conflictTaskId);
+  if (patch.integrationStalled !== undefined) push('integration_stalled', patch.integrationStalled ? 1 : 0);
+  if (patch.finalVerified !== undefined) push('final_verified', patch.finalVerified ? 1 : 0);
+  if (patch.finalVerifiedAt !== undefined) push('final_verified_at', patch.finalVerifiedAt);
+  push('updated_at', nowIso());
+  values.push(runId);
+  db.run(`UPDATE runs SET ${sets.join(', ')} WHERE id = ?`, values);
 }

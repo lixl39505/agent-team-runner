@@ -17,9 +17,9 @@ herdr plugin list
 herdr plugin action list --plugin ateam
 ```
 
-插件 command 以 `bun run src/cli.ts ...` 相对插件根目录执行——`plugin link` 指向本仓库
-的 `plugin/` 目录时，`src/cli.ts` 解析为仓库源码。发布安装（GitHub）前请先构建或改为指向
-编译产物。
+插件 command 相对插件根目录（`<repo>/plugin/`）执行，源码入口写作 `../src/cli.ts`——
+`plugin link` 指向本仓库的 `plugin/` 目录时即解析为仓库源码。发布安装（GitHub）前请先
+构建或改为指向编译产物；入口必须真实存在于发布包内。
 
 ## 入口
 
@@ -27,7 +27,7 @@ herdr plugin action list --plugin ateam
 |---|---|
 | action `run-team-swarm` | 在当前 workspace 启动/认领 Runner（`agent-team run --claim`）。本 pane 即 Runner pane，Runner 会向它自报 working/blocked/done/idle |
 | action `reconcile-team-runs` | 对全部未终结 run 执行恢复协调（先订阅后快照、补做落盘结果、只为无法恢复的执行新建 attempt） |
-| startup hook | `reconcile --dry-run`：只探测与汇报，不产生副作用 |
+| startup hook | `reconcile`：server 重启/插件启动后对未终结 run 执行恢复协调；持有 runner lease 才动作，活 Runner 在位时自动跳过 |
 
 ## 契约
 

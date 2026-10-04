@@ -159,6 +159,19 @@ export class FakeHerdrClient implements HerdrRuntimeClient {
     await this.applyAction(agentName, action);
   }
 
+  /** Test hook: simulate "agent started but the prompt never landed" —
+   * wipes delivered prompts and resets the state walk to idle. */
+  resetToIdle(agentName: string): void {
+    const agent = this.agents.get(agentName);
+    if (!agent) return;
+    agent.prompts.length = 0;
+    for (let i = this.promptLog.length - 1; i >= 0; i--) {
+      if (this.promptLog[i]!.agent === agentName) this.promptLog.splice(i, 1);
+    }
+    agent.state = 'idle';
+    agent.pausedAt = null;
+  }
+
   // ------------------------------------------------------------- internals
 
   private record(method: string, args: unknown): void {

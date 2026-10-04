@@ -45,6 +45,16 @@ bun src/cli.ts clean <runId>
   审计落库；每步可重试，仅作用于 ATeam provenance 资源。
 - **退出码**：0=done、10=needs-attention、11=contract-blocked、1=failed、130=interrupted。
 
+## 信任边界
+
+- **契约是受信可执行输入**：能提交 contract 的人即能以 Runner 用户身份执行代码。默认
+  `verificationAllowlist` 只放行常规测试命令（`bun test`、`npm test`、`cargo test`、
+  `pytest` 等）作为纵深防御；放宽（构建/代码生成/自定义脚本）属于 config.json 的显式、
+  需审查的变更。
+- **技能名称是单段安全路径**：`implementationSkills[].name` 仅允许
+  `/^[A-Za-z0-9][A-Za-z0-9._-]*$/`，解析时再次校验并确认真实路径位于仓库技能根内，
+  契约无法令 Runner 读取仓库外的 `SKILL.md`。
+
 ## 代码地图
 
 | 目录 | 职责 |

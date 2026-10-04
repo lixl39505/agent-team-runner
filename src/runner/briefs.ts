@@ -3,9 +3,10 @@
 // points at it (Windows argv limits the inline prompt).
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { sha256Hex } from '../results/files.ts';
 import { buildBriefMarkdown, resultSchemaExample } from '../results/prompts.ts';
+import { SKILL_NAME_PATTERN } from '../core/contract.ts';
 import type { ExecutionContract, SkillRef, TaskSpec } from '../core/types.ts';
 import type { ExecutionRole } from '../core/types.ts';
 
@@ -18,14 +19,29 @@ export interface ResolvedSkill {
 
 const SKILL_DIRS = ['.agents/skills', 'skills', '.claude/skills'];
 
+/** Candidate path for a skill inside one skill root, or null when the name
+ * is not a single safe segment or would resolve outside that root. Names
+ * are already constrained by contract validation; this is defense in depth
+ * against specs restored from storage or other lower-trust sources. */
+export function skillCandidatePath(skillRoot: string, name: string): string | null {
+  if (!SKILL_NAME_PATTERN.test(name)) return null;
+  const root = resolve(skillRoot);
+  const candidate = resolve(root, name, 'SKILL.md');
+  return candidate.startsWith(root + sep) ? candidate : null;
+}
+
 /** Resolve skill content from the repo; throws for required skills that are missing. */
 export async function resolveSkills(repoRoot: string, refs: SkillRef[] | undefined): Promise<ResolvedSkill[]> {
   if (!refs || refs.length === 0) return [];
   const out: ResolvedSkill[] = [];
   for (const ref of refs) {
+    if (!SKILL_NAME_PATTERN.test(ref.name)) {
+      throw new Error(`skill name "${ref.name}" is not a single safe path segment; refusing to resolve`);
+    }
     let content: string | null = null;
     for (const dir of SKILL_DIRS) {
-      const candidate = join(repoRoot, dir, ref.name, 'SKILL.md');
+      const candidate = skillCandidatePath(join(repoRoot, dir), ref.name);
+      if (!candidate) continue;
       try {
         content = await readFile(candidate, 'utf8');
         break;

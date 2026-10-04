@@ -12,18 +12,21 @@ min_herdr_version = "0.7.0"
 
 # action 即固定 CLI 入口；上下文经 HERDR_PLUGIN_CONTEXT_JSON 注入，
 # `agent-team run` 会解析它获取自身 pane id（Runner 状态自报用）。
+# command 相对插件根（<repo>/plugin/）执行：源码入口在 ../src/cli.ts。
 [[actions]]
 id = "run-team-swarm"
 title = "Run team swarm"
 contexts = ["workspace"]
-command = ["bun", "run", "src/cli.ts", "run", "--claim"]
+command = ["bun", "../src/cli.ts", "run", "--claim"]
 
 [[actions]]
 id = "reconcile-team-runs"
 title = "Reconcile team runs"
 contexts = ["workspace"]
-command = ["bun", "run", "src/cli.ts", "reconcile"]
+command = ["bun", "../src/cli.ts", "reconcile"]
 
-# startup hook：server 重启/插件启动后无副作用检查未终结 run 并汇报
+# startup hook：server 重启/插件启动后对未终结 run 执行真正的恢复协调
+# （订阅→快照→补做落盘结果→只为不可恢复执行新建 attempt）。runner lease
+# 保证与活 Runner 互斥；活 Runner 在位时本 hook 自动跳过（live_lease）。
 [[startup]]
-command = ["bun", "run", "src/cli.ts", "reconcile", "--dry-run"]
+command = ["bun", "../src/cli.ts", "reconcile"]

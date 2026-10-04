@@ -21,6 +21,11 @@ export function compareVersions(a: string, b: string): number {
 }
 
 export function isVersionAtLeast(actual: string, minimum: string): boolean {
+  // an unparseable actual version must FAIL the floor, never compare equal
+  // to it (review 01 #10) — fail-fast beats guessing
+  const va = parseVersion(actual);
+  const vb = parseVersion(minimum);
+  if (!va || !vb) return false;
   return compareVersions(actual, minimum) >= 0;
 }
 
