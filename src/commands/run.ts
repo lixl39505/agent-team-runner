@@ -7,7 +7,7 @@ import { loadHome } from '../config.ts';
 import { RunnerEngine } from '../runner/engine.ts';
 import { AteamError } from '../core/errors.ts';
 import {
-  buildRunnerEnv, createClient, createRunRecord, getRunOrThrow, loadContractFile, probeOrFailFast, resolveSelfPaneId,
+  buildRunnerEnv, createClient, createRunRecord, getRunOrThrow, loadContractFile, probeAgentsOrFailFast, probeOrFailFast, resolveSelfPaneId,
 } from './run-shared.ts';
 import { findClaimableRun } from './submit.ts';
 
@@ -53,7 +53,11 @@ export async function cmdRun(opts: RunCommandOptions): Promise<number> {
 
     if (opts.maxParallel !== undefined) home.config.defaults.maxParallel = opts.maxParallel;
 
-    const engine = new RunnerEngine(buildRunnerEnv(home, db, client, run), {
+    const env = buildRunnerEnv(home, db, client, run);
+    // R2-13: fail fast on the agent CLIs this contract needs, too
+    await probeAgentsOrFailFast(env);
+
+    const engine = new RunnerEngine(env, {
       selfPaneId: resolveSelfPaneId(opts.selfPaneId),
       selfAgentName: 'ateam-runner',
     });

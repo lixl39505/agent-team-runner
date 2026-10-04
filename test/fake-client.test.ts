@@ -93,15 +93,20 @@ describe('FakeHerdrClient', () => {
     });
   });
 
-  test('server restart wipes resources; call log records prompts', async () => {
+  test('server restart: agents/split panes die, worktree sessions restore; call log records prompts', async () => {
     const fake = new FakeHerdrClient({ fsRoot, repoRoot });
     const ws = await fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: 'ateam/t5/Y' });
     await fake.startAgent({ name: 'a1', kind: 'claude', paneId: ws.rootPane.paneId, args: [] });
     await fake.promptAgent({ target: 'a1', text: promptForResult(), wait: false, until: [], timeoutMs: 100 });
     expect(fake.promptCount('a1')).toBe(1);
     fake.restartServer();
+    // live processes are gone (agents, split panes) …
     expect(fake.agentCount()).toBe(0);
-    expect((await fake.snapshot()).panes).toHaveLength(0);
+    // … but Herdr session restore brings the worktree workspaces back with
+    // their root panes (same ids), so the runner can reconfirm its mapping
+    const snap = await fake.snapshot();
+    expect(snap.workspaces.map((w) => w.workspaceId)).toContain(ws.workspace.workspaceId);
+    expect(snap.panes.map((p) => p.paneId)).toContain(ws.rootPane.paneId);
     expect(fake.calls.filter((c) => c.method === 'promptAgent')).toHaveLength(1);
   });
 

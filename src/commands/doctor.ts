@@ -95,6 +95,8 @@ async function checkAgentCli(kind: string): Promise<DoctorCheck> {
   };
 }
 
+export { checkAgentCli };
+
 async function checkGit(): Promise<DoctorCheck> {
   const res = await runArgv(['git', '--version'], { timeoutMs: 10_000 });
   return {

@@ -6,12 +6,15 @@ import { insertTask } from '../store/tasks.ts';
 import { addEvent } from '../store/events.ts';
 import { newRunId } from '../store/ids.ts';
 import type { AteamHome } from '../config.ts';
+import { resolveAgentEntry, type AgentEntry } from '../config.ts';
 import { HerdrCliRuntimeClient } from '../herdr/runtime-client.ts';
 import type { HerdrRuntimeClient } from '../herdr/client.ts';
 import { validateContract, topologicalTasks } from '../core/contract.ts';
 import { revParse } from '../core/git.ts';
 import { MINIMUM_HERDR_VERSION } from '../herdr/versions.ts';
 import { AteamError, DoctorError } from '../core/errors.ts';
+import { checkAgentCli, type DoctorCheck } from './doctor.ts';
+import { resolveReviewerEntry } from '../runner/executions.ts';
 import type { ExecutionContract, RunRecord } from '../core/types.ts';
 import type { RunnerEnv } from '../runner/executions.ts';
 
@@ -54,6 +57,37 @@ export async function probeOrFailFast(client: HerdrRuntimeClient): Promise<void>
 
 export function createClient(herdrPath?: string): HerdrRuntimeClient {
   return new HerdrCliRuntimeClient(herdrPath ? { herdrPath } : {});
+}
+
+/**
+ * Fail-fast on the agent integrations THIS contract needs (review 02
+ * R2-13): every distinct agent kind reachable from the contract's tasks
+ * (task-level override, worker/reviewer/integrator roles, cross-kind
+ * reviewer) must have a runnable CLI before the Runner starts any agent.
+ * `doctor` alone cannot satisfy the ADR — the run entry has to check.
+ */
+export async function probeAgentsOrFailFast(
+  env: RunnerEnv,
+  checkKind: (kind: string) => Promise<DoctorCheck> = checkAgentCli,
+): Promise<void> {
+  const { config, contract } = env;
+  const kinds = new Set<string>();
+  const workerEntryFor = (specAgent: string | undefined): AgentEntry =>
+    resolveAgentEntry(config, specAgent, 'worker');
+  for (const spec of contract.tasks) {
+    const workerEntry = workerEntryFor(spec.agent);
+    kinds.add(workerEntry.kind);
+    kinds.add(resolveReviewerEntry(config, workerEntry.kind).kind);
+    kinds.add(resolveAgentEntry(config, spec.agent, 'integrator').kind);
+  }
+  const checks = await Promise.all([...kinds].sort().map((kind) => checkKind(kind)));
+  const failed = checks.filter((c) => !c.ok);
+  if (failed.length > 0) {
+    throw new DoctorError(
+      `agent integrations unavailable for this contract: ${failed.map((c) => c.detail).join('; ')}`,
+      failed.map((c) => c.remediation).filter(Boolean).join(' ') || 'install the missing agent CLIs',
+    );
+  }
 }
 
 /** The Runner pane's own pane id: explicit flag > plugin action context

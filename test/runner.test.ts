@@ -14,6 +14,7 @@ import { RunnerEngine } from '../src/runner/engine.ts';
 import { FakeHerdrClient } from '../src/herdr/fake-client.ts';
 import type { FakeAgentScript } from '../src/herdr/fake-client.ts';
 import type { HerdrRuntimeClient } from '../src/herdr/client.ts';
+import type { HerdrEvent, HerdrEventStream } from '../src/herdr/types.ts';
 import { agentName } from '../src/store/ids.ts';
 import { DEFAULT_CONFIG, type AteamConfig } from '../src/config.ts';
 import type { ExecutionContract } from '../src/core/types.ts';
@@ -134,6 +135,46 @@ function stubClient(partial: Partial<HerdrRuntimeClient>): HerdrRuntimeClient {
     subscribe: fail,
     ...partial,
   } as unknown as HerdrRuntimeClient;
+}
+
+/** A confirmed, event-less subscription stream (what a healthy subscribe returns). */
+function emptyStream(): HerdrEventStream {
+  return {
+    async *[Symbol.asyncIterator](): AsyncIterator<HerdrEvent> {
+      // never yields
+    },
+    close(): void {},
+    drainPending(): HerdrEvent[] {
+      return [];
+    },
+  };
+}
+
+/** Simulate a process crash at one engine method: the patched engine throws
+ * on EVERY invocation (a dead process never recovers); recovery is observed
+ * through a FRESH engine. Ticks that hit the crash are absorbed. */
+function crashOnce(engine: object, method: string): void {
+  (engine as Record<string, unknown>)[method] = () =>
+    Promise.reject(new Error(`simulated crash in ${method}`));
+}
+
+/** tickUntil that tolerates the simulated crash throws from a dead engine. */
+async function tickUntilCrashed(
+  engine: RunnerEngine,
+  fx: Fixture,
+  pred: () => boolean,
+  maxTicks = 200,
+): Promise<void> {
+  for (let i = 0; i < maxTicks; i++) {
+    try {
+      await engine.tickOnce();
+    } catch (err) {
+      if (!/simulated crash/.test(String(err))) throw err;
+    }
+    if (pred()) return;
+    await Bun.sleep(5);
+  }
+  throw new Error('tickUntilCrashed exhausted');
 }
 
 async function tickUntil(engine: RunnerEngine, fx: Fixture, pred: () => boolean, maxTicks = 600): Promise<void> {
@@ -439,10 +480,11 @@ describe('RunnerEngine — full delivery chain', () => {
     expect((api.review as { status: string }).status).toBe('approved');
   }, 30_000);
 
-  test('clean reclaims integrated-but-unfinished resources and abandons the run', async () => {
+  test('clean reclaims verified resources and abandons the run', async () => {
     const fx = track(await makeFixture({}));
     seedRun(fx);
-    // simulate: API reached "integrated" then the runner died before cleanup
+    // simulate: API reached "integrated", final verification persisted, then
+    // the runner died before cleanup
     const ws = await fx.fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: `ateam/${RUN}/task/API` });
     fx.db.run(
       `UPDATE tasks SET status='integrated', branch=?, worktree_path=?, workspace_id=?,
@@ -451,7 +493,9 @@ describe('RunnerEngine — full delivery chain', () => {
     );
     const { insertResource } = await import('../src/store/resources.ts');
     insertResource(fx.db, { runId: RUN, taskId: 'API', kind: 'workspace', herdrId: ws.workspace.workspaceId, branch: ws.worktree.branch, path: ws.worktree.path });
-    fx.db.run("UPDATE runs SET status='needs_attention' WHERE id = ?", [RUN]);
+    const { insertVerification } = await import('../src/store/verifications.ts');
+    insertVerification(fx.db, { runId: RUN, kind: 'final', ok: true, detail: { headSha: 'i1' } });
+    fx.db.run("UPDATE runs SET status='needs_attention', final_verified=1 WHERE id = ?", [RUN]);
 
     const { cmdClean } = await import('../src/commands/clean.ts');
     const exit = await cmdClean({ runId: RUN, home: fx.home, json: false, client: fx.fake });
@@ -463,6 +507,57 @@ describe('RunnerEngine — full delivery chain', () => {
     expect((await fx.fake.snapshot()).workspaces.filter((w) => w.workspaceId !== 'w0')).toHaveLength(0);
     // idempotent second run
     expect(await cmdClean({ runId: RUN, home: fx.home, json: false, client: fx.fake })).toBe(0);
+  }, 30_000);
+
+  test('clean without a persisted final verification does NOT reclaim (R2-03); --discard-work does, as an audited discard', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    const ws = await fx.fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: `ateam/${RUN}/task/API` });
+    fx.db.run(
+      `UPDATE tasks SET status='integrated', branch=?, worktree_path=?, workspace_id=?,
+       start_sha='s0', commit_sha='c1', integration_commit='i1' WHERE run_id=? AND task_id='API'`,
+      [`ateam/${RUN}/task/API`, ws.worktree.path, ws.workspace.workspaceId, RUN],
+    );
+    const { insertResource } = await import('../src/store/resources.ts');
+    insertResource(fx.db, { runId: RUN, taskId: 'API', kind: 'workspace', herdrId: ws.workspace.workspaceId, branch: ws.worktree.branch, path: ws.worktree.path });
+    // NOTE: no verification record — the run is unverified
+
+    const { cmdClean } = await import('../src/commands/clean.ts');
+    // default: resources untouched, exit 1 reports the deferral
+    expect(await cmdClean({ runId: RUN, home: fx.home, json: true, client: fx.fake })).toBe(1);
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('integrated');
+    expect((await fx.fake.snapshot()).workspaces.some((w) => w.workspaceId === ws.workspace.workspaceId)).toBe(true);
+    const { branchExists } = await import('../src/core/git.ts');
+    expect(await branchExists(fx.repoRoot, `ateam/${RUN}/task/API`)).toBe(true);
+
+    // explicit override: destroy unverified resources as an audited DISCARD
+    expect(await cmdClean({ runId: RUN, home: fx.home, json: true, client: fx.fake, discardWork: true })).toBe(0);
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('discarded'); // never 'reclaimed'
+    expect(await branchExists(fx.repoRoot, `ateam/${RUN}/task/API`)).toBe(false);
+    expect((await fx.fake.snapshot()).workspaces.filter((w) => w.workspaceId !== 'w0')).toHaveLength(0);
+  }, 30_000);
+
+  test('cleanup deletes only branches minted by THIS run (R2-04 provenance)', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    // a branch whose name does NOT carry this run's provenance prefix must
+    // never be a delete candidate, even if a corrupted ledger points at it
+    const { insertVerification } = await import('../src/store/verifications.ts');
+    insertVerification(fx.db, { runId: RUN, kind: 'final', ok: true, detail: {} });
+    fx.db.run("UPDATE runs SET final_verified=1 WHERE id=?", [RUN]);
+    await fx.fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: 'users/someone/feature' });
+    fx.db.run(
+      `UPDATE tasks SET status='integrated', branch='users/someone/feature', worktree_path='/no/where',
+       start_sha='s0', commit_sha='c1', integration_commit='i1' WHERE run_id=? AND task_id='API'`,
+      [RUN],
+    );
+
+    const { cleanupTaskResources } = await import('../src/runner/cleanup.ts');
+    const outcome = await cleanupTaskResources(envFor(fx), getTask(fx.db, RUN, 'API')!);
+    expect(outcome).toBeNull(); // refused at verify_branch_free
+    const { branchExists } = await import('../src/core/git.ts');
+    expect(await branchExists(fx.repoRoot, 'users/someone/feature')).toBe(true); // untouched
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('integrated');
   }, 30_000);
 
   test('clean refuses while a live runner holds the lease', async () => {
@@ -512,10 +607,12 @@ describe('RunnerEngine — full delivery chain', () => {
       [`ateam/${RUN}/task/API`, ws.worktree.path, ws.workspace.workspaceId, RUN],
     );
     fx.db.run('UPDATE runs SET final_verified=1 WHERE id=?', [RUN]);
+    const { insertVerification } = await import('../src/store/verifications.ts');
+    insertVerification(fx.db, { runId: RUN, kind: 'final', ok: true, detail: {} });
 
     const { cleanupTaskResources } = await import('../src/runner/cleanup.ts');
-    const ok = await cleanupTaskResources(envFor(fx), getTask(fx.db, RUN, 'API')!);
-    expect(ok).toBe(true);
+    const outcome = await cleanupTaskResources(envFor(fx), getTask(fx.db, RUN, 'API')!);
+    expect(outcome).toBe('reclaimed');
     expect(getTask(fx.db, RUN, 'API')!.status).toBe('reclaimed');
     const { branchExists } = await import('../src/core/git.ts');
     expect(await branchExists(fx.repoRoot, `ateam/${RUN}/task/API`)).toBe(false);
@@ -566,19 +663,31 @@ describe('RunnerEngine — full delivery chain', () => {
     const exec = listExecutions(fx.db, RUN).find((e) => e.agentName === wName('API'))!;
     fx.fake.dropPane(exec.paneId!); // pane gone, no result written
 
-    // snapshot unavailable ⇒ judgment stops: no phantom pane-loss attempts
-    const { HerdrError } = await import('../src/herdr/types.ts');
+    // subscription unavailable (R2-07) ⇒ the required subscribe-before-
+    // snapshot order cannot be guaranteed: judgments stop entirely, no
+    // snapshot-only degradation
     const broken = stubClient({
       subscribe: () => Promise.reject(new Error('no subscription')),
-      snapshot: () => Promise.reject(new HerdrError('timeout', 'snapshot down')),
+      snapshot: () => Promise.reject(new Error('snapshot down')),
     });
     const brokenEngine = new RunnerEngine({ ...envFor(fx), client: broken }, {});
     const decisions = await brokenEngine.reconcileOnce({});
-    expect(decisions.some((d) => d.kind === 'snapshot_unavailable')).toBe(true);
+    expect(decisions.some((d) => d.kind === 'subscription_unavailable')).toBe(true);
     expect(decisions.some((d) => d.kind === 'pane_lost_new_attempt' || d.kind === 'pane_lost_no_attempt')).toBe(false);
-    // the execution is untouched — the next pass with a healthy snapshot decides
+    // the execution is untouched — the next pass with a healthy runtime decides
     expect(listExecutions(fx.db, RUN).filter((e) => e.status === 'abandoned')).toHaveLength(0);
     expect(listExecutions(fx.db, RUN).find((e) => e.id === exec.id)!.status).toBe('running');
+
+    // a confirmed subscription with a FAILING snapshot still stops judgments
+    const { HerdrError } = await import('../src/herdr/types.ts');
+    const noSnapshot = stubClient({
+      subscribe: () => Promise.resolve(emptyStream()),
+      snapshot: () => Promise.reject(new HerdrError('timeout', 'snapshot down')),
+    });
+    const noSnapEngine = new RunnerEngine({ ...envFor(fx), client: noSnapshot }, {});
+    const snapDecisions = await noSnapEngine.reconcileOnce({});
+    expect(snapDecisions.some((d) => d.kind === 'snapshot_unavailable')).toBe(true);
+    expect(listExecutions(fx.db, RUN).filter((e) => e.status === 'abandoned')).toHaveLength(0);
 
     // with a healthy snapshot the same state gets judged: subscribe BEFORE snapshot
     const beforeReconcile = fx.fake.calls.map((c) => c.method).length;
@@ -694,9 +803,10 @@ describe('RunnerEngine — full delivery chain', () => {
     expect(fx.fake.promptCount(wName('API'))).toBe(promptsBefore); // nothing sent on a guess
   }, 30_000);
 
-  test('runUntilTerminal refuses without a free lease', async () => {    const fx = track(await makeFixture({}));
+  test('runUntilTerminal refuses without a free lease', async () => {
+    const fx = track(await makeFixture({}));
     seedRun(fx);
-    expect(acquireLease(fx.db, RUN)).toBe(true);
+    expect(acquireLease(fx.db, RUN)).not.toBeNull();
     fx.db.run("UPDATE runner_leases SET holder = '99999@other' WHERE run_id = ?", [RUN]);
     const engine = engineFor(fx);
     await expect(engine.runUntilTerminal()).rejects.toThrow(/lease/);
@@ -818,5 +928,284 @@ describe('RunnerEngine — full delivery chain', () => {
     // still exactly one prompt for the API worker; no new attempt was created
     expect(fx.fake.promptCount(wName('API'))).toBe(1);
     expect(listExecutions(fx.db, RUN).filter((e) => e.taskId === 'API' && e.role === 'worker')).toHaveLength(1);
+  }, 30_000);
+
+  test('R2-10: prompt DELIVERED but prompt_sent_at lost → resume dedupes by requestId, never double-injects', async () => {
+    const fx = track(await makeFixture(happyScripts()));
+    seedRun(fx);
+    fx.db.run("UPDATE tasks SET status='running', attempts=1 WHERE run_id=? AND task_id='API'", [RUN]);
+    const scheduled = getTask(fx.db, RUN, 'API')!;
+    const { startExecution } = await import('../src/runner/executions.ts');
+    await startExecution(envFor(fx), { role: 'worker', task: scheduled, attemptNo: 1, cycleNo: 0, entry: { kind: 'claude' } });
+    const exec = listExecutions(fx.db, RUN).find((e) => e.agentName === wName('API'))!;
+    // crash window: the prompt WAS delivered (runtime holds the requestId),
+    // but the process died before persisting prompt_sent_at
+    fx.db.run("UPDATE executions SET status='starting', prompt_sent_at=NULL WHERE id=?", [exec.id]);
+
+    const engine = engineFor(fx);
+    await engine.tickOnce();
+    const resumed = listExecutions(fx.db, RUN).find((e) => e.id === exec.id)!;
+    expect(resumed.status).toBe('running');
+    expect(resumed.promptSentAt).not.toBeNull();
+    // the runtime deduped the re-sent requestId — still exactly ONE injection
+    expect(fx.fake.promptCount(wName('API'))).toBe(1);
+  }, 30_000);
+
+  test('R2-11: a failed worker result retains the pane and re-dispatches into a fresh pane', async () => {
+    const fx = track(await makeFixture({
+      ...happyScripts(),
+      [wName('API')]: workerScript(['src/api/x.ts', 'x'], {
+        status: 'failed', summary: 'could not implement', blockedReason: 'implementation failed', testsRun: [], knownRisks: [], changedPaths: [],
+      }),
+      [wName('API', 2)]: workerScript(['src/api/x.ts', 'export const a = 1;\n'], workerOk('src/api/x.ts', 'export const a = 1;\n', 'a2 ok')),
+      [vName('API')]: reviewerScript(approvedReview(['src/api/x.ts'])),
+    }, { defaults: { maxParallel: 1 } }));
+    seedRun(fx);
+    const engine = engineFor(fx);
+    await tickUntil(engine, fx, () => listExecutions(fx.db, RUN).some((e) => e.taskId === 'API' && e.role === 'worker' && e.attemptNo === 2));
+
+    const failed = listExecutions(fx.db, RUN).find((e) => e.agentName === wName('API'))!;
+    expect(failed.paneState).toBe('retained'); // failed pane kept for attach (ADR)
+    expect(fx.fake.getAgent(wName('API'))).not.toBeNull(); // NOT closed
+    const retry = listExecutions(fx.db, RUN).find((e) => e.agentName === wName('API', 2))!;
+    expect(['starting', 'running']).toContain(retry.status);
+
+    await tickUntil(engine, fx, () => TERMINALS.includes(getRun(fx.db, RUN)!.status));
+    expect(getRun(fx.db, RUN)!.status).toBe('done');
+  }, 60_000);
+
+  test('R2-02: crash after a result was consumed but before the review dispatch replays from pending_dispatch', async () => {
+    const fx = track(await makeFixture(happyScripts()));
+    seedRun(fx);
+    const engine = engineFor(fx);
+    // crash injection: the process dies at the exact window between "task
+    // advanced to reviewing with the dispatch intent" and startReviewer —
+    // once; afterwards the (same) engine behaves normally again
+    crashOnce(engine, 'startReviewer');
+    await tickUntilCrashed(engine, fx, () => getTask(fx.db, RUN, 'API')!.status === 'reviewing');
+    expect(getTask(fx.db, RUN, 'API')!.pendingDispatch).toBe('review'); // intent persisted first
+    expect(listExecutions(fx.db, RUN).filter((e) => e.role === 'reviewer')).toHaveLength(0); // dispatch never landed
+
+    const engine2 = engineFor(fx); // fresh process, no in-memory state
+    await engine2.tickOnce();
+    const reviewers = listExecutions(fx.db, RUN).filter((e) => e.taskId === 'API' && e.role === 'reviewer');
+    expect(reviewers).toHaveLength(1); // recovered exactly one review cycle
+    expect(getTask(fx.db, RUN, 'API')!.pendingDispatch).toBeNull(); // intent served
+    await tickUntil(engine2, fx, () => TERMINALS.includes(getRun(fx.db, RUN)!.status));
+    expect(getRun(fx.db, RUN)!.status).toBe('done');
+  }, 60_000);
+
+  test('R2-02: crash after a review requested changes replays the worker retry', async () => {
+    const fx = track(await makeFixture({
+      ...happyScripts(),
+      [wName('API')]: workerScript(['src/api/x.ts', 'v1\n'], workerOk('src/api/x.ts', 'v1\n', 'a1')),
+      [wName('API', 2)]: workerScript(['src/api/x.ts', 'v2 fixed\n'], workerOk('src/api/x.ts', 'v2 fixed\n', 'a2')),
+      [vName('API')]: reviewerScript({ status: 'changes_requested', summary: 'needs work', findings: [], requiredChanges: ['fix'], reviewedFiles: ['src/api/x.ts'] }),
+      [vName('API', 2)]: reviewerScript(approvedReview(['src/api/x.ts'])),
+    }, { defaults: { maxParallel: 1, maxReviewCycles: 3 } }));
+    seedRun(fx);
+    const engine = engineFor(fx);
+    // crash injection: dies between consuming the changes_requested verdict
+    // (review persisted + retry intent) and retryWorker
+    crashOnce(engine, 'retryWorker');
+    await tickUntilCrashed(engine, fx, () => !!getTask(fx.db, RUN, 'API')!.review);
+    expect(getTask(fx.db, RUN, 'API')!.pendingDispatch).toBe('worker_retry');
+    expect(listExecutions(fx.db, RUN).filter((e) => e.taskId === 'API' && e.role === 'worker' && e.attemptNo >= 2)).toHaveLength(0);
+
+    const engine2 = engineFor(fx);
+    await engine2.tickOnce();
+    expect(listExecutions(fx.db, RUN).filter((e) => e.taskId === 'API' && e.role === 'worker' && e.attemptNo === 2)).toHaveLength(1);
+    expect(getTask(fx.db, RUN, 'API')!.pendingDispatch).toBeNull();
+    await tickUntil(engine2, fx, () => TERMINALS.includes(getRun(fx.db, RUN)!.status));
+    expect(getRun(fx.db, RUN)!.status).toBe('done');
+    expect(getTask(fx.db, RUN, 'API')!.attempts).toBe(2);
+  }, 60_000);
+
+  test('R2-14: verification outcomes persist as queryable records bound to revision and HEAD', async () => {
+    const fx = track(await makeFixture(happyScripts()));
+    seedRun(fx);
+    const engine = engineFor(fx);
+    await tickUntil(engine, fx, () => TERMINALS.includes(getRun(fx.db, RUN)!.status));
+
+    const { listVerifications } = await import('../src/store/verifications.ts');
+    const records = listVerifications(fx.db, RUN);
+    const taskRecords = records.filter((r) => r.kind === 'task' && r.taskId === 'API');
+    expect(taskRecords.length).toBeGreaterThanOrEqual(1);
+    expect(taskRecords.every((r) => r.ok));
+    expect(taskRecords[0]!.detail!.commands!.length).toBeGreaterThanOrEqual(1);
+    expect(taskRecords[0]!.detail!.headSha).toBeTruthy();
+    const final = records.filter((r) => r.kind === 'final');
+    expect(final).toHaveLength(1);
+    expect(final[0]!.ok).toBe(true);
+    expect(final[0]!.detail!.contractRevision).toBe(1);
+    expect(final[0]!.detail!.headSha).toBeTruthy(); // the verified integration HEAD
+  }, 60_000);
+
+  test('R2-05: a revision changing the delivered set after final verification is rejected outright', async () => {
+    const fx = track(await makeFixture(happyScripts()));
+    seedRun(fx);
+    const engine = engineFor(fx);
+    await tickUntil(engine, fx, () => getRun(fx.db, RUN)!.finalVerified === true);
+
+    const contractV2 = validateContract(minimalContract({
+      project: { id: 'demo', repoRoot: fx.repoRoot, baseRef: 'main' },
+      tasks: [
+        { id: 'API', title: 'api', allowedPaths: ['src/api/**'] },
+        { id: 'WEB', title: 'web', allowedPaths: ['src/web/**'] },
+        { id: 'DOCS', title: 'docs', allowedPaths: ['docs/**'], dependsOn: ['API'] },
+        { id: 'EXTRA', title: 'extra', allowedPaths: ['extra/**'] },
+      ],
+    }));
+    appendContractRevision(fx.db, RUN, contractV2);
+    await engine.tickOnce();
+
+    // the stale finalVerified does NOT silently swallow the revision: it is
+    // rejected (audited), nothing half-applies, and the run can finish
+    expect(getTask(fx.db, RUN, 'EXTRA')).toBeNull();
+    expect(getRun(fx.db, RUN)!.revisionPending).toBe(false);
+    expect(engine.env.contract).not.toEqual(contractV2);
+    const { listEvents } = await import('../src/store/events.ts');
+    const rejected = listEvents(fx.db, RUN).find(
+      (e) => e.eventType === 'CONTRACT_REVISED' && (e.payload as { rejected?: boolean })?.rejected === true,
+    );
+    expect(rejected).toBeDefined();
+    expect((rejected!.payload as { reason?: string }).reason).toContain('final verification');
+    await tickUntil(engine, fx, () => TERMINALS.includes(getRun(fx.db, RUN)!.status));
+    expect(getRun(fx.db, RUN)!.status).toBe('done');
+  }, 60_000);
+
+  test('R2-04: a revision moving the project binding is refused outright', async () => {
+    const fx = track(await makeFixture(happyScripts()));
+    seedRun(fx);
+    const engine = engineFor(fx);
+    await tickUntil(engine, fx, () => getTask(fx.db, RUN, 'API')!.status === 'reviewing');
+
+    const moved = validateContract(minimalContract({
+      project: { id: 'demo', repoRoot: '/elsewhere/repo', baseRef: 'main' },
+      tasks: [
+        { id: 'API', title: 'api', allowedPaths: ['src/api/**'] },
+        { id: 'WEB', title: 'web', allowedPaths: ['src/web/**'] },
+        { id: 'DOCS', title: 'docs', allowedPaths: ['docs/**'], dependsOn: ['API'] },
+      ],
+    }));
+    appendContractRevision(fx.db, RUN, moved);
+    await engine.tickOnce();
+
+    expect(getRun(fx.db, RUN)!.status).toBe('needs_attention');
+    expect(getRun(fx.db, RUN)!.revisionPending).toBe(true);
+    expect(getRun(fx.db, RUN)!.error).toContain('project binding');
+    expect(engine.env.contract).not.toEqual(moved);
+  }, 60_000);
+
+  test('R2-12: a stale integration mapping is reconfirmed against Herdr, reopened by branch, and keeps its base SHA', async () => {
+    const fx = track(await makeFixture(happyScripts()));
+    seedRun(fx);
+    const engine = engineFor(fx);
+    await tickUntil(engine, fx, () => {
+      const run = getRun(fx.db, RUN)!;
+      return listTasks(fx.db, RUN).every((t) => t.status === 'integrated') && !!run.integrationPath;
+    });
+    const before = getRun(fx.db, RUN)!;
+    expect(before.integrationBaseSha).toBeTruthy();
+    // simulate a lost/stale mapping (e.g. schema v1 upgrade): the ledger
+    // points at a workspace Herdr no longer knows, while the branch survives
+    fx.db.run("UPDATE runs SET integration_workspace_id='w-gone' WHERE id=?", [RUN]);
+
+    const engine2 = engineFor(fx);
+    // stop at final verification — cleanup has not nulled the mapping yet
+    await tickUntil(engine2, fx, () => getRun(fx.db, RUN)!.finalVerified === true);
+
+    const verified = getRun(fx.db, RUN)!;
+    // reopened from the recorded branch, back to the real workspace
+    expect(verified.integrationWorkspaceId).toBe(before.integrationWorkspaceId);
+    expect(verified.integrationPath).toBe(before.integrationPath);
+    // the FIRST creation's baseline survived the reopen — not the post-integration HEAD
+    expect(verified.integrationBaseSha).toBe(before.integrationBaseSha);
+    const { listVerifications } = await import('../src/store/verifications.ts');
+    const final = listVerifications(fx.db, RUN).filter((r) => r.kind === 'final');
+    expect(final).toHaveLength(1);
+    expect(final[0]!.ok).toBe(true);
+    expect(final[0]!.detail!.baseSha).toBe(before.integrationBaseSha);
+    await tickUntil(engine2, fx, () => TERMINALS.includes(getRun(fx.db, RUN)!.status));
+    expect(getRun(fx.db, RUN)!.status).toBe('done');
+  }, 60_000);
+
+  test('R2-12: after a Herdr restart the ledgered mapping is reconfirmed, not blindly trusted or rebuilt', async () => {
+    const fx = track(await makeFixture(happyScripts()));
+    seedRun(fx);
+    const engine = engineFor(fx);
+    await tickUntil(engine, fx, () => {
+      const run = getRun(fx.db, RUN)!;
+      return listTasks(fx.db, RUN).every((t) => t.status === 'integrated') && !!run.integrationPath;
+    });
+    const before = getRun(fx.db, RUN)!;
+    fx.fake.restartServer(); // panes/agents die; Herdr session restore brings worktrees back
+
+    const engine2 = engineFor(fx);
+    // stop before cleanup nulls the run-level mapping
+    await tickUntil(engine2, fx, () => getRun(fx.db, RUN)!.finalVerified === true);
+    const verified = getRun(fx.db, RUN)!;
+    expect(verified.integrationWorkspaceId).toBe(before.integrationWorkspaceId); // reconfirmed, not rebuilt
+    expect(verified.integrationPath).toBe(before.integrationPath);
+    expect(verified.integrationBaseSha).toBe(before.integrationBaseSha);
+    const { listVerifications } = await import('../src/store/verifications.ts');
+    const final = listVerifications(fx.db, RUN).filter((r) => r.kind === 'final');
+    expect(final).toHaveLength(1);
+    expect(final[0]!.detail!.baseSha).toBe(before.integrationBaseSha);
+    await tickUntil(engine2, fx, () => TERMINALS.includes(getRun(fx.db, RUN)!.status));
+    expect(getRun(fx.db, RUN)!.status).toBe('done');
+  }, 60_000);
+
+  test('R2-13: the run entry refuses when an agent integration the contract needs is missing', async () => {
+    const fx = track(await makeFixture(happyScripts()));
+    seedRun(fx);
+    const env = envFor(fx);
+    const { probeAgentsOrFailFast } = await import('../src/commands/run-shared.ts');
+    const { DoctorError } = await import('../src/core/errors.ts');
+    // contract needs claude (worker/integrator) AND codex (cross-kind reviewer)
+    await expect(probeAgentsOrFailFast(env, async (kind) => ({
+      name: `agent.${kind}`,
+      ok: kind !== 'codex',
+      detail: kind === 'codex' ? 'codex CLI not runnable (exit 127)' : kind,
+      remediation: kind === 'codex' ? 'install the codex CLI' : undefined,
+    }))).rejects.toThrow(DoctorError);
+    await expect(probeAgentsOrFailFast(env, async (kind) => ({
+      name: `agent.${kind}`,
+      ok: true,
+      detail: kind,
+    }))).resolves.toBeUndefined();
+  });
+
+  test('R2-08: reconcile --dry-run does not apply a persisted result', async () => {
+    const fx = track(await makeFixture({
+      [wName('API')]: { kind: 'claude', sequence: ['working', 'done'], stepMs: 5 },
+      [vName('API')]: reviewerScript(approvedReview(['src/api/x.ts'])),
+    }));
+    seedRun(fx);
+    fx.db.run("UPDATE tasks SET status='running', attempts=1 WHERE run_id=? AND task_id='API'", [RUN]);
+    const scheduled = getTask(fx.db, RUN, 'API')!;
+    const { startExecution } = await import('../src/runner/executions.ts');
+    await startExecution(envFor(fx), { role: 'worker', task: scheduled, attemptNo: 1, cycleNo: 0, entry: { kind: 'claude' } });
+    // the worker delivers a valid result, then its pane vanishes
+    await fx.fake.performAction(wName('API'), {
+      editFiles: [['src/api/x.ts', 'export const a = 1;\n']],
+      writeResultFile: workerOk('src/api/x.ts', 'export const a = 1;\n', 'done'),
+    });
+    const exec = listExecutions(fx.db, RUN).find((e) => e.agentName === wName('API'))!;
+    fx.fake.dropPane(exec.paneId!);
+
+    const engine = engineFor(fx);
+    const dry = await engine.reconcileOnce({ dryRun: true });
+    expect(dry.some((d) => d.kind === 'result_recovered')).toBe(true); // WOULD recover
+    // ...but nothing was applied: the task is untouched, no reviewer exists
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('running');
+    expect(listExecutions(fx.db, RUN).filter((e) => e.role === 'reviewer')).toHaveLength(0);
+    const unchanged = listExecutions(fx.db, RUN).find((e) => e.id === exec.id)!;
+    expect(unchanged.resultAppliedDigest).toBeNull();
+    expect(unchanged.status).not.toBe('abandoned');
+
+    // the real pass applies it
+    await engine.reconcileOnce({});
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('reviewing');
   }, 30_000);
 });

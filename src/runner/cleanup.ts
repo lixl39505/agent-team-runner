@@ -10,6 +10,7 @@ import { listActiveResources, markResourceState } from '../store/resources.ts';
 import { updateTask } from '../store/tasks.ts';
 import { getRun } from '../store/runs.ts';
 import { listExecutions, updateExecution } from '../store/executions.ts';
+import { hasPassingFinalVerification } from '../store/verifications.ts';
 import { addEvent } from '../store/events.ts';
 import { branchExists, worktreeBranches, deleteBranchIfFree } from '../core/git.ts';
 import { HerdrError } from '../herdr/types.ts';
@@ -48,28 +49,55 @@ async function runStep(
 
 export interface CleanupOptions {
   /**
-   * Reclaim without a persisted final verification pass. Only for operator
-   * finish-ups (`clean`) that abandon the run anyway; the Runner's own
-   * cleanup path never sets this (ADR: 终验与提交持久化后才可回收).
+   * Explicit operator override (`clean --discard-work`, review 02 R2-03):
+   * DESTROY unverified delivery resources as an audited discard — the task
+   * ends `discarded`, never `reclaimed`, so an unverified resource is never
+   * counted as a normal reclamation. The Runner's own cleanup path never
+   * sets this (ADR: 终验与提交持久化后才可回收).
    */
-  allowUnverified?: boolean;
+  discardUnverified?: boolean;
+}
+
+/**
+ * A reclamation ends `reclaimed` (verified delivery), `discarded` (audited
+ * operator override), or null (not eligible / a step failed — retry later).
+ */
+export type CleanupOutcome = 'reclaimed' | 'discarded' | null;
+
+/**
+ * A cleanup may only ever touch the branch THIS run created
+ * (`ateam/<runId>/…`). Review 02 R2-04: cleanup reads repoRoot from the
+ * CURRENT contract; if a revision ever moved the binding, same-named
+ * branches in the new repo must not be mistaken for this run's resources.
+ * The runId-scoped prefix is the provenance proof (branches are minted by
+ * taskBranch()/integrationBranch() with exactly this shape).
+ */
+function assertRunBranch(runId: string, branch: string): void {
+  if (!branch.startsWith(`ateam/${runId}/`)) {
+    throw new Error(`branch ${branch} is not a resource of run ${runId}; refusing to clean it`);
+  }
 }
 
 /**
  * Reclaim one task's temp resources in the fixed order. Resumes from the
- * first non-ok step; returns true when the task is fully reclaimed.
+ * first non-ok step; returns the outcome when the task fully settled.
  */
-export async function cleanupTaskResources(env: RunnerEnv, task: TaskRecord, opts: CleanupOptions = {}): Promise<boolean> {
+export async function cleanupTaskResources(env: RunnerEnv, task: TaskRecord, opts: CleanupOptions = {}): Promise<CleanupOutcome> {
   const { db, runId, client, contract } = env;
 
-  // cleanup eligibility (review 01 #2): a final mechanical verification must
-  // have been persisted before temp resources are reclaimed
+  // cleanup eligibility (review 01 #2, tightened by review 02 R2-03/R2-14):
+  // a final mechanical verification must be persisted BOTH as the run flag
+  // AND as a passing verification record before temp resources are claimed
+  // back. Without it only an explicit operator discard may proceed.
   const run = getRun(db, runId);
-  if (!run?.finalVerified) {
-    if (!opts.allowUnverified) return false;
+  const verified = !!run?.finalVerified && hasPassingFinalVerification(db, runId);
+  let discarded = false;
+  if (!verified) {
+    if (!opts.discardUnverified) return null;
+    discarded = true;
     addEvent(db, runId, 'RECONCILE_DECISION', {
       taskId: task.taskId,
-      payload: { reason: 'cleanup_unverified_override', source: 'clean', finalCommit: task.integrationCommit },
+      payload: { reason: 'cleanup_unverified_discard', source: 'clean', finalCommit: task.integrationCommit },
     });
   }
 
@@ -81,7 +109,7 @@ export async function cleanupTaskResources(env: RunnerEnv, task: TaskRecord, opt
       updateExecution(db, exec.id, { paneState: 'closed_success' });
     }
   });
-  if (!closePanes) return false;
+  if (!closePanes) return null;
 
   const removeWorktree = await runStep(env, task, 'remove_worktree', async () => {
     if (!task.workspaceId) return;
@@ -92,7 +120,7 @@ export async function cleanupTaskResources(env: RunnerEnv, task: TaskRecord, opt
       if (!(err instanceof HerdrError && err.code === 'not_found')) throw err;
     }
   });
-  if (!removeWorktree) return false;
+  if (!removeWorktree) return null;
   for (const res of listActiveResources(db, runId)) {
     if (res.taskId === task.taskId || res.herdrId === task.workspaceId) {
       markResourceState(db, res.kind, res.herdrId, 'reclaimed');
@@ -101,22 +129,28 @@ export async function cleanupTaskResources(env: RunnerEnv, task: TaskRecord, opt
 
   const verifyFree = await runStep(env, task, 'verify_branch_free', async () => {
     if (!task.branch) return;
+    assertRunBranch(runId, task.branch); // R2-04 provenance gate
     if (!(await branchExists(contract.project.repoRoot, task.branch))) return; // already deleted
     const held = await worktreeBranches(contract.project.repoRoot);
     if (held.has(task.branch)) {
       throw new Error(`branch ${task.branch} still held by a worktree`);
     }
   });
-  if (!verifyFree) return false;
+  if (!verifyFree) return null;
 
   const deleteBranch = await runStep(env, task, 'delete_branch', async () => {
     if (!task.branch) return;
+    assertRunBranch(runId, task.branch); // R2-04 provenance gate (defense in depth)
     const deleted = await deleteBranchIfFree(contract.project.repoRoot, task.branch);
     if (!deleted) throw new Error(`branch ${task.branch} could not be deleted (occupied?)`);
   });
-  if (!deleteBranch) return false;
+  if (!deleteBranch) return null;
 
-  return runStep(env, task, 'finalize', async () => {
-    updateTask(db, runId, task.taskId, { status: 'reclaimed' });
+  const finalized = await runStep(env, task, 'finalize', async () => {
+    // R2-03: an unverified destruction settles as `discarded` — a resource
+    // destroyed without final verification is never counted as reclaimed
+    updateTask(db, runId, task.taskId, { status: discarded ? 'discarded' : 'reclaimed' });
   });
+  if (!finalized) return null;
+  return discarded ? 'discarded' : 'reclaimed';
 }

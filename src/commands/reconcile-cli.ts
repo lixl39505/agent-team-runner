@@ -43,7 +43,8 @@ export async function cmdReconcile(opts: ReconcileCommandOptions): Promise<numbe
     for (const run of runs) {
       const current = getRun(db, run.id)!;
       if (!current) continue;
-      if (!acquireLease(db, run.id)) {
+      const fence = acquireLease(db, run.id);
+      if (!fence) {
         results.push({ runId: run.id, skipped: 'live_lease', decisions: [] });
         continue;
       }
@@ -52,7 +53,7 @@ export async function cmdReconcile(opts: ReconcileCommandOptions): Promise<numbe
         const decisions = await engine.reconcileOnce({ dryRun: opts.dryRun });
         results.push({ runId: run.id, decisions });
       } finally {
-        releaseLease(db, run.id);
+        releaseLease(db, run.id, fence);
       }
     }
 

@@ -5,7 +5,9 @@ import { openDatabase } from '../store/db.ts';
 import { loadHome } from '../config.ts';
 import { RunnerEngine } from '../runner/engine.ts';
 import { AteamError } from '../core/errors.ts';
-import { buildRunnerEnv, createClient, getRunOrThrow, probeOrFailFast, resolveSelfPaneId } from './run-shared.ts';
+import {
+  buildRunnerEnv, createClient, getRunOrThrow, probeAgentsOrFailFast, probeOrFailFast, resolveSelfPaneId,
+} from './run-shared.ts';
 import { findClaimableRun } from './submit.ts';
 
 export interface RunnerEntryOptions {
@@ -29,8 +31,13 @@ export async function cmdRunnerEntry(opts: RunnerEntryOptions): Promise<number> 
     const runId = opts.runId ?? (opts.claim ? findClaimableRun(db) : undefined);
     if (!runId) throw new AteamError('nothing to claim (no queued runs); pass --run-id or submit a contract first');
     const run = getRunOrThrow(db, runId);
+    const env = buildRunnerEnv(home, db, client, run);
+    // R2-13: the ADR fail-fast covers the agent integrations THIS contract
+    // needs — an uninstalled claude/codex/opencode CLI must refuse the entry,
+    // not surface as a mid-run agent start failure
+    await probeAgentsOrFailFast(env);
     const engine = new RunnerEngine(
-      buildRunnerEnv(home, db, client, run),
+      env,
       {
         selfPaneId: resolveSelfPaneId(opts.selfPaneId),
         selfAgentName: 'ateam-runner',

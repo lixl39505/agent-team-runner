@@ -6,6 +6,7 @@
 import type { HerdrRuntimeClient } from './client.ts';
 import { atomicWriteJson } from '../results/files.ts';
 import { join, dirname } from 'node:path';
+import { existsSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import type {
   AgentRecord,
@@ -81,20 +82,29 @@ export class FakeHerdrClient implements HerdrRuntimeClient {
   private readonly workspaces = new Map<string, WorkspaceHandle>();
   private readonly panes = new Map<string, PaneHandle>();
   private readonly agents = new Map<string, FakeAgent>();
+  /** Worktrees ever created — a restarted Herdr restores sessions whose
+   * checkout still exists on disk (Herdr session restore); live panes and
+   * agents do NOT survive. */
+  private readonly persistedWorktrees = new Map<string, WorkspaceHandle>();
   /** Survives pane closure/restarts — prompts are the invariant under test. */
   private readonly promptLog: Array<{ agent: string; text: string }> = [];
+  /** requestId → agent — models the Herdr prompt idempotency contract
+   * (review 02 R2-10): one requestId = exactly one injection. */
+  private readonly deliveredRequests = new Map<string, string>();
   private readonly selfReports: Array<{ paneId: string; agent: string; state: HerdrAgentState; message?: string }> = [];
   private restartTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(private readonly opts: FakeOptions) {
     // base workspace standing in for the Runner's own Herdr workspace
-    this.workspaces.set('w0', {
+    const base: WorkspaceHandle = {
       workspace: { workspaceId: 'w0', label: 'base', worktree: { branch: '(base)', path: opts.repoRoot } },
       tab: { tabId: 'w0:t', workspaceId: 'w0' },
       rootPane: { paneId: 'w0:p', workspaceId: 'w0', tabId: 'w0:t' },
       worktree: { workspaceId: 'w0', branch: '(base)', path: opts.repoRoot },
-    });
-    this.panes.set('w0:p', { paneId: 'w0:p', workspaceId: 'w0', tabId: 'w0:t' });
+    };
+    this.workspaces.set('w0', base);
+    this.panes.set('w0:p', base.rootPane);
+    this.persistedWorktrees.set('w0', base);
     if (opts.faults?.restartServerAfterMs !== undefined) {
       this.restartTimer = setTimeout(() => this.restartServer(), opts.faults.restartServerAfterMs);
     }
@@ -118,6 +128,13 @@ export class FakeHerdrClient implements HerdrRuntimeClient {
     this.workspaces.clear();
     this.panes.clear();
     this.agents.clear();
+    // session restore: worktrees whose checkout still exists come back with
+    // their session records; live split panes and agents stay gone
+    for (const handle of this.persistedWorktrees.values()) {
+      if (!existsSync(handle.worktree.path)) continue;
+      this.workspaces.set(handle.workspace.workspaceId, handle);
+      this.panes.set(handle.rootPane.paneId, handle.rootPane);
+    }
   }
 
   agentCount(): number {
@@ -160,13 +177,18 @@ export class FakeHerdrClient implements HerdrRuntimeClient {
   }
 
   /** Test hook: simulate "agent started but the prompt never landed" —
-   * wipes delivered prompts and resets the state walk to idle. */
+   * wipes delivered prompts AND their request-id records (a runtime that
+   * never injected the prompt has no record of it), then resets the state
+   * walk to idle. */
   resetToIdle(agentName: string): void {
     const agent = this.agents.get(agentName);
     if (!agent) return;
     agent.prompts.length = 0;
     for (let i = this.promptLog.length - 1; i >= 0; i--) {
       if (this.promptLog[i]!.agent === agentName) this.promptLog.splice(i, 1);
+    }
+    for (const [rid, owner] of this.deliveredRequests) {
+      if (owner === agentName) this.deliveredRequests.delete(rid);
     }
     agent.state = 'idle';
     agent.pausedAt = null;
@@ -289,6 +311,7 @@ export class FakeHerdrClient implements HerdrRuntimeClient {
     };
     this.workspaces.set(wsId, handle);
     this.panes.set(paneId, handle.rootPane);
+    this.persistedWorktrees.set(wsId, handle);
     return handle;
   }
 
@@ -359,10 +382,18 @@ export class FakeHerdrClient implements HerdrRuntimeClient {
     wait: boolean;
     until: Array<'idle' | 'done' | 'blocked'>;
     timeoutMs: number;
+    requestId?: string;
   }): Promise<AgentWaitResult> {
     this.record('promptAgent', input);
     const agent = this.agents.get(input.target);
     if (!agent) throw new HerdrError('agent_not_found', `fake: agent ${input.target} not found`);
+    // requestId idempotency (R2-10): a redelivered prompt is a no-op
+    if (input.requestId) {
+      if (this.deliveredRequests.has(input.requestId)) {
+        return { paneId: agent.paneId, state: agent.state };
+      }
+      this.deliveredRequests.set(input.requestId, input.target);
+    }
     agent.prompts.push(input.text);
     this.promptLog.push({ agent: input.target, text: input.text });
     this.walkFrom(input.target, 0);

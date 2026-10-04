@@ -8,8 +8,10 @@ import {
   currentHead,
   deleteBranchIfFree,
   diffStat,
+  hasStagedChanges,
   stageAll,
   worktreeBranches,
+  worktreeChangedFiles,
 } from '../src/core/git.ts';
 import { cleanupTempDir, initRepo, makeTempDir, writeFileDeep } from './helpers.ts';
 
@@ -73,5 +75,28 @@ describe('git gates', () => {
     await Bun.spawn(['git', '-C', repo, 'worktree', 'remove', '--force', join(repo, '..', 'wt-x')], {
       stdin: 'ignore',
     }).exited;
+  });
+
+  test('worktreeChangedFiles excludes .ateam internals (R2-01)', async () => {
+    const localBase = await currentHead(repo); // isolate from earlier commits
+    await writeFileDeep(join(repo, '.ateam', 'brief.md'), '# brief\n');
+    const files = await worktreeChangedFiles(repo, localBase);
+    expect(files).not.toContain('.ateam/brief.md');
+    expect(files).toEqual([]);
+    // a real delivery file still shows up
+    await writeFileDeep(join(repo, 'src/real.ts'), 'export 1;\n');
+    expect(await worktreeChangedFiles(repo, localBase)).toContain('src/real.ts');
+    await stageAll(repo);
+    await commit(repo, 'chore: r2-01 fixtures');
+  });
+
+  test('hasStagedChanges is a pure index query — untracked files are not "staged" (R2-01)', async () => {
+    // only an untracked file exists: the index is EMPTY vs HEAD
+    await writeFileDeep(join(repo, 'untracked-r2.txt'), 'x\n');
+    expect(await hasStagedChanges(repo)).toBe(false);
+    // staging something flips it
+    await stageAll(repo);
+    expect(await hasStagedChanges(repo)).toBe(true);
+    await commit(repo, 'chore: r2-01 fixtures 2');
   });
 });

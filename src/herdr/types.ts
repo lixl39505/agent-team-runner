@@ -102,6 +102,13 @@ export interface HerdrEvent {
 
 export interface HerdrEventStream extends AsyncIterable<HerdrEvent> {
   close(): void;
+  /**
+   * Events buffered since the last consume, WITHOUT blocking (review 02
+   * R2-07): lets the caller merge everything that arrived between the
+   * subscription ACK and a snapshot taken afterwards. Optional — transports
+   * that only support pull-based iteration omit it.
+   */
+  drainPending?(): HerdrEvent[];
 }
 
 export type HerdrErrorCode =

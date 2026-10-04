@@ -3,7 +3,7 @@
 import type { SQLQueryBindings } from 'bun:sqlite';
 import type { SqliteDb } from './db.ts';
 import { nowIso } from './ids.ts';
-import type { TaskRecord, TaskSpec, TaskStatus } from '../core/types.ts';
+import type { PendingDispatch, TaskRecord, TaskSpec, TaskStatus } from '../core/types.ts';
 
 interface TaskRow {
   run_id: string;
@@ -21,6 +21,7 @@ interface TaskRow {
   last_error: string | null;
   contract_block_json: string | null;
   review_json: string | null;
+  pending_dispatch: string | null;
   created_at: string;
   updated_at: string;
   finished_at: string | null;
@@ -43,6 +44,7 @@ function toRecord(row: TaskRow): TaskRecord {
     lastError: row.last_error,
     contractBlock: row.contract_block_json ? JSON.parse(row.contract_block_json) : null,
     review: row.review_json ? JSON.parse(row.review_json) : null,
+    pendingDispatch: (row.pending_dispatch as PendingDispatch | null) ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     finishedAt: row.finished_at,
@@ -77,7 +79,7 @@ export function listTasksByStatus(db: SqliteDb, runId: string, statuses: readonl
   return rows.map(toRecord);
 }
 
-const TERMINAL_TASK = ['reclaimed'];
+const TERMINAL_TASK = ['reclaimed', 'discarded'];
 
 export interface TaskPatch {
   status?: TaskStatus;
@@ -92,6 +94,7 @@ export interface TaskPatch {
   lastError?: string | null;
   contractBlock?: unknown | null;
   review?: unknown | null;
+  pendingDispatch?: PendingDispatch | null;
 }
 
 export function updateTask(db: SqliteDb, runId: string, taskId: string, patch: TaskPatch): void {
@@ -117,6 +120,7 @@ export function updateTask(db: SqliteDb, runId: string, taskId: string, patch: T
   if (patch.review !== undefined) {
     push('review_json', patch.review === null ? null : JSON.stringify(patch.review));
   }
+  if (patch.pendingDispatch !== undefined) push('pending_dispatch', patch.pendingDispatch);
   const terminal = patch.status !== undefined && TERMINAL_TASK.includes(patch.status);
   push('updated_at', nowIso());
   push('finished_at', terminal ? nowIso() : null);

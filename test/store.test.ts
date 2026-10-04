@@ -118,23 +118,29 @@ describe('resources + lease + cleanup', () => {
     expect(listActiveResources(db, runId)[0]!.herdrId).toBe('w9:p1');
   });
 
-  test('lease acquire/heartbeat/release + stale takeover', async () => {
+  test('lease acquire/heartbeat/release + stale takeover (fenced, R2-06)', async () => {
     const runId = 'r-20261003-dddddd';
-    expect(acquireLease(db, runId)).toBe(true);
+    const fence = acquireLease(db, runId);
+    expect(fence).not.toBeNull();
     expect(leaseIsAlive(db, runId)).toBe(true);
     // a different live holder cannot be stolen
-    db.run("UPDATE runner_leases SET holder = '99999@other' WHERE run_id = ?", [runId]);
-    expect(acquireLease(db, runId)).toBe(false);
-    heartbeat(db, runId); // heartbeat only applies to own holder; row keeps other holder alive
-    expect(acquireLease(db, runId)).toBe(false);
+    db.run("UPDATE runner_leases SET holder = '99999@other', fence = 'otherfence' WHERE run_id = ?", [runId]);
+    expect(acquireLease(db, runId)).toBeNull();
+    // heartbeat with the OLD token is a no-op (zero rows changed) — the
+    // dispossessed holder learns it lost the lease instead of silently
+    // refreshing someone else's row
+    expect(heartbeat(db, runId, fence!)).toBe(false);
+    expect(acquireLease(db, runId)).toBeNull();
     // stale heartbeat allows takeover
     db.run("UPDATE runner_leases SET heartbeat_at = '2020-01-01T00:00:00Z' WHERE run_id = ?", [runId]);
-    expect(acquireLease(db, runId)).toBe(true);
-    heartbeat(db, runId);
-    releaseLease(db, runId);
+    const fence2 = acquireLease(db, runId);
+    expect(fence2).not.toBeNull();
+    expect(fence2).not.toBe(fence); // a fresh random fencing token per acquisition
+    expect(heartbeat(db, runId, fence2!)).toBe(true);
+    releaseLease(db, runId, fence2!);
     expect(leaseIsAlive(db, runId)).toBe(false);
     db.run("UPDATE runner_leases SET holder = '99999@other' WHERE run_id = ?", [runId]);
-    expect(acquireLease(db, runId)).toBe(true);
+    expect(acquireLease(db, runId)).not.toBeNull();
   });
 
   test('cleanup audit resume point', () => {

@@ -102,7 +102,10 @@ export class HerdrSocketTransport {
     return this.request('session.snapshot', {}, timeoutMs);
   }
 
-  /** Long-lived event stream over a dedicated socket. */
+  /** Long-lived event stream over a dedicated socket. The subscription is
+   * CONFIRMED before this resolves (review 02 R2-07): the method waits for
+   * the server's ack (or error) so callers can rely on "subscribed" the
+   * moment they proceed to a snapshot. */
   async subscribe(filter?: { paneId?: string }, timeoutMs = 15_000): Promise<HerdrEventStream> {
     const socket = await this.connectSocket(timeoutMs);
     const id = `ateam-sub-${++this.seq}`;
@@ -112,12 +115,27 @@ export class HerdrSocketTransport {
     socket.write(`${JSON.stringify({ id, method: 'events.subscribe', params: { subscriptions } })}\n`);
 
     let buffer = '';
-    let acked = false;
+    let settled = false;
     let onAck: (() => void) | null = null;
     let onFail: ((err: HerdrError) => void) | null = null;
     const ackOrFailure = new Promise<void>((resolve, reject) => {
-      onAck = resolve;
-      onFail = (err) => reject(err);
+      onAck = () => {
+        settled = true;
+        clearTimeout(ackTimer);
+        resolve();
+      };
+      onFail = (err) => {
+        settled = true;
+        clearTimeout(ackTimer);
+        socket.destroy();
+        reject(err);
+      };
+      const ackTimer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        reject(new HerdrError('timeout', `events.subscribe not acknowledged within ${timeoutMs}ms`));
+      }, timeoutMs);
     });
     socket.once('error', (err) => {
       onFail?.(new HerdrError('herdr_not_running', err.message));
@@ -128,14 +146,19 @@ export class HerdrSocketTransport {
 
     const handleLine = (line: string): void => {
       if (!line.trim()) return;
-      let doc: { id?: string; event?: unknown; type?: string; pane_id?: string; workspace_id?: string };
+      let doc: { id?: string; error?: { code?: string; message?: string }; event?: unknown; type?: string; pane_id?: string; workspace_id?: string };
       try {
         doc = JSON.parse(line);
       } catch {
         return;
       }
       if (doc.id === id) {
-        acked = true;
+        // the subscribe response itself: an error document is a REFUSED
+        // subscription, not a silent fallback to polling (R2-07)
+        if (doc.error) {
+          onFail?.(new HerdrError('herdr_error', doc.error.message ?? doc.error.code ?? 'events.subscribe', doc.error));
+          return;
+        }
         onAck?.();
         return;
       }
@@ -165,10 +188,13 @@ export class HerdrSocketTransport {
       }
     });
 
+    // R2-07: do not return a stream whose subscription may still be pending
+    // — the caller's next observation (snapshot) must be strictly AFTER the
+    // confirmed subscription
+    await ackOrFailure;
+
     return {
       async *[Symbol.asyncIterator](): AsyncIterator<HerdrEvent> {
-        await ackOrFailure;
-        if (!acked) return;
         while (true) {
           if (queue.length > 0) {
             yield queue.shift()!;
@@ -178,6 +204,9 @@ export class HerdrSocketTransport {
             waiter = resolve;
           });
         }
+      },
+      drainPending(): HerdrEvent[] {
+        return queue.splice(0, queue.length);
       },
       close(): void {
         socket.destroy();

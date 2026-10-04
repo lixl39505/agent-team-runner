@@ -166,6 +166,14 @@ const MIGRATIONS: string[] = [
   ALTER TABLE runs ADD COLUMN final_verified INTEGER NOT NULL DEFAULT 0;
   ALTER TABLE runs ADD COLUMN final_verified_at TEXT;
   `,
+  // v3 — review 02: fencing token makes the runner lease a real CAS
+  // single-writer gate (R2-06); pending_dispatch persists the "next role/
+  // attempt" intent across crash windows between consuming a result and
+  // dispatching the follow-up (R2-02).
+  `
+  ALTER TABLE runner_leases ADD COLUMN fence TEXT;
+  ALTER TABLE tasks ADD COLUMN pending_dispatch TEXT;
+  `,
 ];
 
 export function openDatabase(path: string): SqliteDb {

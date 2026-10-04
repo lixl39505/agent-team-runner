@@ -216,6 +216,7 @@ export class HerdrCliRuntimeClient implements HerdrRuntimeClient {
     wait: boolean;
     until: Array<'idle' | 'done' | 'blocked'>;
     timeoutMs: number;
+    requestId?: string;
   }): Promise<AgentWaitResult> {
     const args = ['agent', 'prompt', input.target, input.text];
     if (input.wait) {
@@ -224,6 +225,13 @@ export class HerdrCliRuntimeClient implements HerdrRuntimeClient {
       args.push('--timeout', String(input.timeoutMs));
     }
     args.push('--json');
+    // NOTE (R2-10): `requestId` is deliberately NOT mapped to a CLI flag —
+    // no such flag exists in the current Herdr CLI, and inventing one would
+    // fail every prompt. The idempotency contract lives on the interface
+    // and is honored by the socket transport / runtimes that support it;
+    // until then a dispatch resume against a CLI-only runtime may re-send
+    // an already-delivered prompt (uncertainty is NOT resolved by guessing
+    // from transient agent state).
     const doc = unwrapResult<AnyRecord>(await this.cli.callJson<unknown>(args, {
       timeoutMs: input.timeoutMs + 15_000,
     }));

@@ -2,7 +2,7 @@
 // agent reads inside its worktree (.ateam/brief.md); the CLI prompt just
 // points at it (Windows argv limits the inline prompt).
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve, sep } from 'node:path';
 import { sha256Hex } from '../results/files.ts';
 import { buildBriefMarkdown, resultSchemaExample } from '../results/prompts.ts';
@@ -19,15 +19,31 @@ export interface ResolvedSkill {
 
 const SKILL_DIRS = ['.agents/skills', 'skills', '.claude/skills'];
 
-/** Candidate path for a skill inside one skill root, or null when the name
+/**
+ * Candidate path for a skill inside one skill root, or null when the name
  * is not a single safe segment or would resolve outside that root. Names
  * are already constrained by contract validation; this is defense in depth
- * against specs restored from storage or other lower-trust sources. */
-export function skillCandidatePath(skillRoot: string, name: string): string | null {
+ * against specs restored from storage or other lower-trust sources.
+ *
+ * Review 02 R2-09: the lexical prefix check alone does not stop symlink
+ * escape — `readFile` follows a symlink placed INSIDE the skill root. Both
+ * the root and the candidate are therefore `realpath`ed and containment is
+ * enforced on the REAL paths; an in-root symlink pointing outside resolves
+ * to "skill not found" instead of an out-of-repo read.
+ */
+export async function skillCandidatePath(skillRoot: string, name: string): Promise<string | null> {
   if (!SKILL_NAME_PATTERN.test(name)) return null;
   const root = resolve(skillRoot);
   const candidate = resolve(root, name, 'SKILL.md');
-  return candidate.startsWith(root + sep) ? candidate : null;
+  if (!candidate.startsWith(root + sep)) return null;
+  let realRoot: string;
+  let realCandidate: string;
+  try {
+    [realRoot, realCandidate] = await Promise.all([realpath(root), realpath(candidate)]);
+  } catch {
+    return null; // root or candidate does not exist (or is a dangling link)
+  }
+  return realCandidate === realRoot || realCandidate.startsWith(realRoot + sep) ? candidate : null;
 }
 
 /** Resolve skill content from the repo; throws for required skills that are missing. */
@@ -40,7 +56,7 @@ export async function resolveSkills(repoRoot: string, refs: SkillRef[] | undefin
     }
     let content: string | null = null;
     for (const dir of SKILL_DIRS) {
-      const candidate = skillCandidatePath(join(repoRoot, dir), ref.name);
+      const candidate = await skillCandidatePath(join(repoRoot, dir), ref.name);
       if (!candidate) continue;
       try {
         content = await readFile(candidate, 'utf8');
@@ -80,7 +96,10 @@ export interface BriefInput {
   skills: ResolvedSkill[];
 }
 
-/** Write .ateam/brief.md into the worktree; returns its sha256. */
+/** Write .ateam/brief.md into the worktree; returns its sha256. Refuses to
+ * write through a symlinked `.ateam`/brief.md — a hostile worktree could
+ * otherwise redirect the runner's own bookkeeping outside the worktree
+ * (review 02 R2-09). */
 export async function writeBrief(input: BriefInput): Promise<string> {
   const markdown = buildBriefMarkdown({
     role: input.role,
@@ -97,8 +116,20 @@ export async function writeBrief(input: BriefInput): Promise<string> {
     acceptance: input.task.acceptance,
     notes: input.notes,
   });
-  const path = join(input.worktreePath, '.ateam', 'brief.md');
-  await mkdir(dirname(path), { recursive: true });
+  const dir = join(input.worktreePath, '.ateam');
+  const dirStat = await lstat(dir).catch(() => null);
+  if (dirStat) {
+    if (!dirStat.isDirectory()) {
+      throw new Error(`refusing to write brief: ${dir} exists and is not a real directory (symlink?)`);
+    }
+  } else {
+    await mkdir(dir, { recursive: true });
+  }
+  const path = join(dir, 'brief.md');
+  const fileStat = await lstat(path).catch(() => null);
+  if (fileStat && !fileStat.isFile()) {
+    throw new Error(`refusing to write brief: ${path} exists and is not a regular file (symlink?)`);
+  }
   await writeFile(path, markdown, 'utf8');
   return sha256Hex(markdown);
 }

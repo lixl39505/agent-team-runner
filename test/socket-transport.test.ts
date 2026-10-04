@@ -18,7 +18,7 @@ describe('herdrSocketPath', () => {
 const isWin = process.platform === 'win32';
 
 describe.skipIf(isWin)('HerdrSocketTransport against a local NDJSON server', () => {
-  test('request + snapshot + subscribe', async () => {
+  test('request + snapshot + subscribe (ack-confirmed, buffered events drainable)', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'ateam-sock-'));
     const sockPath = join(dir, 'herdr.sock');
     let eventsSent = 0;
@@ -44,11 +44,16 @@ describe.skipIf(isWin)('HerdrSocketTransport against a local NDJSON server', () 
                 agents: [{ name: 'a', pane_id: 'w1:p', state: 'working' }],
               } })}\n`);
             } else if (doc.method === 'events.subscribe') {
-              socket.write(`${JSON.stringify({ id: doc.id, result: { type: 'subscribed' } })}\n`);
+              // ACK is DELAYED: subscribe() must not resolve before it
               setTimeout(() => {
-                socket.write(`${JSON.stringify({ type: 'pane.closed', pane_id: 'w9:p1' })}\n`);
-                eventsSent += 1;
-              }, 20);
+                socket.write(`${JSON.stringify({ id: doc.id, result: { type: 'subscribed' } })}\n`);
+                // events pushed right after the ack — they must be buffered
+                // and visible via drainPending/iteration (R2-07)
+                setTimeout(() => {
+                  socket.write(`${JSON.stringify({ type: 'pane.closed', pane_id: 'w9:p1' })}\n`);
+                  eventsSent += 1;
+                }, 20);
+              }, 50);
             } else {
               socket.write(`${JSON.stringify({ id: doc.id, result: { type: 'ok' } })}\n`);
             }
@@ -68,13 +73,59 @@ describe.skipIf(isWin)('HerdrSocketTransport against a local NDJSON server', () 
       expect(snap.version).toBe('0.8.0');
       expect(snap.panes).toHaveLength(1);
 
+      const t0 = Date.now();
       const stream = await transport.subscribe();
-      const iterator = stream[Symbol.asyncIterator]();
-      const first = await iterator.next();
-      expect(first.value.type).toBe('pane.closed');
-      expect(first.value.paneId).toBe('w9:p1');
-      stream.close();
+      // the ack was delayed ~50ms — subscribe() waited for it (R2-07)
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(40);
+      // events pushed after the ack are buffered and retrievable without
+      // blocking on the iterator
+      const deadline = Date.now() + 2000;
+      while (eventsSent === 0 && Date.now() < deadline) {
+        await Bun.sleep(10);
+      }
+      const buffered = stream.drainPending!();
       expect(eventsSent).toBe(1);
+      expect(buffered).toHaveLength(1);
+      expect(buffered[0]!.type).toBe('pane.closed');
+      expect(buffered[0]!.paneId).toBe('w9:p1');
+      expect(stream.drainPending!()).toHaveLength(0); // drained
+      stream.close();
+    } finally {
+      server.stop(true);
+    }
+  }, 15_000);
+
+  test('subscribe error response rejects instead of degrading (R2-07)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ateam-sock-err-'));
+    const sockPath = join(dir, 'herdr.sock');
+    const buffers = new Map<unknown, string>();
+    const server = Bun.listen({
+      unix: sockPath,
+      socket: {
+        open() {},
+        data(socket, chunk) {
+          let acc = (buffers.get(socket) ?? '') + chunk.toString('utf8');
+          let idx: number;
+          while ((idx = acc.indexOf('\n')) >= 0) {
+            const line = acc.slice(0, idx);
+            acc = acc.slice(idx + 1);
+            if (!line.trim()) continue;
+            const doc = JSON.parse(line) as { id: string; method: string };
+            if (doc.method === 'events.subscribe') {
+              socket.write(`${JSON.stringify({ id: doc.id, error: { code: 'unsupported', message: 'no events here' } })}\n`);
+            }
+          }
+          buffers.set(socket, acc);
+        },
+        close(socket) {
+          buffers.delete(socket);
+        },
+        error() {},
+      },
+    });
+    try {
+      const transport = new HerdrSocketTransport(sockPath);
+      await expect(transport.subscribe()).rejects.toMatchObject({ code: 'herdr_error' });
     } finally {
       server.stop(true);
     }

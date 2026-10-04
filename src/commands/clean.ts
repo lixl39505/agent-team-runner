@@ -2,6 +2,12 @@
 // reclaimed" resources (audit-driven, retryable), then mark the run
 // abandoned. Holds the runner lease while operating, so it never races a
 // live Runner; safe to run repeatedly.
+//
+// Review 02 R2-03: reclamation REQUIRES a persisted passing final
+// verification — `clean` no longer bypasses it. Unverified integrated tasks
+// are reported and left in place; destroying them anyway is a separate,
+// explicit, audited override (`--discard-work`) that settles them as
+// `discarded`, never `reclaimed`.
 
 import { openDatabase } from '../store/db.ts';
 import { loadHome } from '../config.ts';
@@ -21,6 +27,8 @@ export interface CleanCommandOptions {
   herdrPath?: string;
   /** Test seam: inject a fake runtime client. */
   client?: HerdrRuntimeClient;
+  /** Audited destruction of UNVERIFIED delivery resources (R2-03). */
+  discardWork?: boolean;
 }
 
 export async function cmdClean(opts: CleanCommandOptions): Promise<number> {
@@ -31,7 +39,8 @@ export async function cmdClean(opts: CleanCommandOptions): Promise<number> {
     // single-writer discipline (review 01 #2): clean operates only while
     // holding the runner lease — a live Runner is an explicit refusal, not
     // a silent concurrent reclamation
-    if (!acquireLease(db, run.id)) {
+    const fence = acquireLease(db, run.id);
+    if (!fence) {
       throw new AteamError(`run ${run.id} has a live runner lease; stop the runner before clean`, {
         exitCode: 1,
         remediation: 'use `agent-team status` to find the active runner and wait for it to exit',
@@ -43,11 +52,11 @@ export async function cmdClean(opts: CleanCommandOptions): Promise<number> {
       const tasks = listTasks(db, run.id);
 
       let reclaimed = 0;
+      let discarded = 0;
       for (const task of tasks.filter((t) => t.status === 'integrated')) {
-        // operator finish-up: the run is being abandoned, so reclaiming
-        // without a persisted final verification is an audited override
-        const ok = await cleanupTaskResources(env, task, { allowUnverified: true });
-        if (ok) reclaimed += 1;
+        const outcome = await cleanupTaskResources(env, task, { discardUnverified: opts.discardWork });
+        if (outcome === 'reclaimed') reclaimed += 1;
+        if (outcome === 'discarded') discarded += 1;
       }
 
       if (!['done', 'cancelled', 'abandoned', 'failed'].includes(run.status)) {
@@ -57,13 +66,26 @@ export async function cmdClean(opts: CleanCommandOptions): Promise<number> {
 
       const stillIntegrated = listTasks(db, run.id).filter((t) => t.status === 'integrated').length;
       if (opts.json) {
-        console.log(JSON.stringify({ runId: run.id, reclaimed, stillIntegrated, status: getRun(db, run.id)?.status }));
+        console.log(JSON.stringify({
+          runId: run.id,
+          reclaimed,
+          discarded,
+          stillIntegrated,
+          status: getRun(db, run.id)?.status,
+        }));
       } else {
-        console.log(`clean ${run.id}: reclaimed ${reclaimed} task(s), ${stillIntegrated} still pending, run=${getRun(db, run.id)?.status}`);
+        console.log(
+          `clean ${run.id}: reclaimed ${reclaimed}, discarded ${discarded}, ${stillIntegrated} still pending, run=${getRun(db, run.id)?.status}`,
+        );
+        if (stillIntegrated > 0 && !opts.discardWork) {
+          console.log(
+            'fix: these tasks have no persisted passing final verification, so they are not reclaimable — run the runner / `agent-team reconcile` to finish verification, or re-run with --discard-work to destroy the unverified resources (audited, irreversible)',
+          );
+        }
       }
       return stillIntegrated > 0 ? 1 : 0;
     } finally {
-      releaseLease(db, run.id);
+      releaseLease(db, run.id, fence);
     }
   } finally {
     db.close();

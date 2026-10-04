@@ -81,8 +81,18 @@ export const TASK_STATUSES = [
   'blocked_on_contract',
   'failed',
   'reclaimed',
+  'discarded',
 ] as const;
 export type TaskStatus = (typeof TASK_STATUSES)[number];
+
+/**
+ * Persisted "next dispatch" intent (review 02 R2-02). Consuming a role
+ * result and starting the follow-up (worker retry / review cycle) are two
+ * steps; a crash between them must not strand the task. The intent is
+ * written BEFORE the execution is consumed and cleared once the dispatch
+ * is on the ledger, so recovery replays it from the task row alone.
+ */
+export type PendingDispatch = 'review' | 'worker_retry';
 
 export const EXECUTION_STATUSES = [
   'starting',
@@ -154,6 +164,9 @@ export interface TaskRecord {
   lastError: string | null;
   contractBlock: unknown | null;
   review: unknown | null;
+  /** Pending follow-up dispatch (R2-02): set before the follow-up starts,
+   * cleared once the execution is on the ledger. */
+  pendingDispatch: PendingDispatch | null;
   createdAt: string;
   updatedAt: string;
   finishedAt: string | null;

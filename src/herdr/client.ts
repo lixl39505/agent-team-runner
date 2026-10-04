@@ -42,6 +42,15 @@ export interface PromptAgentInput {
   wait: boolean;
   until: Array<'idle' | 'done' | 'blocked'>;
   timeoutMs: number;
+  /**
+   * Idempotency key for THIS prompt (review 02 R2-10): the runtime MUST
+   * dedupe repeated sends under one requestId, so a crash-recovery resend
+   * after an uncertain delivery never double-injects. The runner always
+   * passes the execution's persisted prompt digest. Transports without
+   * request-id support must refuse deliveries whose recovery would depend
+   * on it, not silently resend.
+   */
+  requestId?: string;
 }
 
 export interface ReadPaneInput {

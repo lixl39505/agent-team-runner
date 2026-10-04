@@ -2,6 +2,7 @@
 // anchored to an explicit repo/worktree path — never to process cwd.
 
 import { runArgv, type CommandResult } from './shell.ts';
+import { matchAny, ATEAM_INTERNAL_PATTERNS } from './path-policy.ts';
 
 async function git(repoRoot: string, args: string[], timeoutMs = 60_000): Promise<CommandResult> {
   return runArgv(['git', '-C', repoRoot, ...args], { timeoutMs });
@@ -44,9 +45,12 @@ export async function changedFiles(repoRoot: string, fromSha: string, toSha = 'H
 }
 
 /**
- * Worktree-level change set vs a base sha: committed diffs PLUS staged/
- * modified/untracked files (workers edit without committing — the runner
- * commits only after verification passes).
+ * Worktree-level DELIVERY change set vs a base sha: committed diffs PLUS
+ * staged/modified/untracked files (workers edit without committing — the
+ * runner commits only after verification passes). Runner-internal
+ * `.ateam/**` bookkeeping is excluded (review 02 R2-01): the brief is an
+ * untracked internal file, and counting it made "no delivery changes"
+ * look like a valid delivery.
  */
 export async function worktreeChangedFiles(repoRoot: string, fromSha: string): Promise<string[]> {
   const status = await gitRaw(repoRoot, ['status', '--porcelain', '-uall']);
@@ -62,7 +66,7 @@ export async function worktreeChangedFiles(repoRoot: string, fromSha: string): P
     const t = line.trim();
     if (t) files.add(t);
   }
-  return [...files];
+  return [...files].filter((f) => !matchAny(ATEAM_INTERNAL_PATTERNS, f));
 }
 
 export async function diffStat(repoRoot: string, fromSha: string, toSha = 'HEAD'): Promise<string> {
@@ -103,9 +107,17 @@ export async function squashSince(repoRoot: string, baseSha: string, message: st
   return commit(repoRoot, message);
 }
 
+/**
+ * Pure index query (review 02 R2-01): `status --porcelain` also lists
+ * unstaged and untracked paths, so runner-internal `.ateam` churn made an
+ * EMPTY index look staged and derailed the crash-replay commit decision.
+ * `diff --cached --quiet` exits 1 iff the index differs from HEAD.
+ */
 export async function hasStagedChanges(repoRoot: string): Promise<boolean> {
-  const out = await gitOk(repoRoot, ['status', '--porcelain']);
-  return out.length > 0;
+  const res = await git(repoRoot, ['diff', '--cached', '--quiet']);
+  if (res.exitCode === 0) return false;
+  if (res.exitCode === 1) return true;
+  throw new Error(`git diff --cached --quiet failed (${res.exitCode}): ${res.stderr.trim() || res.stdout.trim()}`);
 }
 
 export interface CherryPickResult {

@@ -171,6 +171,9 @@ export async function startExecution(env: RunnerEnv, input: StartExecutionInput)
   if (prompt.length > MAX_PROMPT_CHARS) {
     throw new Error(`prompt for ${executionId} exceeds ${MAX_PROMPT_CHARS} chars — brief overflow`);
   }
+  // the digest is persisted BEFORE dispatch and doubles as the prompt
+  // requestId, so a crash-recovery resend cannot double-inject (R2-10)
+  const promptDigest = sha256Hex(prompt);
   insertExecution(env.db, {
     id: executionId,
     runId: env.runId,
@@ -183,7 +186,7 @@ export async function startExecution(env: RunnerEnv, input: StartExecutionInput)
     model: input.entry.model ?? null,
     status: 'starting',
     promptSentAt: null,
-    promptDigest: sha256Hex(prompt),
+    promptDigest,
     resultPath,
     nativeSessionRef: null,
     paneId: null,
@@ -208,7 +211,7 @@ export async function startExecution(env: RunnerEnv, input: StartExecutionInput)
     args: agentStartArgs(input.entry),
   });
 
-  await env.client.promptAgent({ target: name, text: prompt, wait: false, until: [], timeoutMs: 5000 });
+  await env.client.promptAgent({ target: name, text: prompt, wait: false, until: [], timeoutMs: 5000, requestId: promptDigest });
   updateExecution(env.db, executionId, { promptSentAt: nowIso(), status: 'running' });
   addEvent(env.db, env.runId, 'EXECUTION_PROMPTED', {
     taskId: task.taskId,

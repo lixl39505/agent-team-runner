@@ -68,7 +68,7 @@ function usage(): string {
     '  agent-team attach RUN_ID TASK_ID',
     '  agent-team contract (validate --contract PATH | revise --run-id ID --contract PATH)',
     '  agent-team reconcile [--run-id ID] [--dry-run]   (M5)',
-    '  agent-team clean RUN_ID                          (M4)',
+    '  agent-team clean RUN_ID [--discard-work]        (M4)',
     '',
     'Global flags: --home PATH (default ~/.agent-team), --json',
   ].join('\n');
@@ -219,7 +219,7 @@ async function main(argv: readonly string[]): Promise<number> {
         console.error('clean requires RUN_ID');
         return 1;
       }
-      return await cmdClean({ runId, home: globals.home, json: globals.json });
+      return await cmdClean({ runId, home: globals.home, json: globals.json, discardWork: flags['discard-work'] === true });
     }
 
     case 'reconcile': {
