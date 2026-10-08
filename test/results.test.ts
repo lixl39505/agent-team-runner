@@ -127,6 +127,16 @@ describe('result files', () => {
   test('missing file returns null (not a commit point)', async () => {
     expect(await readResultFile(join(home, 'nope.json'))).toBeNull();
   });
+
+  test('unreadable or unparseable result paths are "no result yet" — never a runner crash', async () => {
+    const { mkdir, writeFile } = await import('node:fs/promises');
+    // a DIRECTORY at the result path (real-e2e sabotage) → EISDIR, not ENOENT
+    await mkdir(join(home, 'occupied.json'), { recursive: true });
+    expect(await readResultFile(join(home, 'occupied.json'))).toBeNull();
+    // garbage bytes: unparseable → the schema gate never fires; agent rewrites
+    await writeFile(join(home, 'garbage.json'), 'definitely not json', 'utf8');
+    expect(await readResultFile(join(home, 'garbage.json'))).toBeNull();
+  });
 });
 
 describe('prompts', () => {

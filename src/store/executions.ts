@@ -19,6 +19,7 @@ interface ExecutionRow {
   status: string;
   prompt_sent_at: string | null;
   prompt_digest: string | null;
+  start_failed: number;
   result_path: string | null;
   result_digest: string | null;
   result_applied_digest: string | null;
@@ -49,6 +50,7 @@ function toRecord(row: ExecutionRow): ExecutionRecord {
     status: row.status as ExecutionStatus,
     promptSentAt: row.prompt_sent_at,
     promptDigest: row.prompt_digest,
+    startFailed: row.start_failed === 1,
     resultPath: row.result_path,
     resultDigest: row.result_digest,
     resultAppliedDigest: row.result_applied_digest,
@@ -66,8 +68,8 @@ function toRecord(row: ExecutionRow): ExecutionRecord {
   };
 }
 
-export type NewExecution = Omit<ExecutionRecord, 'updatedAt' | 'resultDigest' | 'resultAppliedDigest' | 'result' | 'resultReceivedAt'> &
-  Partial<Pick<ExecutionRecord, 'resultDigest' | 'resultAppliedDigest' | 'result' | 'resultReceivedAt'>>;
+export type NewExecution = Omit<ExecutionRecord, 'updatedAt' | 'resultDigest' | 'resultAppliedDigest' | 'result' | 'resultReceivedAt' | 'startFailed'> &
+  Partial<Pick<ExecutionRecord, 'resultDigest' | 'resultAppliedDigest' | 'result' | 'resultReceivedAt' | 'startFailed'>>;
 
 export function insertExecution(db: SqliteDb, record: NewExecution): ExecutionRecord {
   const updatedAt = nowIso();
@@ -82,6 +84,7 @@ export function insertExecution(db: SqliteDb, record: NewExecution): ExecutionRe
   );
   return {
     ...record,
+    startFailed: record.startFailed ?? false,
     resultDigest: record.resultDigest ?? null,
     resultAppliedDigest: record.resultAppliedDigest ?? null,
     result: record.result ?? null,
@@ -123,6 +126,7 @@ export interface ExecutionPatch {
   status?: ExecutionStatus;
   promptSentAt?: string | null;
   promptDigest?: string | null;
+  startFailed?: boolean;
   resultPath?: string | null;
   resultDigest?: string | null;
   resultAppliedDigest?: string | null;
@@ -146,6 +150,7 @@ export function updateExecution(db: SqliteDb, executionId: string, patch: Execut
   if (patch.status !== undefined) push('status', patch.status);
   if (patch.promptSentAt !== undefined) push('prompt_sent_at', patch.promptSentAt);
   if (patch.promptDigest !== undefined) push('prompt_digest', patch.promptDigest);
+  if (patch.startFailed !== undefined) push('start_failed', patch.startFailed ? 1 : 0);
   if (patch.resultPath !== undefined) push('result_path', patch.resultPath);
   if (patch.resultDigest !== undefined) push('result_digest', patch.resultDigest);
   if (patch.resultAppliedDigest !== undefined) push('result_applied_digest', patch.resultAppliedDigest);

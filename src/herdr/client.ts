@@ -43,12 +43,13 @@ export interface PromptAgentInput {
   until: Array<'idle' | 'done' | 'blocked'>;
   timeoutMs: number;
   /**
-   * Idempotency key for THIS prompt (review 02 R2-10): the runtime MUST
-   * dedupe repeated sends under one requestId, so a crash-recovery resend
-   * after an uncertain delivery never double-injects. The runner always
-   * passes the execution's persisted prompt digest. Transports without
-   * request-id support must refuse deliveries whose recovery would depend
-   * on it, not silently resend.
+   * Idempotency key for THIS prompt (review 02 R2-10): a runtime that
+   * supports dedupe (`supportsPromptDedup()`) MUST collapse repeated sends
+   * under one requestId, so a crash-recovery resend after an uncertain
+   * delivery never double-injects. The runner always passes the execution's
+   * persisted prompt digest. On runtimes where this is unsupported the
+   * runner must never rely on it: a resume whose delivery is uncertain is
+   * escalated for manual confirmation instead of re-sent (R3-01).
    */
   requestId?: string;
 }
@@ -73,6 +74,12 @@ export interface HerdrRuntimeClient {
 
   startAgent(input: StartAgentInput): Promise<AgentRecord>;
   promptAgent(input: PromptAgentInput): Promise<AgentWaitResult>;
+  /**
+   * Whether THIS client dedupes promptAgent by requestId (R2-10/R3-01).
+   * Only a yes makes crash-recovery re-sends safe; a no obligates the
+   * runner to escalate an uncertain resume instead of re-prompting.
+   */
+  supportsPromptDedup(): boolean;
   waitAgent(input: { target: string; until: Array<'done' | 'blocked'>; timeoutMs?: number }): Promise<AgentWaitResult>;
   getAgent(target: string): Promise<AgentRecord | null>;
   readPane(input: ReadPaneInput): Promise<string>;
@@ -86,6 +93,9 @@ export interface HerdrRuntimeClient {
   }): Promise<void>;
 
   snapshot(): Promise<HerdrSessionSnapshot>;
-  /** Long-lived event stream; CLI-only transports throw unsupported_transport. */
-  subscribe(filter?: { paneId?: string }): Promise<HerdrEventStream>;
+  /** Long-lived event stream; CLI-only transports throw unsupported_transport.
+   * herdr 0.9.x only admits PANE-SCOPED subscriptions: pass the pane ids the
+   * caller actually tracks (an empty set means there is nothing to observe —
+   * callers skip subscribing instead of degrading to snapshot-only). */
+  subscribe(filter?: { paneId?: string; paneIds?: string[] }): Promise<HerdrEventStream>;
 }

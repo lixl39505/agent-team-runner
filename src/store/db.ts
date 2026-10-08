@@ -174,6 +174,49 @@ const MIGRATIONS: string[] = [
   ALTER TABLE runner_leases ADD COLUMN fence TEXT;
   ALTER TABLE tasks ADD COLUMN pending_dispatch TEXT;
   `,
+  // v4 — review 03 R3-02/R3-03: the ACCEPTED (effective) contract revision
+  // is separated from the latest SUBMITTED one. A rejected revision — moved
+  // project binding, post-verification task-set change — stays a mere
+  // candidate: no fresh Runner, clean or reconcile may read it as the
+  // authoritative contract.
+  `
+  ALTER TABLE runs ADD COLUMN accepted_revision INTEGER NOT NULL DEFAULT 1;
+  `,
+  // v5 — real-Herdr e2e (2026-10-08): herdr REJECTS `agent start` immediately
+  // when the agent enters native UI during startup (folder trust, first-run
+  // dialogs). The runner must survive that and resume dispatch once the pane
+  // is resolved; start_failed marks "start never completed, prompt was
+  // definitively NEVER sent" so the resume path may re-dispatch safely.
+  `
+  ALTER TABLE executions ADD COLUMN start_failed INTEGER NOT NULL DEFAULT 0;
+  `,
+  // v6 — real-Herdr e2e: herdr REUSES small workspace/pane ids after a server
+  // restart, so a global UNIQUE(kind, herdr_id) made a new run's resource
+  // rows silently collide with an old run's ledger (INSERT DO NOTHING ate
+  // them and the run could not find its own root pane). Uniqueness moves to
+  // (run_id, kind, herdr_id); rebuild required — SQLite cannot alter a
+  // constraint in place.
+  `
+  CREATE TABLE herdr_resources_v6 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    task_id TEXT,
+    execution_id TEXT,
+    kind TEXT NOT NULL,
+    herdr_id TEXT NOT NULL,
+    branch TEXT,
+    path TEXT,
+    provenance INTEGER NOT NULL DEFAULT 1,
+    state TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL,
+    reclaimed_at TEXT,
+    UNIQUE (run_id, kind, herdr_id)
+  ) STRICT;
+  INSERT INTO herdr_resources_v6 SELECT * FROM herdr_resources;
+  DROP TABLE herdr_resources;
+  ALTER TABLE herdr_resources_v6 RENAME TO herdr_resources;
+  CREATE INDEX idx_res_run ON herdr_resources(run_id, kind, state);
+  `,
 ];
 
 export function openDatabase(path: string): SqliteDb {

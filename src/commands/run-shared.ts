@@ -1,7 +1,7 @@
 // Shared wiring for run-oriented commands.
 
 import type { SqliteDb } from '../store/db.ts';
-import { insertRun, getRun } from '../store/runs.ts';
+import { insertRun, getRun, getContractRevisionAt } from '../store/runs.ts';
 import { insertTask } from '../store/tasks.ts';
 import { addEvent } from '../store/events.ts';
 import { newRunId } from '../store/ids.ts';
@@ -135,16 +135,15 @@ export async function createRunRecord(
   return run;
 }
 
+/** The env's contract is the ACCEPTED revision (R3-02/R3-03) — the latest
+ * SUBMITTED revision may be a rejected candidate (moved project binding,
+ * post-verification task-set change), and a fresh Runner, clean or reconcile
+ * reading it would schedule against, or clean in, a repo the run never
+ * delivered to. */
 export function buildRunnerEnv(home: AteamHome, db: SqliteDb, client: HerdrRuntimeClient, run: RunRecord): RunnerEnv {
-  const contract = getRunContract(db, run.id);
+  const contract = getContractRevisionAt(db, run.id, run.acceptedRevision);
+  if (!contract) throw new AteamError(`run ${run.id} has no accepted contract revision ${run.acceptedRevision}`);
   return { home, db, client, config: home.config, runId: run.id, contract };
-}
-
-import { getContractRevision } from '../store/runs.ts';
-function getRunContract(db: SqliteDb, runId: string): ExecutionContract {
-  const contract = getContractRevision(db, runId);
-  if (!contract) throw new AteamError(`run ${runId} has no contract revision`);
-  return contract;
 }
 
 export function getRunOrThrow(db: SqliteDb, runId: string): RunRecord {

@@ -6,7 +6,7 @@
 import { afterAll, describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
 import { openDatabase, type SqliteDb } from '../src/store/db.ts';
-import { insertRun, getRun, appendContractRevision } from '../src/store/runs.ts';
+import { insertRun, getRun, appendContractRevision, listRuns } from '../src/store/runs.ts';
 import { insertTask, listTasks, getTask } from '../src/store/tasks.ts';
 import { listExecutions } from '../src/store/executions.ts';
 import { validateContract } from '../src/core/contract.ts';
@@ -15,10 +15,11 @@ import { FakeHerdrClient } from '../src/herdr/fake-client.ts';
 import type { FakeAgentScript } from '../src/herdr/fake-client.ts';
 import type { HerdrRuntimeClient } from '../src/herdr/client.ts';
 import type { HerdrEvent, HerdrEventStream } from '../src/herdr/types.ts';
+import { HerdrError } from '../src/herdr/types.ts';
 import { agentName } from '../src/store/ids.ts';
 import { DEFAULT_CONFIG, type AteamConfig } from '../src/config.ts';
 import type { ExecutionContract } from '../src/core/types.ts';
-import { acquireLease } from '../src/store/lease.ts';
+import { acquireLease, heartbeat, releaseLease } from '../src/store/lease.ts';
 import { cleanupTempDir, initRepo, makeTempDir, minimalContract } from './helpers.ts';
 
 const RUN = 'r-20261003-run001';
@@ -373,6 +374,8 @@ describe('RunnerEngine — full delivery chain', () => {
     expect(engine.env.contract.tasks.map((t) => t.id).sort()).toEqual(['API', 'EXTRA']);
     expect(engine.env.contract).toEqual(contractV2);
     expect(getRun(fx.db, RUN)!.revisionPending).toBe(false);
+    // R3-02/R3-03: an APPLIED revision is the accepted one
+    expect(getRun(fx.db, RUN)!.acceptedRevision).toBe(2);
   }, 60_000);
 
   test('incompatible revision (removes an executed task) is refused and stays pending', async () => {
@@ -494,7 +497,7 @@ describe('RunnerEngine — full delivery chain', () => {
     const { insertResource } = await import('../src/store/resources.ts');
     insertResource(fx.db, { runId: RUN, taskId: 'API', kind: 'workspace', herdrId: ws.workspace.workspaceId, branch: ws.worktree.branch, path: ws.worktree.path });
     const { insertVerification } = await import('../src/store/verifications.ts');
-    insertVerification(fx.db, { runId: RUN, kind: 'final', ok: true, detail: { headSha: 'i1' } });
+    insertVerification(fx.db, { runId: RUN, kind: 'final', ok: true, detail: { contractRevision: 1, headSha: 'i1', integratedCommits: { API: 'i1' } } });
     fx.db.run("UPDATE runs SET status='needs_attention', final_verified=1 WHERE id = ?", [RUN]);
 
     const { cmdClean } = await import('../src/commands/clean.ts');
@@ -526,6 +529,10 @@ describe('RunnerEngine — full delivery chain', () => {
     // default: resources untouched, exit 1 reports the deferral
     expect(await cmdClean({ runId: RUN, home: fx.home, json: true, client: fx.fake })).toBe(1);
     expect(getTask(fx.db, RUN, 'API')!.status).toBe('integrated');
+    // R3-08: the run is NOT terminated — it stays visible to the default
+    // startup/reconcile path that re-runs the final verification
+    expect(TERMINALS).not.toContain(getRun(fx.db, RUN)!.status);
+    expect(listRuns(fx.db, { nonTerminalOnly: true }).map((r) => r.id)).toContain(RUN);
     expect((await fx.fake.snapshot()).workspaces.some((w) => w.workspaceId === ws.workspace.workspaceId)).toBe(true);
     const { branchExists } = await import('../src/core/git.ts');
     expect(await branchExists(fx.repoRoot, `ateam/${RUN}/task/API`)).toBe(true);
@@ -543,7 +550,7 @@ describe('RunnerEngine — full delivery chain', () => {
     // a branch whose name does NOT carry this run's provenance prefix must
     // never be a delete candidate, even if a corrupted ledger points at it
     const { insertVerification } = await import('../src/store/verifications.ts');
-    insertVerification(fx.db, { runId: RUN, kind: 'final', ok: true, detail: {} });
+    insertVerification(fx.db, { runId: RUN, kind: 'final', ok: true, detail: { contractRevision: 1, integratedCommits: { API: 'i1' } } });
     fx.db.run("UPDATE runs SET final_verified=1 WHERE id=?", [RUN]);
     await fx.fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: 'users/someone/feature' });
     fx.db.run(
@@ -608,7 +615,7 @@ describe('RunnerEngine — full delivery chain', () => {
     );
     fx.db.run('UPDATE runs SET final_verified=1 WHERE id=?', [RUN]);
     const { insertVerification } = await import('../src/store/verifications.ts');
-    insertVerification(fx.db, { runId: RUN, kind: 'final', ok: true, detail: {} });
+    insertVerification(fx.db, { runId: RUN, kind: 'final', ok: true, detail: { contractRevision: 1, integratedCommits: { API: 'i1' } } });
 
     const { cleanupTaskResources } = await import('../src/runner/cleanup.ts');
     const outcome = await cleanupTaskResources(envFor(fx), getTask(fx.db, RUN, 'API')!);
@@ -951,6 +958,214 @@ describe('RunnerEngine — full delivery chain', () => {
     expect(fx.fake.promptCount(wName('API'))).toBe(1);
   }, 30_000);
 
+  test('R3-01: a runtime WITHOUT prompt dedupe escalates an uncertain resume instead of re-sending', async () => {
+    const fx = track(await makeFixture({
+      // never finishes → no result file can exist, so the resume stays uncertain
+      [wName('API')]: { kind: 'claude', sequence: ['working'], stepMs: 5 },
+    }));
+    fx.fake.supportsPromptDedup = () => false; // CLI-like transport: no request-id flag
+    seedRun(fx);
+    fx.db.run("UPDATE tasks SET status='running', attempts=1 WHERE run_id=? AND task_id='API'", [RUN]);
+    const { startExecution } = await import('../src/runner/executions.ts');
+    await startExecution(envFor(fx), { role: 'worker', task: getTask(fx.db, RUN, 'API')!, attemptNo: 1, cycleNo: 0, entry: { kind: 'claude' } });
+    const exec = listExecutions(fx.db, RUN).find((e) => e.agentName === wName('API'))!;
+    // crash window: the prompt MAY have landed; prompt_sent_at was lost
+    fx.db.run("UPDATE executions SET status='starting', prompt_sent_at=NULL WHERE id=?", [exec.id]);
+
+    const engine = engineFor(fx);
+    await engine.tickOnce();
+
+    // no second promptAgent call reached THIS agent, and the execution is
+    // parked for manual confirmation — not re-prompted on a guess
+    const promptsFor = (agent: string): number =>
+      fx.fake.calls.filter((c) => c.method === 'promptAgent' && (c.args as { target: string }).target === agent).length;
+    expect(promptsFor(wName('API'))).toBe(1);
+    const resumed = listExecutions(fx.db, RUN).find((e) => e.id === exec.id)!;
+    expect(resumed.promptSentAt).toBeNull();
+    expect(resumed.status).toBe('starting');
+    expect(getRun(fx.db, RUN)!.status).toBe('needs_attention');
+    expect(getRun(fx.db, RUN)!.error).toContain('no request-id dedupe');
+  }, 30_000);
+
+  test('R3-01: a persisted result proves prompt delivery — resume marks it sent and never re-prompts', async () => {
+    const fx = track(await makeFixture(happyScripts()));
+    seedRun(fx);
+    fx.db.run("UPDATE tasks SET status='running', attempts=1 WHERE run_id=? AND task_id='API'", [RUN]);
+    const { startExecution } = await import('../src/runner/executions.ts');
+    await startExecution(envFor(fx), { role: 'worker', task: getTask(fx.db, RUN, 'API')!, attemptNo: 1, cycleNo: 0, entry: { kind: 'claude' } });
+    const exec = listExecutions(fx.db, RUN).find((e) => e.agentName === wName('API'))!;
+    // the agent finished and wrote its result, but the runner died before
+    // persisting prompt_sent_at
+    for (let i = 0; i < 200 && !exec.resultPath; i++) await Bun.sleep(5);
+    expect(exec.resultPath).toBeTruthy();
+    let resultExists = false;
+    for (let i = 0; i < 200 && !resultExists; i++) {
+      resultExists = await (await import('../src/results/files.ts')).readResultFile(exec.resultPath!).then((r) => !!r);
+      await Bun.sleep(5);
+    }
+    expect(resultExists).toBe(true);
+    fx.db.run("UPDATE executions SET status='starting', prompt_sent_at=NULL WHERE id=?", [exec.id]);
+
+    // even a NO-dedupe transport is safe here: the result file is delivery evidence
+    fx.fake.supportsPromptDedup = () => false;
+    const engine = engineFor(fx);
+    await engine.tickOnce();
+    const resumed = listExecutions(fx.db, RUN).find((e) => e.id === exec.id)!;
+    expect(resumed.promptSentAt).not.toBeNull();
+    // never re-sent to THIS agent
+    expect(fx.fake.calls.filter((c) => c.method === 'promptAgent' && (c.args as { target: string }).target === wName('API'))).toHaveLength(1);
+
+    await tickUntil(engine, fx, () => TERMINALS.includes(getRun(fx.db, RUN)!.status));
+    expect(getRun(fx.db, RUN)!.status).toBe('done');
+    expect(fx.fake.promptCount(wName('API'))).toBe(1);
+  }, 30_000);
+
+  test('R3-05: a close event arriving after the snapshot removes the pane from the alive set', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    fx.db.run("UPDATE tasks SET status='running', attempts=1 WHERE run_id=? AND task_id='API'", [RUN]);
+    const { startExecution } = await import('../src/runner/executions.ts');
+    await startExecution(envFor(fx), { role: 'worker', task: getTask(fx.db, RUN, 'API')!, attemptNo: 1, cycleNo: 0, entry: { kind: 'claude' } });
+    const exec = listExecutions(fx.db, RUN).find((e) => e.agentName === wName('API'))!;
+    const snap = await fx.fake.snapshot();
+    expect(snap.panes.some((p) => p.paneId === exec.paneId)).toBe(true); // snapshot STILL shows it
+
+    // the subscription buffered a close for that pane AFTER the snapshot:
+    // arrival order decides — the pane must judge as gone, not alive
+    const streamWith = (...events: HerdrEvent[]): HerdrEventStream => {
+      let drained = false;
+      return {
+        async *[Symbol.asyncIterator]() { /* never yields */ },
+        close(): void {},
+        drainPending(): HerdrEvent[] {
+          if (drained) return [];
+          drained = true;
+          return events;
+        },
+      };
+    };
+    const env = { ...envFor(fx) };
+    const liveAgent = { name: exec.agentName, paneId: exec.paneId!, state: 'idle' as const };
+    const engine = new RunnerEngine({
+      ...env,
+      client: stubClient({
+        subscribe: () => Promise.resolve(streamWith({ type: 'pane.closed', paneId: exec.paneId! })),
+        snapshot: () => Promise.resolve(snap),
+        getAgent: () => Promise.resolve(liveAgent),
+      }),
+    }, { tickMs: 5 });
+    const decisions = await engine.reconcileOnce({ dryRun: true });
+    const judged = decisions.find((d) => d.executionId === exec.id);
+    expect(judged?.kind).toBe('pane_lost_new_attempt'); // NOT 'result_recovered / pane alive'
+
+    // a later pane event re-adds liveness: closed → updated is alive again
+    const engine2 = new RunnerEngine({
+      ...env,
+      client: stubClient({
+        subscribe: () => Promise.resolve(streamWith({ type: 'pane.closed', paneId: exec.paneId! }, { type: 'pane.updated', paneId: exec.paneId! })),
+        snapshot: () => Promise.resolve(snap),
+        getAgent: () => Promise.resolve(liveAgent),
+      }),
+    }, { tickMs: 5 });
+    const decisions2 = await engine2.reconcileOnce({ dryRun: true });
+    const judged2 = decisions2.find((d) => d.executionId === exec.id);
+    expect(judged2?.kind).toBe('result_recovered');
+    expect(judged2?.detail).toContain('pane alive');
+  }, 30_000);
+
+  test('R3-e2e: herdr restores empty panes after a restart — pane alive but agent gone judges pane_lost', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    fx.db.run("UPDATE tasks SET status='running', attempts=1 WHERE run_id=? AND task_id='API'", [RUN]);
+    const { startExecution } = await import('../src/runner/executions.ts');
+    await startExecution(envFor(fx), { role: 'worker', task: getTask(fx.db, RUN, 'API')!, attemptNo: 1, cycleNo: 0, entry: { kind: 'claude' } });
+    const exec = listExecutions(fx.db, RUN).find((e) => e.agentName === wName('API'))!;
+    const snap = await fx.fake.snapshot(); // pane alive in the snapshot…
+    const env = { ...envFor(fx) };
+
+    // …but the agent process is definitively gone (herdr not_found → null):
+    // the same pane_lost judgment as a vanished pane — never a prompt guess
+    const engine = new RunnerEngine({
+      ...env,
+      client: stubClient({
+        subscribe: () => Promise.resolve(emptyStream()),
+        snapshot: () => Promise.resolve(snap),
+        getAgent: () => Promise.resolve(null),
+      }),
+    }, { tickMs: 5 });
+    const decisions = await engine.reconcileOnce({ dryRun: true });
+    const judged = decisions.find((d) => d.executionId === exec.id);
+    expect(judged?.kind).toBe('pane_lost_new_attempt');
+    expect(judged?.detail).toContain('agent');
+
+    // an observability ERROR (not definitive absence) defers the judgment
+    const engine2 = new RunnerEngine({
+      ...env,
+      client: stubClient({
+        subscribe: () => Promise.resolve(emptyStream()),
+        snapshot: () => Promise.resolve(snap),
+        getAgent: () => Promise.reject(new Error('transport hiccup')),
+      }),
+    }, { tickMs: 5 });
+    const decisions2 = await engine2.reconcileOnce({ dryRun: true });
+    const judged2 = decisions2.find((d) => d.executionId === exec.id);
+    expect(judged2?.kind).toBe('snapshot_unavailable');
+    expect(judged2?.detail).toContain('unobservable');
+  }, 30_000);
+
+  test('R3-06: a live lease refuses a second fence even inside the same process', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    const first = acquireLease(fx.db, RUN);
+    expect(first).not.toBeNull();
+    // same holder string (same PID@host), same process: still refused — a
+    // second engine must never write alongside the first (R3-06)
+    expect(acquireLease(fx.db, RUN)).toBeNull();
+    // the holder renews via heartbeat, not by re-acquiring
+    expect(heartbeat(fx.db, RUN, first)).toBe(true);
+    expect(acquireLease(fx.db, RUN)).toBeNull();
+    // release frees the run for the next acquirer
+    releaseLease(fx.db, RUN, first);
+    expect(acquireLease(fx.db, RUN)).not.toBeNull();
+  });
+
+  test('herdr blocked-at-startup rejection: start_failed marks the dispatch safe and the run resumes it', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    fx.db.run("UPDATE tasks SET status='running', attempts=1 WHERE run_id=? AND task_id='API'", [RUN]);
+    // wrap the fake with herdr 0.9.x startup semantics: the FIRST agent start
+    // is rejected instantly (agent entered native UI during startup)
+    let startCalls = 0;
+    let promptCalls = 0;
+    const client = Object.create(fx.fake) as typeof fx.fake;
+    client.startAgent = async (input) => {
+      startCalls += 1;
+      if (startCalls === 1) throw new HerdrError('herdr_error', 'agent is blocked during startup and is not ready for prompts');
+      return { name: input.name, paneId: input.paneId, state: 'idle' as const };
+    };
+    client.getAgent = async () => ({ name: wName('API'), paneId: 'w0:px', state: 'idle' as const });
+    client.promptAgent = (async (input: { target: string }) => {
+      promptCalls += 1;
+      return { paneId: 'w0:px', state: 'working' as const, target: input.target };
+    }) as typeof client.promptAgent;
+
+    const env = { ...envFor(fx), client };
+    const engine = new RunnerEngine(env, { tickMs: 5 });
+    await engine.tickOnce(); // scheduleReady → start rejected → marked, run alive
+    expect(getRun(fx.db, RUN)!.status).toBe('needs_attention');
+    let exec = listExecutions(fx.db, RUN).find((e) => e.role === 'worker')!;
+    expect(exec.startFailed).toBe(true);
+    expect(exec.promptSentAt).toBeNull();
+
+    // the operator resolved the pane; the next tick re-dispatches EXACTLY once
+    await engine.tickOnce();
+    exec = listExecutions(fx.db, RUN).find((e) => e.role === 'worker')!;
+    expect(exec.startFailed).toBe(false);
+    expect(exec.promptSentAt).not.toBeNull();
+    expect(promptCalls).toBe(1);
+    expect(startCalls).toBe(1); // the living agent was NOT restarted
+  });
+
   test('R2-11: a failed worker result retains the pane and re-dispatches into a fresh pane', async () => {
     const fx = track(await makeFixture({
       ...happyScripts(),
@@ -972,6 +1187,30 @@ describe('RunnerEngine — full delivery chain', () => {
 
     await tickUntil(engine, fx, () => TERMINALS.includes(getRun(fx.db, RUN)!.status));
     expect(getRun(fx.db, RUN)!.status).toBe('done');
+  }, 60_000);
+
+  test('R3-07: cleanup never marks a retained failure pane closed_success — it retires as gone', async () => {
+    const fx = track(await makeFixture({
+      ...happyScripts(),
+      [wName('API')]: workerScript(['src/api/x.ts', 'x'], {
+        status: 'failed', summary: 'could not implement', blockedReason: 'implementation failed', testsRun: [], knownRisks: [], changedPaths: [],
+      }),
+      [wName('API', 2)]: workerScript(['src/api/x.ts', 'export const a = 1;\n'], workerOk('src/api/x.ts', 'export const a = 1;\n', 'a2 ok')),
+      [vName('API')]: reviewerScript(approvedReview(['src/api/x.ts'])),
+    }, { defaults: { maxParallel: 1 } }));
+    seedRun(fx);
+    const engine = engineFor(fx);
+    await tickUntil(engine, fx, () => TERMINALS.includes(getRun(fx.db, RUN)!.status));
+    expect(getRun(fx.db, RUN)!.status).toBe('done'); // full reclamation ran
+
+    const failed = listExecutions(fx.db, RUN).find((e) => e.agentName === wName('API'))!;
+    // the failure record survives the sweep honestly: retired with the
+    // removed workspace as `gone`, never rewritten to closed_success
+    expect(failed.paneState).toBe('gone');
+    const retried = listExecutions(fx.db, RUN).find((e) => e.agentName === wName('API', 2))!;
+    expect(retried.paneState).toBe('closed_success');
+    const reviewer = listExecutions(fx.db, RUN).find((e) => e.agentName === vName('API'))!;
+    expect(reviewer.paneState).toBe('closed_success');
   }, 60_000);
 
   test('R2-02: crash after a result was consumed but before the review dispatch replays from pending_dispatch', async () => {
@@ -1095,6 +1334,137 @@ describe('RunnerEngine — full delivery chain', () => {
     expect(getRun(fx.db, RUN)!.revisionPending).toBe(true);
     expect(getRun(fx.db, RUN)!.error).toContain('project binding');
     expect(engine.env.contract).not.toEqual(moved);
+  }, 60_000);
+
+  test('R3-02: a rejected binding revision never becomes the contract a fresh process reads', async () => {
+    const fx = track(await makeFixture(happyScripts()));
+    seedRun(fx);
+    const engine = engineFor(fx);
+    await tickUntil(engine, fx, () => getTask(fx.db, RUN, 'API')!.status === 'reviewing');
+
+    const moved = validateContract(minimalContract({
+      project: { id: 'demo', repoRoot: '/elsewhere/repo', baseRef: 'main' },
+      tasks: [
+        { id: 'API', title: 'api', allowedPaths: ['src/api/**'] },
+        { id: 'WEB', title: 'web', allowedPaths: ['src/web/**'] },
+        { id: 'DOCS', title: 'docs', allowedPaths: ['docs/**'], dependsOn: ['API'] },
+      ],
+    }));
+    appendContractRevision(fx.db, RUN, moved);
+    await engine.tickOnce();
+    expect(getRun(fx.db, RUN)!.acceptedRevision).toBe(1); // refusal keeps the accepted pointer
+
+    // a FRESH process (run --run-id / clean / reconcile) builds its env from
+    // the run row — the accepted revision, never the rejected candidate
+    const { buildRunnerEnv } = await import('../src/commands/run-shared.ts');
+    const home = { root: fx.home, dbPath: join(fx.home, 'state.sqlite'), runsDir: join(fx.home, 'runs'), config: fx.config };
+    const env = buildRunnerEnv(home as never, fx.db, fx.fake, getRun(fx.db, RUN)!);
+    expect(env.contract).not.toEqual(moved);
+    expect(env.contract.project.repoRoot).toBe(fx.repoRoot); // the immutable run binding
+    expect(env.contract.tasks.map((t) => t.id).sort()).toEqual(['API', 'DOCS', 'WEB']);
+  }, 60_000);
+
+  test('R3-03: a rejected post-verification revision is not the contract a restarted Runner resumes with', async () => {
+    const fx = track(await makeFixture(happyScripts()));
+    seedRun(fx);
+    const engine = engineFor(fx);
+    await tickUntil(engine, fx, () => getRun(fx.db, RUN)!.finalVerified === true);
+
+    const contractV2 = validateContract(minimalContract({
+      project: { id: 'demo', repoRoot: fx.repoRoot, baseRef: 'main' },
+      tasks: [
+        { id: 'API', title: 'api', allowedPaths: ['src/api/**'], verificationCommands: ['git rev-parse HEAD'] },
+        { id: 'WEB', title: 'web', allowedPaths: ['src/web/**'] },
+        { id: 'DOCS', title: 'docs', allowedPaths: ['docs/**'], dependsOn: ['API'] },
+        { id: 'EXTRA', title: 'extra', allowedPaths: ['extra/**'] },
+      ],
+    }));
+    appendContractRevision(fx.db, RUN, contractV2);
+    await engine.tickOnce(); // rejected outright (R2-05)
+    expect(getTask(fx.db, RUN, 'EXTRA')).toBeNull();
+    expect(getRun(fx.db, RUN)!.revisionPending).toBe(false);
+    expect(getRun(fx.db, RUN)!.acceptedRevision).toBe(1);
+
+    // restart verification: a NEW Runner env from buildRunnerEnv must see the
+    // SAME contract, task set and verification evidence — not the candidate
+    const { buildRunnerEnv } = await import('../src/commands/run-shared.ts');
+    const { hasPassingFinalVerification } = await import('../src/store/verifications.ts');
+    const home = { root: fx.home, dbPath: join(fx.home, 'state.sqlite'), runsDir: join(fx.home, 'runs'), config: fx.config };
+    const env = buildRunnerEnv(home as never, fx.db, fx.fake, getRun(fx.db, RUN)!);
+    expect(env.contract.tasks.map((t) => t.id).sort()).toEqual(['API', 'DOCS', 'WEB']);
+    expect(listTasks(fx.db, RUN).map((t) => t.taskId).sort()).toEqual(['API', 'DOCS', 'WEB']);
+    const final = hasPassingFinalVerification(env.db, RUN);
+    expect(final).toBe(true);
+    const acceptedRev = getRun(fx.db, RUN)!.acceptedRevision;
+
+    // and the fresh engine can still finish: cleanup runs against the accepted world
+    const engine2 = new RunnerEngine(env, { tickMs: 5 });
+    await tickUntil(engine2, fx, () => TERMINALS.includes(getRun(fx.db, RUN)!.status));
+    expect(getRun(fx.db, RUN)!.status).toBe('done');
+    expect(getRun(fx.db, RUN)!.acceptedRevision).toBe(acceptedRev);
+  }, 60_000);
+
+  test('R3-04: a stale final PASS (integration HEAD moved after it) never gates cleanup — the gate is re-run', async () => {
+    const fx = track(await makeFixture(happyScripts()));
+    seedRun(fx);
+    const engine = engineFor(fx);
+    await tickUntil(engine, fx, () => getRun(fx.db, RUN)!.finalVerified === true);
+    const { latestVerification, listVerifications } = await import('../src/store/verifications.ts');
+    const first = latestVerification(fx.db, RUN, 'final')!;
+    expect(first.ok).toBe(true);
+
+    // a stray commit moves the integration HEAD after the PASS was recorded
+    const path = getRun(fx.db, RUN)!.integrationPath!;
+    const tamper = Bun.spawn(['git', '-C', path, 'commit', '--allow-empty', '-m', 'post-verification tamper'],
+      { stdout: 'ignore', stderr: 'ignore', stdin: 'ignore' });
+    expect(await tamper.exited).toBe(0);
+    const { currentHead } = await import('../src/core/git.ts');
+    const newHead = await currentHead(path);
+
+    // one tick: nothing is reclaimed on the stale PASS; the gate re-runs and
+    // persists a NEW record bound to the current HEAD
+    await engine.tickOnce();
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('integrated');
+    const second = latestVerification(fx.db, RUN, 'final')!;
+    expect(second.id).not.toBe(first.id);
+    expect(second.ok).toBe(true);
+    expect(second.detail!.headSha).toBe(newHead);
+
+    await tickUntil(engine, fx, () => TERMINALS.includes(getRun(fx.db, RUN)!.status));
+    expect(getRun(fx.db, RUN)!.status).toBe('done');
+    expect(listVerifications(fx.db, RUN).filter((r) => r.kind === 'final')).toHaveLength(2);
+  }, 60_000);
+
+  test('R3-04: a PASS bound to an older accepted revision never gates cleanup — the gate is re-run', async () => {
+    const fx = track(await makeFixture(happyScripts()));
+    seedRun(fx);
+    const engine = engineFor(fx);
+    await tickUntil(engine, fx, () => getRun(fx.db, RUN)!.finalVerified === true);
+    const { latestVerification } = await import('../src/store/verifications.ts');
+    const first = latestVerification(fx.db, RUN, 'final')!;
+    expect(first.detail!.contractRevision).toBe(1);
+
+    // a compatible (delivery-preserving) revision is accepted afterwards —
+    // the recorded PASS no longer carries the accepted revision
+    const contractV2 = validateContract(minimalContract({
+      project: { id: 'demo', repoRoot: fx.repoRoot, baseRef: 'main' },
+      provenance: { documents: [{ kind: 'note', reference: 'scope-note-rev2' }] },
+      tasks: [
+        { id: 'API', title: 'api', allowedPaths: ['src/api/**'], verificationCommands: ['git rev-parse HEAD'] },
+        { id: 'WEB', title: 'web', allowedPaths: ['src/web/**'] },
+        { id: 'DOCS', title: 'docs', allowedPaths: ['docs/**'], dependsOn: ['API'] },
+      ],
+    }));
+    appendContractRevision(fx.db, RUN, contractV2);
+    await engine.tickOnce(); // consume → acceptedRevision=2, stale PASS redone
+    expect(getRun(fx.db, RUN)!.acceptedRevision).toBe(2);
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('integrated'); // nothing reclaimed on the v1 PASS
+    const second = latestVerification(fx.db, RUN, 'final')!;
+    expect(second.id).not.toBe(first.id);
+    expect(second.detail!.contractRevision).toBe(2);
+
+    await tickUntil(engine, fx, () => TERMINALS.includes(getRun(fx.db, RUN)!.status));
+    expect(getRun(fx.db, RUN)!.status).toBe('done');
   }, 60_000);
 
   test('R2-12: a stale integration mapping is reconfirmed against Herdr, reopened by branch, and keeps its base SHA', async () => {

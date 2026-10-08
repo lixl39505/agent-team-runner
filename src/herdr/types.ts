@@ -7,7 +7,13 @@ export interface HerdrWorkspace {
   workspaceId: string;
   label?: string;
   cwd?: string;
-  worktree?: { branch: string; path: string };
+  worktree?: {
+    branch: string;
+    path: string;
+    /** The repo the worktree belongs to (repo_root in herdr snapshots);
+     * identifies the repo PARENT workspace for worktree create/open. */
+    repoRoot?: string;
+  };
 }
 
 export interface HerdrTab {
@@ -117,6 +123,7 @@ export type HerdrErrorCode =
   | 'timeout'
   | 'not_found'
   | 'invalid_response'
+  | 'invalid_request'
   | 'unsupported_transport'
   | 'agent_not_found'
   | 'herdr_error';

@@ -74,7 +74,7 @@ describe.skipIf(isWin)('HerdrSocketTransport against a local NDJSON server', () 
       expect(snap.panes).toHaveLength(1);
 
       const t0 = Date.now();
-      const stream = await transport.subscribe();
+      const stream = await transport.subscribe({ paneIds: ['w9:p1'] });
       // the ack was delayed ~50ms — subscribe() waited for it (R2-07)
       expect(Date.now() - t0).toBeGreaterThanOrEqual(40);
       // events pushed after the ack are buffered and retrievable without
@@ -125,7 +125,7 @@ describe.skipIf(isWin)('HerdrSocketTransport against a local NDJSON server', () 
     });
     try {
       const transport = new HerdrSocketTransport(sockPath);
-      await expect(transport.subscribe()).rejects.toMatchObject({ code: 'herdr_error' });
+      await expect(transport.subscribe({ paneIds: ['w9:p1'] })).rejects.toMatchObject({ code: 'herdr_error' });
     } finally {
       server.stop(true);
     }

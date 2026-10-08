@@ -125,6 +125,11 @@ export interface RunRecord {
   baseRef: string;
   baseSha: string;
   contractRevision: number;
+  /** The accepted (effective) revision — the latest one the Runner applied.
+   * A newer `contractRevision` may be a REJECTED candidate (moved binding,
+   * post-verification task-set change); nothing may read that as the
+   * authoritative contract (review 03 R3-02/R3-03). */
+  acceptedRevision: number;
   status: RunStatus;
   revisionPending: boolean;
   error: string | null;
@@ -186,6 +191,10 @@ export interface ExecutionRecord {
   /** Non-null forbids every recovery path from re-sending the prompt. */
   promptSentAt: string | null;
   promptDigest: string | null;
+  /** The agent start never completed (herdr rejects starts that hit native
+   * UI during startup). The prompt was definitively NEVER sent — the resume
+   * path may re-dispatch without the uncertain-delivery gate (R3-01). */
+  startFailed: boolean;
   resultPath: string | null;
   resultDigest: string | null;
   /** Digest of the result that has been APPLIED to the task state machine.

@@ -13,6 +13,7 @@ interface RunRow {
   base_ref: string;
   base_sha: string;
   contract_revision: number;
+  accepted_revision: number;
   status: string;
   revision_pending: number;
   error: string | null;
@@ -38,6 +39,7 @@ function toRecord(row: RunRow): RunRecord {
     baseRef: row.base_ref,
     baseSha: row.base_sha,
     contractRevision: row.contract_revision,
+    acceptedRevision: row.accepted_revision,
     status: row.status as RunStatus,
     revisionPending: row.revision_pending === 1,
     error: row.error,
@@ -117,7 +119,12 @@ export function getContractRevisionAt(db: SqliteDb, runId: string, revision: num
   return row ? (JSON.parse(row.contract_json) as ExecutionContract) : null;
 }
 
-/** Append an immutable revision and flag it pending for Runner consumption. */
+/** Append an immutable revision and flag it pending for Runner consumption.
+ * This SUBMITS a candidate only: `runs.contract_revision` moving forward
+ * never makes the revision authoritative. Acceptance happens exclusively in
+ * the Runner's revision consumption (markRevisionAccepted) — a rejected
+ * candidate must never become the contract a fresh process builds its env
+ * from (review 03 R3-02/R3-03). */
 export function appendContractRevision(db: SqliteDb, runId: string, contract: ExecutionContract): number {
   return inTransaction(db, () => {
     const run = getRun(db, runId);
@@ -137,6 +144,14 @@ export function appendContractRevision(db: SqliteDb, runId: string, contract: Ex
 
 export function clearRevisionPending(db: SqliteDb, runId: string): void {
   db.run('UPDATE runs SET revision_pending = 0, updated_at = ? WHERE id = ?', [nowIso(), runId]);
+}
+
+/** Promote the consumed revision to the ACCEPTED (effective) one (R3-02/
+ * R3-03). Called only from the Runner's revision application — rejections
+ * (incompatible graph, moved binding, post-verification task-set change)
+ * leave the previously accepted revision authoritative. */
+export function markRevisionAccepted(db: SqliteDb, runId: string, revision: number): void {
+  db.run('UPDATE runs SET accepted_revision = ?, updated_at = ? WHERE id = ?', [revision, nowIso(), runId]);
 }
 
 /** Persisted Runner state-machine fields (review 01 #3): integration

@@ -105,13 +105,21 @@ export class HerdrSocketTransport {
   /** Long-lived event stream over a dedicated socket. The subscription is
    * CONFIRMED before this resolves (review 02 R2-07): the method waits for
    * the server's ack (or error) so callers can rely on "subscribed" the
-   * moment they proceed to a snapshot. */
-  async subscribe(filter?: { paneId?: string }, timeoutMs = 15_000): Promise<HerdrEventStream> {
+   * moment they proceed to a snapshot.
+   *
+   * herdr 0.9.x (protocol 22) only admits pane-scoped subscriptions — every
+   * entry REQUIRES a pane_id and a global subscription is rejected with
+   * invalid_request (errors also carry an empty id, which would silently
+   * never match our ack). Callers pass the panes they actually track. */
+  async subscribe(filter?: { paneId?: string; paneIds?: string[] }, timeoutMs = 15_000): Promise<HerdrEventStream> {
+    const panes = filter?.paneId ? [filter.paneId] : (filter?.paneIds ?? []);
+    if (panes.length === 0) {
+      throw new HerdrError('invalid_request', 'herdr 0.9.x requires pane-scoped event subscriptions (paneIds)');
+    }
     const socket = await this.connectSocket(timeoutMs);
     const id = `ateam-sub-${++this.seq}`;
-    const subscriptions = filter?.paneId
-      ? [{ type: 'pane.agent_status_changed', pane_id: filter.paneId }]
-      : [{ type: 'pane.agent_status_changed' }, { type: 'pane.closed' }, { type: 'pane.exited' }, { type: 'worktree.removed' }];
+    const types = ['pane.agent_status_changed', 'pane.closed', 'pane.exited'];
+    const subscriptions = panes.flatMap((p) => types.map((type) => ({ type, pane_id: p })));
     socket.write(`${JSON.stringify({ id, method: 'events.subscribe', params: { subscriptions } })}\n`);
 
     let buffer = '';

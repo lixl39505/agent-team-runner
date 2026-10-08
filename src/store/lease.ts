@@ -32,8 +32,12 @@ interface LeaseRow {
   fence: string | null;
 }
 
-/** Try to acquire or refresh the lease. Returns the fencing token, or null
- * when a live runner holds the lease. */
+/** Try to acquire the lease. Returns the fencing token, or null when a live
+ * lease exists. R3-06: a LIVE lease refuses takeover regardless of the
+ * holder string — the previous same-holder exemption let a second engine in
+ * the SAME process mint its own fence and write alongside the first. An
+ * existing holder renews through heartbeat(); only a STALE lease (or a
+ * released/absent row) may be acquired. */
 export function acquireLease(db: SqliteDb, runId: string): string | null {
   const holder = leaseHolder();
   // BEGIN IMMEDIATE serializes the read-decide-write against every other
@@ -43,7 +47,7 @@ export function acquireLease(db: SqliteDb, runId: string): string | null {
     const row = db.query<LeaseRow, [string]>(
       'SELECT holder, heartbeat_at, state, fence FROM runner_leases WHERE run_id = ?',
     ).get(runId);
-    if (row && row.state === 'alive' && row.holder !== holder && !isStale(row.heartbeat_at, now)) {
+    if (row && row.state === 'alive' && !isStale(row.heartbeat_at, now)) {
       return null;
     }
     const fence = randomBytes(16).toString('hex');

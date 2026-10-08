@@ -49,6 +49,7 @@ function mapWorkspace(raw: AnyRecord | undefined) {
       ? {
           branch: str(pick(worktreeRaw, 'branch')) ?? '',
           path: str(pick(worktreeRaw, 'path')) ?? '',
+          repoRoot: str(pick(worktreeRaw, 'repo_root')),
         }
       : undefined,
   };
@@ -149,10 +150,11 @@ export class HerdrCliRuntimeClient implements HerdrRuntimeClient {
     label?: string;
     focus?: boolean;
   }): Promise<WorkspaceHandle> {
+    // herdr 0.9.x: API-backed subcommands print the {id, result} JSON envelope
+    // by default and REJECT an explicit --json flag (exit 2 usage error)
     const args = ['worktree', 'create', '--workspace', input.sourceWorkspaceId, '--branch', input.branch];
     if (input.label) args.push('--label', input.label);
     if (input.focus === false) args.push('--no-focus');
-    args.push('--json');
     return requireWorkspaceHandle(await this.cli.callJson<unknown>(args), 'worktree.create');
   }
 
@@ -160,19 +162,17 @@ export class HerdrCliRuntimeClient implements HerdrRuntimeClient {
     const args = ['worktree', 'open', '--workspace', input.sourceWorkspaceId];
     if (input.branch) args.push('--branch', input.branch);
     if (input.path) args.push('--path', input.path);
-    args.push('--json');
     return requireWorkspaceHandle(await this.cli.callJson<unknown>(args), 'worktree.open');
   }
 
   async removeWorktree(input: { workspaceId: string; force?: boolean }): Promise<void> {
     const args = ['worktree', 'remove', '--workspace', input.workspaceId];
     if (input.force) args.push('--force');
-    args.push('--json');
     await this.cli.callJson<unknown>(args);
   }
 
   async splitPane(input: { paneId: string; direction?: 'right' | 'down'; label?: string }): Promise<PaneHandle> {
-    const args = ['pane', 'split', input.paneId, '--direction', input.direction ?? 'right', '--no-focus', '--json'];
+    const args = ['pane', 'split', input.paneId, '--direction', input.direction ?? 'right', '--no-focus'];
     const doc = unwrapResult<AnyRecord>(await this.cli.callJson<unknown>(args));
     const pane = mapPane(pick(doc, 'pane') as AnyRecord | undefined);
     if (!pane.paneId) throw new HerdrError('invalid_response', 'pane.split response missing pane record', doc);
@@ -180,7 +180,7 @@ export class HerdrCliRuntimeClient implements HerdrRuntimeClient {
   }
 
   async closePane(paneId: string): Promise<void> {
-    await this.cli.callJson<unknown>(['pane', 'close', paneId, '--json']);
+    await this.cli.callJson<unknown>(['pane', 'close', paneId]);
   }
 
   async focusPane(paneId: string): Promise<void> {
@@ -199,7 +199,6 @@ export class HerdrCliRuntimeClient implements HerdrRuntimeClient {
       '--kind', input.kind,
       '--pane', input.paneId,
       '--timeout', String(input.readyTimeoutMs ?? 30_000),
-      '--json',
       '--',
       ...input.args,
     ];
@@ -224,25 +223,28 @@ export class HerdrCliRuntimeClient implements HerdrRuntimeClient {
       for (const state of input.until) args.push('--until', state);
       args.push('--timeout', String(input.timeoutMs));
     }
-    args.push('--json');
-    // NOTE (R2-10): `requestId` is deliberately NOT mapped to a CLI flag —
-    // no such flag exists in the current Herdr CLI, and inventing one would
-    // fail every prompt. The idempotency contract lives on the interface
-    // and is honored by the socket transport / runtimes that support it;
-    // until then a dispatch resume against a CLI-only runtime may re-send
-    // an already-delivered prompt (uncertainty is NOT resolved by guessing
-    // from transient agent state).
+    // NOTE (R2-10/R3-01): `requestId` is deliberately NOT mapped to a CLI
+    // flag — no such flag exists in the current Herdr CLI, and inventing one
+    // would fail every prompt. Because this transport cannot dedupe, it
+    // reports supportsPromptDedup() === false: the runner must treat any
+    // recovery re-send whose delivery is uncertain as needing manual
+    // confirmation, never blind re-prompting.
     const doc = unwrapResult<AnyRecord>(await this.cli.callJson<unknown>(args, {
       timeoutMs: input.timeoutMs + 15_000,
     }));
     return { paneId: str(pick(doc, 'pane_id')) ?? '', state: (str(pick(doc, 'state', 'agent_status')) ?? 'unknown') as HerdrAgentState };
   }
 
+  /** R3-01: the CLI has no verified request-id flag, so deliveries through
+   * this transport are NOT idempotent — recovery may not re-send. */
+  supportsPromptDedup(): boolean {
+    return false;
+  }
+
   async waitAgent(input: { target: string; until: Array<'done' | 'blocked'>; timeoutMs?: number }): Promise<AgentWaitResult> {
     const args = ['agent', 'wait', input.target];
     for (const state of input.until) args.push('--until', state);
     if (input.timeoutMs) args.push('--timeout', String(input.timeoutMs));
-    args.push('--json');
     const doc = unwrapResult<AnyRecord>(await this.cli.callJson<unknown>(args, {
       timeoutMs: (input.timeoutMs ?? 120_000) + 15_000,
     }));
@@ -254,10 +256,20 @@ export class HerdrCliRuntimeClient implements HerdrRuntimeClient {
   }
 
   async getAgent(target: string): Promise<AgentRecord | null> {
-    const args = ['agent', 'get', target, '--json'];
-    const doc = unwrapResult<AnyRecord>(await this.cli.callJson<unknown>(args));
+    const args = ['agent', 'get', target];
+    // herdr 0.9.x reports a missing agent as a not_found ERROR; the interface
+    // contract is null = "definitively gone" (the engine restarts on null,
+    // escalates on errors) — so map that one code, propagate the rest
+    const doc = await this.cli.callJson<unknown>(args).catch((err) => {
+      if (err instanceof HerdrError && err.code === 'not_found') return null;
+      throw err;
+    });
     if (!doc || typeof doc !== 'object') return null;
-    return mapAgent(doc as AnyRecord);
+    // 0.9.x shape: {type, agent: {...}} inside the envelope — unwrap the
+    // agent record before mapping; the fixture/test shape is the record itself
+    const body = unwrapResult<AnyRecord>(doc);
+    const agentRaw = (pick(body, 'agent') as AnyRecord | undefined) ?? body;
+    return mapAgent(agentRaw);
   }
 
   async readPane(input: { paneId: string; source?: string; lines?: number }): Promise<string> {
@@ -272,18 +284,21 @@ export class HerdrCliRuntimeClient implements HerdrRuntimeClient {
     state: HerdrAgentState;
     message?: string;
   }): Promise<void> {
+    // herdr 0.9.x shape: positional <PANE_ID> plus a REQUIRED --source (the
+    // reporting client's label); there is no --pane flag
     const args = [
       'pane', 'report-agent',
-      '--pane', input.paneId,
+      '--source', input.agent,
       '--agent', input.agent,
       '--state', input.state,
     ];
     if (input.message) args.push('--message', input.message);
-    await this.cli.callJson<unknown>(args);
+    args.push(input.paneId);
+    await this.cli.callText(args); // 0.9.x acknowledges with empty output
   }
 
   async snapshot(): Promise<HerdrSessionSnapshot> {
-    const result = unwrapResult<AnyRecord>(await this.cli.callJson<unknown>(['api', 'snapshot', '--json']));
+    const result = unwrapResult<AnyRecord>(await this.cli.callJson<unknown>(['api', 'snapshot']));
     return normalizeSnapshot(result);
   }
 
@@ -295,9 +310,14 @@ export class HerdrCliRuntimeClient implements HerdrRuntimeClient {
   }
 }
 
-/** Normalize a raw session.snapshot result body into domain records. */
+/** Normalize a raw session.snapshot result body into domain records.
+ * Both transports land here: the CLI envelope unwraps to
+ * `{type, snapshot: {...}}` while the socket result is the same shape — the
+ * optional `snapshot` wrapper is stripped FIRST, otherwise every workspace/
+ * pane is invisible and reconcile judges live resources as lost. */
 export function normalizeSnapshot(result: unknown): HerdrSessionSnapshot {
-  const body = (typeof result === 'object' && result !== null ? result : {}) as AnyRecord;
+  const outer = (typeof result === 'object' && result !== null ? result : {}) as AnyRecord;
+  const body = (pick(outer, 'snapshot') as AnyRecord | undefined) ?? outer;
   const workspaces = Array.isArray(pick(body, 'workspaces')) ? (pick(body, 'workspaces') as AnyRecord[]).map(mapWorkspace) : [];
   const tabs = Array.isArray(pick(body, 'tabs')) ? (pick(body, 'tabs') as AnyRecord[]).map(mapTab) : [];
   const panes = Array.isArray(pick(body, 'panes')) ? (pick(body, 'panes') as AnyRecord[]).map(mapPane) : [];
@@ -343,6 +363,10 @@ export class HerdrHybridRuntimeClient implements HerdrRuntimeClient {
   }
   promptAgent(input: Parameters<HerdrRuntimeClient['promptAgent']>[0]) {
     return this.cli.promptAgent(input);
+  }
+  supportsPromptDedup(): boolean {
+    // prompts ride the CLI wrapper here — dedupe follows the CLI's answer
+    return this.cli.supportsPromptDedup();
   }
   waitAgent(input: Parameters<HerdrRuntimeClient['waitAgent']>[0]) {
     return this.cli.waitAgent(input);

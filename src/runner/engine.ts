@@ -5,7 +5,7 @@
 
 import type { SqliteDb } from '../store/db.ts';
 import { inTransaction } from '../store/db.ts';
-import { getRun, updateRunStatus, updateRunRuntimeState, getContractRevisionAt, clearRevisionPending } from '../store/runs.ts';
+import { getRun, updateRunStatus, updateRunRuntimeState, getContractRevisionAt, clearRevisionPending, markRevisionAccepted } from '../store/runs.ts';
 import { getTask, insertTask, listTasks, updateTask } from '../store/tasks.ts';
 import { latestExecutionFor, listActiveExecutions, listExecutions, updateExecution } from '../store/executions.ts';
 import type { ExecutionRecord, PendingDispatch } from '../core/types.ts';
@@ -13,7 +13,7 @@ import { addEvent } from '../store/events.ts';
 import { insertResource, markResourceState, listActiveResources } from '../store/resources.ts';
 import { heartbeat, acquireLease, releaseLease, leaseHolder } from '../store/lease.ts';
 import { nowIso } from '../store/ids.ts';
-import { insertVerification, hasPassingFinalVerification } from '../store/verifications.ts';
+import { insertVerification } from '../store/verifications.ts';
 import { readResultFile } from '../results/files.ts';
 import { validateRoleResult } from '../results/validate.ts';
 import type { WorkerResult, ReviewerResult, IntegrationResult } from '../results/types.ts';
@@ -25,10 +25,10 @@ import type { HerdrAgentState } from '../core/types.ts';
 import { resolveAgentEntry } from '../config.ts';
 import { existsSync } from 'node:fs';
 import type { RunnerEnv, StartExecutionInput } from './executions.ts';
-import { startExecution, resolveReviewerEntry, closePaneSafe, rebuildRolePrompt } from './executions.ts';
+import { startExecution, resolveReviewerEntry, closePaneSafe, rebuildRolePrompt, findSourceWorkspaceId } from './executions.ts';
 import { agentStartArgs } from '../herdr/agent-args.ts';
 import { verifyTaskWork } from './phases/verify.ts';
-import { cleanupTaskResources } from './cleanup.ts';
+import { cleanupTaskResources, finalPassMatchesDelivery } from './cleanup.ts';
 import { topologicalTasks, validateGraph } from '../core/contract.ts';
 
 const TERMINAL_RUN: ReadonlySet<string> = new Set(['done', 'cancelled', 'abandoned', 'failed']);
@@ -185,6 +185,12 @@ export class RunnerEngine {
    * conclusion binds to that set and the integration HEAD, so accepting it
    * silently would keep a stale finalVerified while new tasks can never
    * reach integration.
+   *
+   * Review 03 (R3-02/R3-03): only a fully applied revision is promoted to
+   * the run's ACCEPTED revision — the contract every process (fresh Runner,
+   * clean, reconcile) builds its env from. Rejections leave the previously
+   * accepted revision authoritative; the refused candidate stays a mere
+   * submitted pointer that no one reads as the contract.
    */
   async consumeContractRevision(): Promise<void> {
     const { db, runId } = this.env;
@@ -305,6 +311,10 @@ export class RunnerEngine {
       }
       // consumed atomically with the task changes — a crash mid-apply retries
       clearRevisionPending(db, runId);
+      // R3-02/R3-03: the applied revision becomes the ACCEPTED one in the
+      // SAME transaction — a crash between applying and promoting can never
+      // leave a fresh process reading the old contract over applied tasks
+      markRevisionAccepted(db, runId, run.contractRevision);
       // a corrected revision resolves a previously refused one
       db.run('UPDATE runs SET error = NULL WHERE id = ?', [runId]);
     });
@@ -509,6 +519,7 @@ export class RunnerEngine {
       updateRunStatus(db, runId, 'needs_attention', `agent ${exec.agentName} state unobservable during dispatch resume: ${observed.message}; resolve manually`);
       return;
     }
+    let restartedFresh = false;
     if (!observed) {
       try {
         const entry = resolveAgentEntry(this.env.config, task.spec.agent, exec.role);
@@ -517,11 +528,22 @@ export class RunnerEngine {
           kind: exec.agentKind,
           paneId: exec.paneId,
           args: agentStartArgs(entry),
+          readyTimeoutMs: 120_000, // same operator window as startExecution
         });
+        restartedFresh = true;
       } catch (err) {
         await abandon(`dispatch_interrupted_agent_gone: ${String(err)}`);
         return;
       }
+    } else if (observed.state === 'blocked') {
+      // native UI still open (trust dialog, approval) — the operator is on
+      // it; wait silently and re-check on the next tick. If the start had
+      // FAILED, the prompt was never sent, so there is nothing to un-deliver.
+      if (!exec.startFailed) {
+        updateRunStatus(db, runId, 'needs_attention',
+          `execution ${exec.id}: agent ${exec.agentName} is blocked in native UI during dispatch resume — resolve it in pane ${exec.paneId}`);
+      }
+      return;
     }
     const worktreePath = exec.role === 'integrator'
       ? getRun(db, runId)?.integrationPath ?? task.worktreePath
@@ -533,11 +555,37 @@ export class RunnerEngine {
       updateRunStatus(db, runId, 'needs_attention', `execution ${exec.id} prompt could not be rebuilt; attach the pane to decide`);
       return;
     }
-    // R2-10: prompt delivery is idempotent by requestId (the persisted
-    // prompt digest) — the runtime dedupes a re-sent prompt, so recovery
-    // never has to GUESS from transient agent state whether the first send
-    // landed. Runtimes without request-id support must not call this path
-    // blindly: the requestId contract is documented on HerdrRuntimeClient.
+    // R3-01: a persisted result file IS delivery evidence — the original
+    // prompt demonstrably landed (only this execution writes that path).
+    // Mark the dispatch delivered and let the result gate apply it; the
+    // agent is never re-prompted.
+    if (exec.resultPath && await readResultFile(exec.resultPath)) {
+      updateExecution(db, exec.id, { promptSentAt: nowIso(), status: 'running' });
+      addEvent(db, runId, 'EXECUTION_PROMPTED', {
+        taskId: exec.taskId,
+        executionId: exec.id,
+        payload: { role: exec.role, attemptNo: exec.attemptNo, cycleNo: exec.cycleNo, agentName: exec.agentName, resumed: true, evidence: 'persisted_result' },
+      });
+      return;
+    }
+    // R3-01/R2-10: re-prompting a LIVE agent cannot distinguish "never
+    // delivered" from "delivered, receipt lost" unless the runtime dedupes
+    // by requestId (the persisted prompt digest). With a dedupe-capable
+    // runtime the re-send is a no-op when the first injection landed; on a
+    // transport without that guarantee the uncertain delivery escalates for
+    // manual confirmation instead of gambling a double execution. The one
+    // exception is a recorded start failure: the start never completed, so
+    // the prompt was never even attempted and re-dispatching is certain-safe.
+    if (!restartedFresh && !exec.startFailed && !client.supportsPromptDedup()) {
+      updateRunStatus(db, runId, 'needs_attention',
+        `execution ${exec.id}: prompt delivery is uncertain and the runtime has no request-id dedupe — attach pane ${exec.paneId} (agent ${exec.agentName}) and resolve manually`);
+      addEvent(db, runId, 'RECONCILE_DECISION', {
+        executionId: exec.id,
+        payload: { reason: 'prompt_resume_uncertain_no_dedupe', agentName: exec.agentName, paneId: exec.paneId },
+      });
+      return;
+    }
+    if (exec.startFailed) updateExecution(db, exec.id, { startFailed: false });
     await client.promptAgent({
       target: exec.agentName, text: prompt, wait: false, until: [], timeoutMs: 5000,
       requestId: exec.promptDigest ?? undefined,
@@ -601,7 +649,7 @@ export class RunnerEngine {
       attemptNo: exec.attemptNo,
       ok: outcome.ok,
       detail: {
-        contractRevision: getRun(db, runId)?.contractRevision,
+        contractRevision: getRun(db, runId)?.acceptedRevision,
         headSha: outcome.headAfter,
         baseSha: current.startSha ?? outcome.headBefore,
         violations: outcome.violations,
@@ -819,7 +867,11 @@ export class RunnerEngine {
     if (tasks.length === 0) return;
     const run = getRun(db, runId)!;
     if (run.integrationStalled) return;
-    if (run.finalVerified) {
+    // R3-04: reclamation proceeds only while the persisted final PASS still
+    // describes the CURRENT delivery (accepted revision, integration HEAD,
+    // task commit set). A stale conclusion falls through to re-verification
+    // below instead of gating resource destruction on it.
+    if (run.finalVerified && await finalPassMatchesDelivery(this.env)) {
       await this.runCleanupPhase(run);
       return;
     }
@@ -852,6 +904,9 @@ export class RunnerEngine {
       const task = tasks.find((t) => t.taskId === taskId);
       if (!task || task.status !== 'approved') continue;
       if (current.conflictTaskId && current.conflictTaskId !== task.taskId) continue; // serialize conflicts
+      // R3-06: cherry-picks mutate the shared integration tree — the fence
+      // must be current before each one
+      this.ensureLease();
       await this.integrateTask(task);
     }
   }
@@ -861,13 +916,24 @@ export class RunnerEngine {
     const { db, runId, client } = this.env;
     const tasks = listTasks(db, runId);
     for (const task of tasks.filter((t) => t.status === 'integrated')) {
+      // R3-06: reclamation is irreversible — renew/verify the fencing token
+      // before each task's teardown, never batch it across the whole loop
+      this.ensureLease();
       await cleanupTaskResources(this.env, task);
     }
     // run-level temp resource: the integration worktree itself
     if (run.integrationWorkspaceId && listTasks(db, runId).every((t) => SETTLED_TASK.has(t.status))) {
+      this.ensureLease();
       try {
         await client.removeWorktree({ workspaceId: run.integrationWorkspaceId, force: true });
-        markResourceState(db, 'workspace', run.integrationWorkspaceId, 'reclaimed');
+        markResourceState(db, runId, 'workspace', run.integrationWorkspaceId, 'reclaimed');
+        // R3-07: integrator panes lived in the removed workspace — retired
+        // as `gone` (audit-honest), never as a success close
+        for (const exec of listExecutions(db, runId)) {
+          if (['open', 'retained'].includes(exec.paneState) && exec.workspaceId === run.integrationWorkspaceId) {
+            updateExecution(db, exec.id, { paneState: 'gone' });
+          }
+        }
         updateRunRuntimeState(db, runId, { integrationWorkspaceId: null, integrationPath: null });
       } catch {
         /* retried on the next tick / by clean */
@@ -898,19 +964,38 @@ export class RunnerEngine {
     const branch = run.integrationBranch ?? `ateam/${runId}/integration`;
     // resume order (review 01 #3): reopen the ledger-recorded workspace →
     // reopen by branch → create fresh; a restart must not orphan the
-    // already-integrated commits by silently rebuilding elsewhere
+    // already-integrated commits by silently rebuilding elsewhere.
+    // herdr 0.9.x: open/create must start from the repo PARENT workspace,
+    // so the branch-based fallbacks resolve the parent, not a task workspace.
+    let parentWorkspaceId: string | null = null;
+    try {
+      parentWorkspaceId = await findSourceWorkspaceId(this.env);
+    } catch {
+      parentWorkspaceId = null;
+    }
     let handle: WorkspaceHandle | null = null;
     if (run.integrationWorkspaceId) {
       handle = await client
         .openWorktree({ sourceWorkspaceId: run.integrationWorkspaceId })
         .catch(() => null);
     }
-    if (!handle) {
+    if (!handle && parentWorkspaceId) {
       handle = await client
-        .openWorktree({ sourceWorkspaceId: firstWithWorkspace.workspaceId!, branch })
+        .openWorktree({ sourceWorkspaceId: parentWorkspaceId, branch })
         .catch(() => null);
     }
-    if (!handle) {
+    if (!handle && parentWorkspaceId) {
+      handle = await client
+        .createWorktreeWorkspace({
+          sourceWorkspaceId: parentWorkspaceId,
+          branch,
+          label: `${runId}/integration`,
+          focus: false,
+        })
+        .catch(() => null);
+    }
+    if (!handle && !parentWorkspaceId) {
+      // legacy fallback: task-workspace-sourced creation (fakes / older runtimes)
       handle = await client
         .createWorktreeWorkspace({
           sourceWorkspaceId: firstWithWorkspace.workspaceId!,
@@ -1009,18 +1094,29 @@ export class RunnerEngine {
     // dispossessed runner must not mark the run final-verified
     this.ensureLease();
     const integrationHead = await currentHead(path).catch(() => null);
-    // R2-14: the final conclusion is persisted as a queryable record bound
-    // to the contract revision and the verified integration HEAD — this
-    // record (not just the run flag) is what cleanup eligibility reads
+    // R2-14 + R3-04: the final conclusion is persisted as a queryable record
+    // bound to the contract revision, the verified integration HEAD AND the
+    // exact task/commit set it covered — this record (not just the run flag)
+    // is what cleanup eligibility reads, and cleanup re-checks the bindings
+    // before destroying anything
+    const integratedCommits: Record<string, string> = {};
+    for (const t of tasks) {
+      if (['integrated', 'reclaimed'].includes(t.status) && t.integrationCommit) {
+        integratedCommits[t.taskId] = t.integrationCommit;
+      }
+    }
     insertVerification(db, {
       runId,
       kind: 'final',
       ok: outcome.ok,
       detail: {
         phase: 'integration_final',
-        contractRevision: run.contractRevision,
+        // the ACCEPTED revision, never run.contractRevision: a pending
+        // candidate that was refused must not become a gate's provenance
+        contractRevision: run.acceptedRevision,
         headSha: integrationHead,
         baseSha: run.integrationBaseSha ?? null,
+        integratedCommits,
         violations: outcome.violations,
         diffFiles: outcome.diffFiles,
         commands: outcome.commands.map((c) => ({ command: c.command, ok: c.ok, exitCode: c.exitCode })),
@@ -1065,16 +1161,25 @@ export class RunnerEngine {
     // is bridged by buffered events instead of being silently missed. A
     // subscription that cannot be confirmed means the required order cannot
     // be guaranteed — report it and defer every judgment (no snapshot-only
-    // degradation).
-    let stream: HerdrEventStream;
-    try {
-      stream = await client.subscribe();
-    } catch (err) {
-      decisions.push({
-        kind: 'subscription_unavailable',
-        detail: `event subscription failed (${String(err)}); recovery judgments deferred`,
-      });
-      return decisions;
+    // degradation). herdr 0.9.x admits only pane-scoped subscriptions, so the
+    // subscription tracks exactly the ledger's live panes; with none in
+    // flight there is no pane judgment pending and the pass may proceed.
+    const trackedPanes = new Set<string>();
+    for (const exec of listActiveExecutions(db, runId)) {
+      if (exec.paneId) trackedPanes.add(exec.paneId);
+    }
+    if (run.integrationRootPaneId) trackedPanes.add(run.integrationRootPaneId);
+    let stream: HerdrEventStream | null = null;
+    if (trackedPanes.size > 0) {
+      try {
+        stream = await client.subscribe({ paneIds: [...trackedPanes] });
+      } catch (err) {
+        decisions.push({
+          kind: 'subscription_unavailable',
+          detail: `event subscription failed (${String(err)}); recovery judgments deferred`,
+        });
+        return decisions;
+      }
     }
     try {
         const snap = await client.snapshot().catch(() => null);
@@ -1086,18 +1191,32 @@ export class RunnerEngine {
           });
           return decisions;
         }
-        // R2-07: merge events buffered between the subscription ACK and the
-        // snapshot into the observation sets — removal events never add
-        // liveness, so a pane closed in the gap still judges as gone
+        // R2-07 + R3-05: merge events buffered between the subscription ACK
+        // and the snapshot IN ARRIVAL ORDER — a removal event for a resource
+        // the snapshot showed must remove it from the alive/observed sets,
+        // and an event arriving after the removal may re-add it. Ignoring
+        // deletions would keep judging closed panes as recoverable.
         const alivePanes = new Set(snap.panes.map((p) => p.paneId));
         const observedIds = new Set<string>([
           ...snap.workspaces.map((w) => w.workspaceId),
           ...snap.panes.map((p) => p.paneId),
         ]);
-        for (const ev of stream.drainPending?.() ?? []) {
-          if (ev.type === 'pane.closed' || ev.type === 'pane.exited' || ev.type === 'worktree.removed') continue;
-          if (ev.paneId) alivePanes.add(ev.paneId);
-          if (ev.paneId) observedIds.add(ev.paneId);
+        for (const ev of stream?.drainPending?.() ?? []) {
+          if (ev.type === 'pane.closed' || ev.type === 'pane.exited') {
+            if (ev.paneId) {
+              alivePanes.delete(ev.paneId);
+              observedIds.delete(ev.paneId);
+            }
+            continue;
+          }
+          if (ev.type === 'worktree.removed') {
+            if (ev.workspaceId) observedIds.delete(ev.workspaceId);
+            continue;
+          }
+          if (ev.paneId) {
+            alivePanes.add(ev.paneId);
+            observedIds.add(ev.paneId);
+          }
           if (ev.workspaceId) observedIds.add(ev.workspaceId);
         }
         const tasks = listTasks(db, runId);
@@ -1124,8 +1243,36 @@ export class RunnerEngine {
               }
             }
           }
-          // 2) pane 仍然存活：回到常规观察/结果门
+          // 2) pane 仍然存活：区分「agent 也在」与「herdr 重启后恢复的空 pane」。
+          //    agent 确定不在（getAgent → null）等同 pane 丢失——tick 语义一致，
+          //    走新 attempt；agent 状态不可观测（非 not_found 错误）则保守延迟。
           if (exec.paneId && alivePanes.has(exec.paneId)) {
+            const agent = await client.getAgent(exec.agentName).catch((err) => err);
+            if (agent === null) {
+              decisions.push({
+                kind: exec.promptSentAt ? 'pane_lost_new_attempt' : 'pane_lost_no_attempt',
+                taskId: exec.taskId,
+                executionId: exec.id,
+                detail: `pane ${exec.paneId} alive but agent ${exec.agentName} is gone`,
+              });
+              if (opts.dryRun || !task) continue;
+              updateExecution(db, exec.id, { status: 'abandoned', paneState: 'gone' });
+              addEvent(db, runId, 'RECONCILE_DECISION', {
+                executionId: exec.id,
+                payload: { reason: 'pane_lost', promptSent: !!exec.promptSentAt, agentGone: true },
+              });
+              await this.recoverExecutionOnFreshWorktree(exec, task, decisions);
+              continue;
+            }
+            if (agent instanceof Error) {
+              decisions.push({
+                kind: 'snapshot_unavailable',
+                taskId: exec.taskId,
+                executionId: exec.id,
+                detail: `agent ${exec.agentName} state unobservable (${String(agent)}); judgment deferred`,
+              });
+              continue;
+            }
             decisions.push({ kind: 'result_recovered', taskId: exec.taskId, executionId: exec.id, detail: 'pane alive; re-entered result gate' });
             await apply(() => this.progressExecution(exec, listTasks(db, runId)));
             continue;
@@ -1146,11 +1293,11 @@ export class RunnerEngine {
           await this.recoverExecutionOnFreshWorktree(exec, task, decisions);
         }
 
-      // cleanup eligibility (review 01 #2 + R2-03/R2-14): only after the
-      // final verification is persisted as a PASSING record; reconciling an
-      // unverified run reports the deferral instead of destroying worktrees
-      // that the final gate still needs
-      if (run.finalVerified && hasPassingFinalVerification(db, runId)) {
+      // cleanup eligibility (review 01 #2 + R2-03/R2-14 + R3-04): only while
+      // a persisted PASSING final record still describes the CURRENT
+      // delivery; reconciling an unverified (or stale-verified) run reports
+      // the deferral instead of destroying worktrees the final gate needs
+      if (run.finalVerified && await finalPassMatchesDelivery(this.env)) {
         for (const task of listTasks(db, runId).filter((t) => t.status === 'integrated')) {
           decisions.push({ kind: 'cleanup_resumed', taskId: task.taskId });
           await apply(async () => {
@@ -1172,12 +1319,12 @@ export class RunnerEngine {
           taskId: res.taskId ?? undefined,
           detail: `${res.kind}:${res.herdrId}`,
         });
-        await apply(() => markResourceState(db, res.kind, res.herdrId, res.provenance ? 'lost' : 'orphaned'));
+        await apply(() => markResourceState(db, runId, res.kind, res.herdrId, res.provenance ? 'lost' : 'orphaned'));
       }
 
       return decisions;
     } finally {
-      stream.close();
+      stream?.close();
     }
   }
 
@@ -1197,7 +1344,13 @@ export class RunnerEngine {
     decisions: ReconcileDecision[],
   ): Promise<void> {
     const { db, runId, client } = this.env;
-    const source = process.env.HERDR_WORKSPACE_ID ?? task.workspaceId ?? '';
+    // herdr 0.9.x: rebuilds must start from the repo PARENT workspace
+    let source = task.workspaceId ?? '';
+    try {
+      source = await findSourceWorkspaceId(this.env);
+    } catch {
+      /* keep the ledgered task workspace as the fallback source */
+    }
     let handle: Awaited<ReturnType<typeof client.createWorktreeWorkspace>> | null = null;
 
     if (task.branch) {

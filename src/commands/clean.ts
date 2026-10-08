@@ -17,7 +17,7 @@ import { addEvent } from '../store/events.ts';
 import { AteamError } from '../core/errors.ts';
 import { buildRunnerEnv, createClient, getRunOrThrow } from './run-shared.ts';
 import { cleanupTaskResources } from '../runner/cleanup.ts';
-import { acquireLease, releaseLease } from '../store/lease.ts';
+import { acquireLease, heartbeat, releaseLease } from '../store/lease.ts';
 import type { HerdrRuntimeClient } from '../herdr/client.ts';
 
 export interface CleanCommandOptions {
@@ -54,17 +54,31 @@ export async function cmdClean(opts: CleanCommandOptions): Promise<number> {
       let reclaimed = 0;
       let discarded = 0;
       for (const task of tasks.filter((t) => t.status === 'integrated')) {
+        // R3-06: reclamation is irreversible — the token-CAS heartbeat both
+        // renews the lease and aborts the sweep the moment another writer
+        // took over mid-run
+        if (!heartbeat(db, run.id, fence)) {
+          throw new AteamError(`runner lease for ${run.id} was lost mid-clean — another writer took over; aborting before further destruction`, {
+            exitCode: 1,
+          });
+        }
         const outcome = await cleanupTaskResources(env, task, { discardUnverified: opts.discardWork });
         if (outcome === 'reclaimed') reclaimed += 1;
         if (outcome === 'discarded') discarded += 1;
       }
 
-      if (!['done', 'cancelled', 'abandoned', 'failed'].includes(run.status)) {
+      const stillIntegrated = listTasks(db, run.id).filter((t) => t.status === 'integrated').length;
+      // R3-08: with unverified work left behind (and no explicit discard),
+      // the run stays RESUMABLE — terminating it here would hide it from the
+      // default startup/reconcile path that re-runs the final gate and
+      // finishes reclamation. Only a fully settled (or explicitly discarded)
+      // run is finalized.
+      const terminate = stillIntegrated === 0 || opts.discardWork;
+      if (terminate && !['done', 'cancelled', 'abandoned', 'failed'].includes(run.status)) {
         updateRunStatus(db, run.id, 'abandoned');
         addEvent(db, run.id, 'RUN_STATUS_CHANGED', { payload: { to: 'abandoned', source: 'clean' } });
       }
 
-      const stillIntegrated = listTasks(db, run.id).filter((t) => t.status === 'integrated').length;
       if (opts.json) {
         console.log(JSON.stringify({
           runId: run.id,
@@ -79,7 +93,7 @@ export async function cmdClean(opts: CleanCommandOptions): Promise<number> {
         );
         if (stillIntegrated > 0 && !opts.discardWork) {
           console.log(
-            'fix: these tasks have no persisted passing final verification, so they are not reclaimable — run the runner / `agent-team reconcile` to finish verification, or re-run with --discard-work to destroy the unverified resources (audited, irreversible)',
+            'fix: these tasks have no current passing final verification, so they are not reclaimable and the run was left resumable — run the runner / `agent-team reconcile` to re-run the final verification, or re-run with --discard-work to destroy the unverified resources (audited, irreversible)',
           );
         }
       }

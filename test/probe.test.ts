@@ -33,6 +33,7 @@ function clientWithProbe(probe: HerdrProbe | Error): HerdrRuntimeClient {
     focusPane: () => Promise.reject(new Error('unused')),
     startAgent: () => Promise.reject(new Error('unused')),
     promptAgent: () => Promise.reject(new Error('unused')),
+    supportsPromptDedup: () => false,
     waitAgent: () => Promise.reject(new Error('unused')),
     getAgent: () => Promise.reject(new Error('unused')),
     readPane: () => Promise.reject(new Error('unused')),

@@ -53,20 +53,29 @@ export interface ReadResult<T> {
 /**
  * Read + parse a result file. The bytes are read twice and compared by
  * digest so a concurrent rewrite is detected instead of silently accepted.
- * Returns null when the file does not exist (not a commit point yet).
+ * Returns null when the file does not exist or cannot be read (not a commit
+ * point yet) — an unreadable path is "no result", never a gate failure; the
+ * real e2e hit EISDIR when a result path was occupied by a directory.
  */
 export async function readResultFile<T = unknown>(path: string): Promise<ReadResult<T> | null> {
   let first: Buffer;
   try {
     first = await readFile(path);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
-    throw err;
+  } catch {
+    // ENOENT / EISDIR / EACCES / … — all mean "no readable result yet"
+    return null;
   }
-  const second = await readFile(path);
+  const second = await readFile(path).catch(() => null);
+  if (!second) return null; // vanished mid-read — not a commit point
   const digest = sha256Hex(first);
   if (digest !== sha256Hex(second)) {
     throw new Error(`result file changed between reads (possible concurrent rewrite): ${path}`);
   }
-  return { value: JSON.parse(first.toString('utf8')) as T, digest };
+  try {
+    return { value: JSON.parse(first.toString('utf8')) as T, digest };
+  } catch {
+    // unparseable content: the schema gate never sees it; the agent can
+    // rewrite a valid result — treated identically to "not written yet"
+    return null;
+  }
 }

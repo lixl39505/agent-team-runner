@@ -408,6 +408,12 @@ export class FakeHerdrClient implements HerdrRuntimeClient {
     return this.waitFor(input.target, input.until, input.timeoutMs ?? 30_000);
   }
 
+  /** The fake models the Herdr prompt idempotency contract (R2-10): one
+   * requestId = exactly one injection, so recovery re-sends are safe. */
+  supportsPromptDedup(): boolean {
+    return true;
+  }
+
   async getAgent(target: string): Promise<AgentRecord | null> {
     this.record('getAgent', target);
     const agent = this.agents.get(target);

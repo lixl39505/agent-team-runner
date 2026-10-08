@@ -49,16 +49,19 @@ export function insertResource(
     path?: string | null;
   },
 ): HerdrResourceRecord {
+  // herdr reuses small workspace/pane ids after server restarts — uniqueness
+  // is per (run, kind, herdrId) so a new run never collides with an old
+  // run's ledger rows (migration v6)
   db.run(
     `INSERT INTO herdr_resources (run_id, task_id, execution_id, kind, herdr_id, branch, path, provenance, state, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'active', ?)
-     ON CONFLICT (kind, herdr_id) DO NOTHING`,
+     ON CONFLICT (run_id, kind, herdr_id) DO NOTHING`,
     [input.runId, input.taskId ?? null, input.executionId ?? null, input.kind, input.herdrId,
       input.branch ?? null, input.path ?? null, nowIso()],
   );
   const row = db
-    .query<ResourceRow, [string, string]>('SELECT * FROM herdr_resources WHERE kind = ? AND herdr_id = ?')
-    .get(input.kind, input.herdrId)!;
+    .query<ResourceRow, [string, string, string]>('SELECT * FROM herdr_resources WHERE run_id = ? AND kind = ? AND herdr_id = ?')
+    .get(input.runId, input.kind, input.herdrId)!;
   return toRecord(row);
 }
 
@@ -77,8 +80,15 @@ export function getResource(db: SqliteDb, kind: HerdrResourceKind, herdrId: stri
   return row ? toRecord(row) : null;
 }
 
-export function markResourceState(db: SqliteDb, kind: HerdrResourceKind, herdrId: string, state: HerdrResourceState): void {
-  db.run('UPDATE herdr_resources SET state = ?, reclaimed_at = ? WHERE kind = ? AND herdr_id = ?', [
-    state, state === 'active' ? null : nowIso(), kind, herdrId,
+export function getResourceForRun(db: SqliteDb, runId: string, kind: HerdrResourceKind, herdrId: string): HerdrResourceRecord | null {
+  const row = db
+    .query<ResourceRow, [string, string, string]>('SELECT * FROM herdr_resources WHERE run_id = ? AND kind = ? AND herdr_id = ?')
+    .get(runId, kind, herdrId);
+  return row ? toRecord(row) : null;
+}
+
+export function markResourceState(db: SqliteDb, runId: string, kind: HerdrResourceKind, herdrId: string, state: HerdrResourceState): void {
+  db.run('UPDATE herdr_resources SET state = ?, reclaimed_at = ? WHERE run_id = ? AND kind = ? AND herdr_id = ?', [
+    state, state === 'active' ? null : nowIso(), runId, kind, herdrId,
   ]);
 }

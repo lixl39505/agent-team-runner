@@ -98,12 +98,41 @@ export function latestVerification(db: SqliteDb, runId: string, kind: Verificati
   return row ? toRecord(row) : null;
 }
 
+/** What the current delivery must look like for a persisted final PASS to
+ * still count (review 03 R3-04): the accepted contract revision, the live
+ * integration HEAD and exactly the task integration commits recorded when
+ * the gate ran. Omitted fields are not compared. */
+export interface FinalVerificationExpectation {
+  contractRevision?: number;
+  headSha?: string;
+  integratedCommits?: Record<string, string>;
+}
+
 /**
  * Cleanup eligibility (R2-03/R2-14): a PASSING final verification record
  * must exist. The runs.final_verified flag alone is not proof — the record
  * carries the revision, integration HEAD, commands and log that justify
- * reclamation.
+ * reclamation. With an `expected` argument the record must ALSO still
+ * describe the current delivery (R3-04): a PASS taken against an older
+ * revision, a different integration HEAD or a different task set no longer
+ * authorizes destroying resources.
  */
-export function hasPassingFinalVerification(db: SqliteDb, runId: string): boolean {
-  return latestVerification(db, runId, 'final')?.ok === true;
+export function hasPassingFinalVerification(
+  db: SqliteDb,
+  runId: string,
+  expected?: FinalVerificationExpectation,
+): boolean {
+  const latest = latestVerification(db, runId, 'final');
+  if (latest?.ok !== true) return false;
+  if (!expected) return true;
+  const detail = latest.detail ?? {};
+  if (expected.contractRevision !== undefined && detail.contractRevision !== expected.contractRevision) return false;
+  if (expected.headSha !== undefined && detail.headSha !== expected.headSha) return false;
+  if (expected.integratedCommits) {
+    const recorded = (detail.integratedCommits ?? {}) as Record<string, string>;
+    const normalize = (m: Record<string, string>): string =>
+      JSON.stringify(Object.entries(m).sort(([a], [b]) => (a < b ? -1 : 1)));
+    if (normalize(recorded) !== normalize(expected.integratedCommits)) return false;
+  }
+  return true;
 }

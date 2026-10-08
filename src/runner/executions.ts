@@ -6,6 +6,7 @@ import type { SqliteDb } from '../store/db.ts';
 import { insertExecution, updateExecution, listExecutions, type ExecutionPatch } from '../store/executions.ts';
 import { insertResource, listActiveResources } from '../store/resources.ts';
 import { updateTask, getTask, type TaskPatch } from '../store/tasks.ts';
+import { updateRunStatus } from '../store/runs.ts';
 import { addEvent } from '../store/events.ts';
 import { agentName, newExecutionId, nowIso, taskBranch } from '../store/ids.ts';
 import type { AteamHome } from '../config.ts';
@@ -102,14 +103,21 @@ export async function ensureTaskWorktree(env: RunnerEnv, task: TaskRecord): Prom
   return getTask(env.db, env.runId, task.taskId)!;
 }
 
-/** The workspace whose repo the run is bound to: a previous task workspace,
- * else the Runner's own Herdr workspace, else an explicit override. */
-async function findSourceWorkspaceId(env: RunnerEnv): Promise<string> {
+/** The workspace whose repo the run is bound to. herdr 0.9.x requires
+ * worktree create/open to start from the repo PARENT workspace, so the
+ * operator-declared runner workspace wins, then a snapshot scan for the
+ * workspace whose repo is the run's binding; ledgered task worktrees are
+ * the last fallback (they may be refused by the runtime). */
+export async function findSourceWorkspaceId(env: RunnerEnv): Promise<string> {
+  const herdrWorkspace = process.env.HERDR_WORKSPACE_ID ?? process.env.ATEAM_SOURCE_WORKSPACE_ID;
+  if (herdrWorkspace) return herdrWorkspace;
+  const snap = await env.client.snapshot().catch(() => null);
+  const repoRoot = env.contract.project.repoRoot;
+  const parent = snap?.workspaces.find((w) => (w.worktree?.repoRoot ?? w.worktree?.path ?? w.cwd) === repoRoot);
+  if (parent) return parent.workspaceId;
   const resources = listActiveResources(env.db, env.runId).filter((r) => r.kind === 'workspace');
   const first = resources[0];
   if (first) return first.herdrId;
-  const herdrWorkspace = process.env.HERDR_WORKSPACE_ID ?? process.env.ATEAM_SOURCE_WORKSPACE_ID;
-  if (herdrWorkspace) return herdrWorkspace;
   throw new HerdrError(
     'herdr_error',
     'no source workspace for worktree creation — start the Runner inside a Herdr workspace (HERDR_WORKSPACE_ID) or set ATEAM_SOURCE_WORKSPACE_ID',
@@ -172,7 +180,9 @@ export async function startExecution(env: RunnerEnv, input: StartExecutionInput)
     throw new Error(`prompt for ${executionId} exceeds ${MAX_PROMPT_CHARS} chars — brief overflow`);
   }
   // the digest is persisted BEFORE dispatch and doubles as the prompt
-  // requestId, so a crash-recovery resend cannot double-inject (R2-10)
+  // requestId: on dedupe-capable runtimes a crash-recovery resend cannot
+  // double-inject (R2-10); runtimes without that guarantee never re-send —
+  // the engine escalates an uncertain resume instead (R3-01)
   const promptDigest = sha256Hex(prompt);
   insertExecution(env.db, {
     id: executionId,
@@ -204,12 +214,32 @@ export async function startExecution(env: RunnerEnv, input: StartExecutionInput)
   const pane = await env.client.splitPane({ paneId: rootPaneId, direction: 'right', label: `${task.taskId}:${input.role}` });
   updateExecution(env.db, executionId, { paneId: pane.paneId, tabId: pane.tabId, workspaceId: pane.workspaceId });
 
-  await env.client.startAgent({
-    name,
-    kind: input.entry.kind,
-    paneId: pane.paneId,
-    args: agentStartArgs(input.entry),
-  });
+  try {
+    await env.client.startAgent({
+      name,
+      kind: input.entry.kind,
+      paneId: pane.paneId,
+      args: agentStartArgs(input.entry),
+      // real agents cold-start into native UI (folder trust, approvals) that a
+      // human resolves in the pane — 30s made every first run a start failure
+      readyTimeoutMs: 120_000,
+    });
+  } catch (err) {
+    // herdr 0.9.x REJECTS agent start immediately when the agent enters
+    // native UI during startup (folder trust, first-run dialogs). The prompt
+    // was definitively never sent, so marking start_failed lets the resume
+    // path re-dispatch safely once the operator resolves the pane — the run
+    // stays alive instead of dying on a recoverable runtime condition.
+    updateExecution(env.db, executionId, { startFailed: true });
+    addEvent(env.db, env.runId, 'RECONCILE_DECISION', {
+      executionId,
+      payload: { reason: 'agent_start_failed', agentName: name, paneId: pane.paneId, error: String(err).slice(0, 300) },
+    });
+    updateTask(env.db, env.runId, task.taskId, { lastError: `agent start failed: ${String(err).slice(0, 200)}` });
+    updateRunStatus(env.db, env.runId, 'needs_attention',
+      `agent ${name} start failed (${String(err).slice(0, 160)}) — resolve the native UI in pane ${pane.paneId}; the runner resumes dispatch automatically`);
+    return getExecutionRow(env, executionId);
+  }
 
   await env.client.promptAgent({ target: name, text: prompt, wait: false, until: [], timeoutMs: 5000, requestId: promptDigest });
   updateExecution(env.db, executionId, { promptSentAt: nowIso(), status: 'running' });

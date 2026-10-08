@@ -113,9 +113,27 @@ describe('resources + lease + cleanup', () => {
     insertResource(db, { runId, taskId: 'API', kind: 'workspace', herdrId: 'w9', branch: 'ateam/x/API', path: '/wt/api' });
     insertResource(db, { runId, kind: 'pane', herdrId: 'w9:p1' });
     expect(listActiveResources(db, runId)).toHaveLength(2);
-    markResourceState(db, 'workspace', 'w9', 'reclaimed');
+    markResourceState(db, runId, 'workspace', 'w9', 'reclaimed');
     expect(listActiveResources(db, runId)).toHaveLength(1);
     expect(listActiveResources(db, runId)[0]!.herdrId).toBe('w9:p1');
+  });
+
+  test('resource ids are unique PER RUN (herdr reuses small ids after server restarts)', () => {
+    const runA = 'r-20261008-aaaaaa';
+    const runB = 'r-20261008-bbbbbb';
+    insertRun(db, { id: runA, contract, baseSha: 's', status: 'running' });
+    insertRun(db, { id: runB, contract, baseSha: 's', status: 'running' });
+    insertResource(db, { runId: runA, taskId: 'API', kind: 'workspace', herdrId: 'w2', branch: 'ateam/a/API', path: '/wt/a' });
+    // the same herdr id (reused after a restart) must ledger for run B too —
+    // the v5-and-before global UNIQUE(kind, herdr_id) silently swallowed it
+    const b = insertResource(db, { runId: runB, taskId: 'API', kind: 'workspace', herdrId: 'w2', branch: 'ateam/b/API', path: '/wt/b' });
+    expect(b.runId).toBe(runB);
+    expect(listActiveResources(db, runA)).toHaveLength(1);
+    expect(listActiveResources(db, runB)).toHaveLength(1);
+    // state transitions are run-scoped: reclaiming B's w2 leaves A's alone
+    markResourceState(db, runB, 'workspace', 'w2', 'reclaimed');
+    expect(listActiveResources(db, runB)).toHaveLength(0);
+    expect(listActiveResources(db, runA)).toHaveLength(1);
   });
 
   test('lease acquire/heartbeat/release + stale takeover (fenced, R2-06)', async () => {
