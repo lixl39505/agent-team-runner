@@ -83,7 +83,21 @@ export async function probeLiveServerOrFailFast(
   }
   const repoRoot = opts.repoRoot;
   if (!repoRoot) return;
-  if (process.env.HERDR_WORKSPACE_ID || process.env.ATEAM_SOURCE_WORKSPACE_ID) return; // explicit source wins
+  // R5-07: an explicitly pinned source id must ALSO be proven by the
+  // authoritative snapshot — a stale or foreign id would otherwise survive
+  // startup and only explode at the first worktree creation
+  const explicitId = process.env.HERDR_WORKSPACE_ID || process.env.ATEAM_SOURCE_WORKSPACE_ID;
+  if (explicitId) {
+    const source = snap.workspaces.find((w) => w.workspaceId === explicitId);
+    const onRepo = !!source && (source.worktree?.repoRoot ?? source.worktree?.path ?? source.cwd) === repoRoot;
+    if (!onRepo) {
+      throw new DoctorError(
+        `HERDR_WORKSPACE_ID/ATEAM_SOURCE_WORKSPACE_ID ${explicitId} is not a live workspace on the contract repo ${repoRoot}${source ? ' (the id exists but points at another repo)' : ' (no such workspace in the live snapshot)'}`,
+        `point the env at the workspace holding ${repoRoot}, or unset it to let the runner find a source workspace from the snapshot`,
+      );
+    }
+    return;
+  }
   if (opts.hasLedgeredWorkspace) return; // reattach: the run already holds worktree workspaces
   const source = snap.workspaces.find((w) => (w.worktree?.repoRoot ?? w.worktree?.path ?? w.cwd) === repoRoot);
   if (!source) {

@@ -97,7 +97,7 @@ export class FakeHerdrClient implements HerdrRuntimeClient {
   constructor(private readonly opts: FakeOptions) {
     // base workspace standing in for the Runner's own Herdr workspace
     const base: WorkspaceHandle = {
-      workspace: { workspaceId: 'w0', label: 'base', worktree: { branch: '(base)', path: opts.repoRoot } },
+      workspace: { workspaceId: 'w0', label: 'base', worktree: { branch: '(base)', path: opts.repoRoot, repoRoot: opts.repoRoot } },
       tab: { tabId: 'w0:t', workspaceId: 'w0' },
       rootPane: { paneId: 'w0:p', workspaceId: 'w0', tabId: 'w0:t' },
       worktree: { workspaceId: 'w0', branch: '(base)', path: opts.repoRoot },
@@ -304,7 +304,9 @@ export class FakeHerdrClient implements HerdrRuntimeClient {
     const exists = (await branchProc.exited) === 0;
     await git(this.opts.repoRoot, exists ? ['worktree', 'add', path, input.branch] : ['worktree', 'add', '-b', input.branch, path]);
     const handle: WorkspaceHandle = {
-      workspace: { workspaceId: wsId, label: input.label, worktree: { branch: input.branch, path } },
+      // repoRoot mirrors the real herdr 0.9.x snapshot mapping (the deletion
+      // gate proves identity against it — R5-02)
+      workspace: { workspaceId: wsId, label: input.label, worktree: { branch: input.branch, path, repoRoot: this.opts.repoRoot } },
       tab: { tabId, workspaceId: wsId },
       rootPane: { paneId, workspaceId: wsId, tabId },
       worktree: { workspaceId: wsId, branch: input.branch, path },

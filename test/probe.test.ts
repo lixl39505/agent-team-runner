@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import type { HerdrRuntimeClient } from '../src/herdr/client.ts';
 import type { HerdrProbe, HerdrSessionSnapshot } from '../src/herdr/types.ts';
 import { probeLiveServerOrFailFast, probeOrFailFast, resolveSelfPaneId } from '../src/commands/run-shared.ts';
+import { findSourceWorkspaceId, type RunnerEnv } from '../src/runner/executions.ts';
 import { cmdRun } from '../src/commands/run.ts';
 import { DoctorError } from '../src/core/errors.ts';
 
@@ -101,13 +102,29 @@ describe('probeLiveServerOrFailFast (R4-08)', () => {
     expect((err as DoctorError).message).toMatch(/no Herdr workspace is open/);
   });
 
-  test('an explicit source workspace env or a ledgered workspace skips the scan', async () => {
+  test('an explicit source id must be proven live on the contract repo (R5-07)', async () => {
+    const withW0: HerdrSessionSnapshot = {
+      ...emptySnapshot,
+      workspaces: [{ workspaceId: 'w0', worktree: { branch: 'main', path: '/repo', repoRoot: '/repo' } }],
+    };
     process.env.HERDR_WORKSPACE_ID = 'w0';
     try {
-      await expect(probeLiveServerOrFailFast(clientWithSnapshot(emptySnapshot), { repoRoot: '/repo' })).resolves.toBeUndefined();
+      // a live id on the contract repo passes
+      await expect(probeLiveServerOrFailFast(clientWithSnapshot(withW0), { repoRoot: '/repo' })).resolves.toBeUndefined();
+      // an id that exists but points at ANOTHER repo fails
+      const err = await probeLiveServerOrFailFast(clientWithSnapshot(withW0), { repoRoot: '/other' }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(DoctorError);
+      expect((err as DoctorError).message).toMatch(/points at another repo/);
+      // an id the live snapshot does not know fails
+      const unknown = await probeLiveServerOrFailFast(clientWithSnapshot(emptySnapshot), { repoRoot: '/repo' }).catch((e: unknown) => e);
+      expect(unknown).toBeInstanceOf(DoctorError);
+      expect((unknown as DoctorError).message).toMatch(/no such workspace/);
+      expect((unknown as DoctorError).remediation).toMatch(/unset it to let the runner find/);
     } finally {
       delete process.env.HERDR_WORKSPACE_ID;
+      delete process.env.ATEAM_SOURCE_WORKSPACE_ID;
     }
+    // a ledgered reattach still skips the source scan entirely
     await expect(
       probeLiveServerOrFailFast(clientWithSnapshot(emptySnapshot), { repoRoot: '/repo', hasLedgeredWorkspace: true }),
     ).resolves.toBeUndefined();
@@ -115,6 +132,66 @@ describe('probeLiveServerOrFailFast (R4-08)', () => {
 
   test('without a repo binding only the live-server check applies', async () => {
     await expect(probeLiveServerOrFailFast(clientWithSnapshot(emptySnapshot))).resolves.toBeUndefined();
+  });
+});
+
+describe('findSourceWorkspaceId (R5-07 explicit-pin proof)', () => {
+  const repoRoot = '/repo';
+
+  function envWith(client: HerdrRuntimeClient): RunnerEnv {
+    return {
+      home: {} as never,
+      db: {} as never,
+      client,
+      config: {} as never,
+      runId: 'r-test',
+      contract: { version: 1, project: { id: 'demo', repoRoot, baseRef: 'main' }, tasks: [] },
+    } as unknown as RunnerEnv;
+  }
+
+  function clientWith(snapshot: HerdrSessionSnapshot | Error): HerdrRuntimeClient {
+    return {
+      snapshot: async () => {
+        if (snapshot instanceof Error) throw snapshot;
+        return snapshot;
+      },
+    } as unknown as HerdrRuntimeClient;
+  }
+
+  const snapWithW0: HerdrSessionSnapshot = {
+    workspaces: [{ workspaceId: 'w0', worktree: { branch: 'main', path: repoRoot, repoRoot } }],
+    tabs: [], panes: [], agents: [],
+  };
+
+  test('a pinned id that is live on the run repo wins', async () => {
+    process.env.HERDR_WORKSPACE_ID = 'w0';
+    try {
+      await expect(findSourceWorkspaceId(envWith(clientWith(snapWithW0)))).resolves.toBe('w0');
+    } finally {
+      delete process.env.HERDR_WORKSPACE_ID;
+    }
+  });
+
+  test('a pinned id that is foreign, unknown, or unprovable fails closed', async () => {
+    const foreign: HerdrSessionSnapshot = {
+      workspaces: [{ workspaceId: 'w0', worktree: { branch: 'main', path: '/elsewhere', repoRoot: '/elsewhere' } }],
+      tabs: [], panes: [], agents: [],
+    };
+    process.env.ATEAM_SOURCE_WORKSPACE_ID = 'w0';
+    try {
+      await expect(findSourceWorkspaceId(envWith(clientWith(foreign)))).rejects.toThrow(/not a live workspace/);
+      await expect(findSourceWorkspaceId(envWith(clientWith({ workspaces: [], tabs: [], panes: [], agents: [] })))).rejects.toThrow(/not a live workspace/);
+      // snapshot unavailable = no proof = refuse (even though the id "might" be fine)
+      await expect(findSourceWorkspaceId(envWith(clientWith(new Error('server down'))))).rejects.toThrow(/not a live workspace/);
+    } finally {
+      delete process.env.ATEAM_SOURCE_WORKSPACE_ID;
+    }
+  });
+
+  test('without a pin the snapshot scan still resolves the repo workspace', async () => {
+    delete process.env.HERDR_WORKSPACE_ID;
+    delete process.env.ATEAM_SOURCE_WORKSPACE_ID;
+    await expect(findSourceWorkspaceId(envWith(clientWith(snapWithW0)))).resolves.toBe('w0');
   });
 });
 

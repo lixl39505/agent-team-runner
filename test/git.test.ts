@@ -5,14 +5,19 @@ import {
   changedFiles,
   cherryPick,
   commit,
+  commitTree,
   currentHead,
   deleteBranchIfFree,
   diffStat,
   hasStagedChanges,
   stageAll,
+  stagedChangedFiles,
   worktreeBranches,
   worktreeChangedFiles,
+  worktreeDirtyFiles,
+  writeTree,
 } from '../src/core/git.ts';
+import { commitVerifiedTree } from '../src/runner/phases/commit.ts';
 import { cleanupTempDir, initRepo, makeTempDir, writeFileDeep } from './helpers.ts';
 
 let repo: string;
@@ -98,5 +103,50 @@ describe('git gates', () => {
     await stageAll(repo);
     expect(await hasStagedChanges(repo)).toBe(true);
     await commit(repo, 'chore: r2-01 fixtures 2');
+  });
+
+  test('worktreeDirtyFiles lists every non-bookkeeping status entry (R5-03)', async () => {
+    const localBase = await currentHead(repo); // isolate from earlier commits
+    await writeFileDeep(join(repo, '.ateam', 'brief.md'), '# brief\n'); // runner-owned, ignored
+    await writeFileDeep(join(repo, 'dirty-untracked.txt'), 'x\n');
+    await writeFileDeep(join(repo, 'src/dirty-tracked.ts'), 'edited\n');
+    const dirty = await worktreeDirtyFiles(repo);
+    expect(dirty).toContain('dirty-untracked.txt');
+    expect(dirty).toContain('src/dirty-tracked.ts');
+    expect(dirty).not.toContain('.ateam/brief.md');
+    await stageAll(repo);
+    expect(await worktreeDirtyFiles(repo)).toContain('src/dirty-tracked.ts'); // staged counts too
+    await commit(repo, 'chore: r5-03 fixtures');
+    expect(await worktreeDirtyFiles(repo)).toEqual([]);
+  });
+
+  test('stage-first primitives (R5-01): pin the index tree, measure index-vs-base, prove the commit tree', async () => {
+    const localBase = await currentHead(repo);
+    await writeFileDeep(join(repo, 'src/pin.ts'), 'export 1;\n');
+    await stageAll(repo);
+    const tree = await writeTree(repo);
+    // the staged diff is index-vs-base: exactly what the commit will carry
+    expect(await stagedChangedFiles(repo, localBase)).toContain('src/pin.ts');
+    expect(await stagedChangedFiles(repo, localBase)).not.toContain('untracked-nothing.txt');
+
+    // committing against the pin proves the tree
+    const sha = await commitVerifiedTree(repo, tree, 'r5-01: pinned');
+    expect(sha).not.toBeNull();
+    expect(await commitTree(repo, sha!)).toBe(tree);
+
+    // content staged AFTER the pin cannot ride the commit — the proof fails
+    await writeFileDeep(join(repo, 'src/raced.ts'), 'raced in after the gate\n');
+    await stageAll(repo);
+    expect(await commitVerifiedTree(repo, tree, 'r5-01: raced')).toBeNull();
+    // and the raced content IS in the new commit (it was staged) — the null
+    // return is what keeps it out of a REVIEWED delivery
+    const racedSha = await currentHead(repo);
+    expect(await commitTree(repo, racedSha)).not.toBe(tree);
+  });
+
+  test('commitVerifiedTree reuses HEAD on a crash replay (nothing staged)', async () => {
+    const before = await currentHead(repo);
+    const sha = await commitVerifiedTree(repo, await commitTree(repo, before), 'r5-01: replay');
+    expect(sha).toBe(before);
   });
 });

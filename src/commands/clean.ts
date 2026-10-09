@@ -15,7 +15,8 @@ import { getRun, updateRunStatus } from '../store/runs.ts';
 import { listTasks } from '../store/tasks.ts';
 import { listActiveExecutions } from '../store/executions.ts';
 import { addEvent } from '../store/events.ts';
-import { AteamError } from '../core/errors.ts';
+import { SETTLED_TASK } from '../core/types.ts';
+import { AteamError, LeaseLostError } from '../core/errors.ts';
 import { buildRunnerEnv, createClient, getRunOrThrow } from './run-shared.ts';
 import { cleanupTaskResources } from '../runner/cleanup.ts';
 import { acquireLease, heartbeat, releaseLease } from '../store/lease.ts';
@@ -54,25 +55,30 @@ export async function cmdClean(opts: CleanCommandOptions): Promise<number> {
 
       let reclaimed = 0;
       let discarded = 0;
-      for (const task of tasks.filter((t) => t.status === 'integrated')) {
+      // R5-04: the fence errors are LeaseLostError so the cleanup audit path
+      // can tell "the operation failed" from "we no longer own this run" and
+      // record nothing in the latter case
+      const leaseLost = (): LeaseLostError =>
+        new LeaseLostError(`runner lease for ${run.id} was lost mid-clean — another writer took over; aborting before further destruction`);
+      // R5-05: integrated tasks always sweep; an explicit --discard-work also
+      // sweeps every not-yet-settled task that may still hold resources
+      // (running/reviewing/blocked worktrees and branches), settling them as
+      // audited discards
+      const sweepable = tasks.filter((t) =>
+        t.status === 'integrated'
+        || (opts.discardWork === true && !['reclaimed', 'discarded'].includes(t.status)));
+      for (const task of sweepable) {
         // R3-06: reclamation is irreversible — the token-CAS heartbeat both
         // renews the lease and aborts the sweep the moment another writer
         // took over mid-run
-        if (!heartbeat(db, run.id, fence)) {
-          throw new AteamError(`runner lease for ${run.id} was lost mid-clean — another writer took over; aborting before further destruction`, {
-            exitCode: 1,
-          });
-        }
+        if (!heartbeat(db, run.id, fence)) throw leaseLost();
         const outcome = await cleanupTaskResources(env, task, {
           discardUnverified: opts.discardWork,
-          // R4-05: the fence is also renewed between the individual teardown
-          // steps — a single slow reclamation must not outlive its lease
+          // R4-05/R5-04: the fence is renewed between the individual teardown
+          // steps and re-checked after each operation before any audit write —
+          // a single slow reclamation must not outlive its lease
           ensureLease: () => {
-            if (!heartbeat(db, run.id, fence)) {
-              throw new AteamError(`runner lease for ${run.id} was lost mid-clean — another writer took over; aborting before further destruction`, {
-                exitCode: 1,
-              });
-            }
+            if (!heartbeat(db, run.id, fence)) throw leaseLost();
           },
         });
         if (outcome === 'reclaimed') reclaimed += 1;
@@ -85,12 +91,18 @@ export async function cmdClean(opts: CleanCommandOptions): Promise<number> {
       // any coordinator. clean refuses to finalize while any execution is
       // active, whatever the integrated count says.
       const activeExecutions = listActiveExecutions(db, run.id);
+      // R5-05: an execution-free window is NOT a settled run — a task still
+      // reviewing/running/blocked (or carrying an unplayed dispatch intent)
+      // has undelivered work and possibly un-reclaimed temp resources; the
+      // default startup/reconcile path must stay able to finish it
+      const remaining = listTasks(db, run.id);
+      const unsettled = remaining.filter((t) => !SETTLED_TASK.has(t.status) || t.pendingDispatch !== null);
       // R3-08: with unverified work left behind (and no explicit discard),
       // the run stays RESUMABLE — terminating it here would hide it from the
       // default startup/reconcile path that re-runs the final gate and
       // finishes reclamation. Only a fully settled (or explicitly discarded)
       // run with no live executions is finalized.
-      const terminate = (stillIntegrated === 0 || opts.discardWork) && activeExecutions.length === 0;
+      const terminate = stillIntegrated === 0 && activeExecutions.length === 0 && unsettled.length === 0;
       if (terminate && !['done', 'cancelled', 'abandoned', 'failed'].includes(run.status)) {
         updateRunStatus(db, run.id, 'abandoned');
         addEvent(db, run.id, 'RUN_STATUS_CHANGED', { payload: { to: 'abandoned', source: 'clean' } });
@@ -103,15 +115,21 @@ export async function cmdClean(opts: CleanCommandOptions): Promise<number> {
           discarded,
           stillIntegrated,
           activeExecutions: activeExecutions.length,
+          unsettledTasks: unsettled.map((t) => ({ taskId: t.taskId, status: t.status, pendingDispatch: t.pendingDispatch })),
           status: getRun(db, run.id)?.status,
         }));
       } else {
         console.log(
-          `clean ${run.id}: reclaimed ${reclaimed}, discarded ${discarded}, ${stillIntegrated} still pending, ${activeExecutions.length} active executions, run=${getRun(db, run.id)?.status}`,
+          `clean ${run.id}: reclaimed ${reclaimed}, discarded ${discarded}, ${stillIntegrated} still pending, ${activeExecutions.length} active executions, ${unsettled.length} unsettled tasks, run=${getRun(db, run.id)?.status}`,
         );
         if (activeExecutions.length > 0) {
           console.log(
             `fix: ${activeExecutions.length} execution(s) are still active (${activeExecutions.map((e) => `${e.taskId}/${e.role}`).join(', ')}) — stop the runner or let them finish before terminating the run; the run was left resumable`,
+          );
+        }
+        if (unsettled.length > 0) {
+          console.log(
+            `fix: ${unsettled.length} task(s) are not settled (${unsettled.map((t) => `${t.taskId}:${t.status}${t.pendingDispatch ? `+${t.pendingDispatch}` : ''}`).join(', ')}) — a run with in-flight delivery is not terminable; resume it (runner / \`agent-team reconcile\`) or re-run with --discard-work to abort the remaining work (audited, irreversible)`,
           );
         }
         if (stillIntegrated > 0 && !opts.discardWork) {
@@ -120,7 +138,7 @@ export async function cmdClean(opts: CleanCommandOptions): Promise<number> {
           );
         }
       }
-      return stillIntegrated > 0 || activeExecutions.length > 0 ? 1 : 0;
+      return terminate ? 0 : 1;
     } finally {
       releaseLease(db, run.id, fence);
     }

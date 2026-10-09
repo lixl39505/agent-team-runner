@@ -64,3 +64,5 @@ herdr 版本时，**先对照本表逐条复核**——这些约束全部来自�
 3. 一个 2 任务最小 e2e（docs/e2e.md 手动清单；`ATEAM_HERDR_E2E=1` 门控的自动用例）。
 4. 检查 `AgentPromptParams` 是否新增幂等键（若新增，可重估 R3-01 的暂停语义与
    `supportsPromptDedup()`）。
+5. 确认 `api snapshot` 的 workspace 映射仍带 `worktree.repo_root`（R5-02 删除门禁的
+   身份证明要求 path/branch/repo_root 三者齐全；缺字段时清理会 fail-closed 拒绝）。

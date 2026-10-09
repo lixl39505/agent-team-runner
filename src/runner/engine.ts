@@ -10,7 +10,7 @@ import { getTask, insertTask, listTasks, updateTask } from '../store/tasks.ts';
 import { latestExecutionFor, listActiveExecutions, listExecutions, updateExecution } from '../store/executions.ts';
 import type { ExecutionRecord, PendingDispatch } from '../core/types.ts';
 import { addEvent } from '../store/events.ts';
-import { insertResource, markResourceState, listActiveResources } from '../store/resources.ts';
+import { insertResource, markResourceState, listActiveResources, listResources } from '../store/resources.ts';
 import { heartbeat, acquireLease, releaseLease, leaseHolder } from '../store/lease.ts';
 import { nowIso } from '../store/ids.ts';
 import { insertVerification } from '../store/verifications.ts';
@@ -18,8 +18,9 @@ import { readResultFile } from '../results/files.ts';
 import { validateRoleResult } from '../results/validate.ts';
 import type { WorkerResult, ReviewerResult, IntegrationResult } from '../results/types.ts';
 import { stageAll, commit, cherryPick, currentHead, hasStagedChanges, revParse, squashSince, worktreeChangedFiles } from '../core/git.ts';
-import { AteamError, type ExitCode } from '../core/errors.ts';
+import { AteamError, LeaseLostError, type ExitCode } from '../core/errors.ts';
 import type { HerdrEventStream, WorkspaceHandle } from '../herdr/types.ts';
+import { SETTLED_TASK } from '../core/types.ts';
 import type { RunRecord, RunStatus, TaskRecord } from '../core/types.ts';
 import type { HerdrAgentState } from '../core/types.ts';
 import { resolveAgentEntry } from '../config.ts';
@@ -28,13 +29,11 @@ import type { RunnerEnv, StartExecutionInput } from './executions.ts';
 import { startExecution, resolveReviewerEntry, closePaneSafe, rebuildRolePrompt, findSourceWorkspaceId } from './executions.ts';
 import { agentStartArgs } from '../herdr/agent-args.ts';
 import { verifyTaskWork } from './phases/verify.ts';
+import { commitVerifiedTree } from './phases/commit.ts';
 import { assertRemovableWorkspace, cleanupTaskResources, finalPassMatchesDelivery } from './cleanup.ts';
 import { topologicalTasks, validateGraph } from '../core/contract.ts';
 
 const TERMINAL_RUN: ReadonlySet<string> = new Set(['done', 'cancelled', 'abandoned', 'failed']);
-
-/** Task states that need no further delivery work. */
-const SETTLED_TASK: ReadonlySet<string> = new Set(['integrated', 'reclaimed', 'discarded', 'failed']);
 
 /** R4-04: a dependency is satisfied only when its delivery is IN the
  * integration base. `failed`/`discarded` upstreams settle the run but never
@@ -117,13 +116,13 @@ export class RunnerEngine {
 
   /** Renew the lease and verify this process still holds the fencing token
    * (R2-06). heartbeat() is a token-CAS update: zero rows changed means
-   * another writer took over — this runner must not write delivery state. */
+   * another writer took over — this runner must not write delivery state.
+   * R5-04: the error is a LeaseLostError so audit paths can distinguish it
+   * and record nothing on behalf of a dispossessed writer. */
   private ensureLease(): void {
     if (!this.leaseFence) return;
     if (!heartbeat(this.env.db, this.env.runId, this.leaseFence)) {
-      throw new AteamError('runner lease lost (fencing token no longer current) — another writer holds this run', {
-        exitCode: 1,
-      });
+      throw new LeaseLostError();
     }
   }
 
@@ -680,11 +679,18 @@ export class RunnerEngine {
     // once the task has advanced past this result
     if (['reviewing', 'approved', 'integrated', 'reclaimed', 'discarded', 'changes_requested'].includes(current.status)) return;
     updateTask(db, runId, task.taskId, { status: 'verifying' });
+    // R5-01: stage BEFORE the gate — the gate measures index-vs-base and
+    // pins the index tree, so the verification object is exactly the content
+    // the commit below will carry. Edits a worker keeps making after its
+    // result file landed stay unstaged and are caught by the post-commit
+    // drift checks (deliveryDriftedSinceVerification), not silently committed.
+    await stageAll(current.worktreePath!);
     const outcome = await verifyTaskWork({
       worktreePath: current.worktreePath!,
       task: current,
       allowlist: config.verificationAllowlist,
       baseSha: current.startSha ?? 'HEAD',
+      staged: true,
       logDir: `${home.runsDir}/${runId}/logs`,
     });
     // R2-14: the gate outcome becomes a queryable record (revision, HEAD,
@@ -728,12 +734,24 @@ export class RunnerEngine {
     // CAS) before any delivery write; a dispossessed runner must not commit
     this.ensureLease();
 
-    await stageAll(current.worktreePath!);
-    // crash-safe commit: if the task commit already landed (crash after
-    // commit, before the status write) there is nothing staged — reuse HEAD
-    const sha = (await hasStagedChanges(current.worktreePath!))
-      ? await commit(current.worktreePath!, `ateam(${runId}): task ${task.taskId} attempt ${exec.attemptNo}`)
-      : await currentHead(current.worktreePath!);
+    // R5-01: commit and prove the commit carries the verified tree — content
+    // staged into the index after the gate ran must not ride the delivery
+    const sha = await commitVerifiedTree(
+      current.worktreePath!,
+      outcome.treeSha,
+      `ateam(${runId}): task ${task.taskId} attempt ${exec.attemptNo}`,
+    );
+    if (sha === null) {
+      // the committed content is NOT what the gate verified — refuse the
+      // delivery and route the task back through the worker gate
+      updateExecution(db, exec.id, { status: 'completed', paneState: 'retained' });
+      addEvent(db, runId, 'RECONCILE_DECISION', {
+        taskId: task.taskId,
+        payload: { reason: 'commit_tree_mismatch_after_verification', expectedTree: outcome.treeSha },
+      });
+      await this.retryWorker(getTask(db, runId, task.taskId)!, {});
+      return;
+    }
     // R2-02: the review dispatch intent lands in the SAME write that
     // advances the status, so a crash before startReviewer replays
     updateTask(db, runId, task.taskId, { status: 'reviewing', commitSha: sha, pendingDispatch: 'review' });
@@ -1005,12 +1023,24 @@ export class RunnerEngine {
         // alone does not survive a herdr id reuse
         await assertRemovableWorkspace(this.env, run.integrationWorkspaceId);
         await client.removeWorktree({ workspaceId: run.integrationWorkspaceId, force: true });
+        // R5-04: the removal may have run long — the state writes below are
+        // its conclusion and need a current fence
+        this.ensureLease();
         markResourceState(db, runId, 'workspace', run.integrationWorkspaceId, 'reclaimed');
-        // R3-07: integrator panes lived in the removed workspace — retired
-        // as `gone` (audit-honest), never as a success close
+        // R3-07 + pane-retirement policy: integrator panes lived in the
+        // removed workspace — retired as `gone` (never a success close), one
+        // audit event each, mirroring the task-worktree path
         for (const exec of listExecutions(db, runId)) {
           if (['open', 'retained'].includes(exec.paneState) && exec.workspaceId === run.integrationWorkspaceId) {
             updateExecution(db, exec.id, { paneState: 'gone' });
+            addEvent(db, runId, 'RECONCILE_DECISION', {
+              executionId: exec.id,
+              payload: {
+                reason: 'pane_retired_by_workspace_removal',
+                workspaceId: run.integrationWorkspaceId,
+                concludedSuccessfully: exec.status === 'completed' && !!exec.resultDigest,
+              },
+            });
           }
         }
         updateRunRuntimeState(db, runId, { integrationWorkspaceId: null, integrationPath: null });
@@ -1174,6 +1204,10 @@ export class RunnerEngine {
       task: probe,
       allowlist: config.verificationAllowlist,
       baseSha: run.integrationBaseSha ?? 'HEAD',
+      // R5-03: the final gate verifies the COMMITTED delivery — a dirty
+      // integration tree would make the PASS describe content no commit
+      // carries, so the tree must be clean before and after the commands
+      requireClean: true,
       logDir: `${home.runsDir}/${runId}/logs`,
     });
     // R2-06: renew the lease (token CAS) before the delivery conclusion; a
@@ -1430,6 +1464,24 @@ export class RunnerEngine {
         });
       }
 
+      // R5-02 companion: the deletion gate requires an ACTIVE provenanced
+      // ledger row, so a resource this run previously judged lost/orphaned
+      // that the authoritative snapshot shows alive again is re-activated —
+      // without this, strict identity gating could never reclaim a
+      // reappeared resource and the run would stall at integrating forever
+      for (const res of listResources(db, runId)) {
+        // no passStartedAt guard here: insertResource always writes 'active',
+        // so a non-active row necessarily predates this pass
+        if (res.state === 'active' || !observedIds.has(res.herdrId)) continue;
+        await apply(() => {
+          this.ensureLease();
+          markResourceState(db, runId, res.kind, res.herdrId, 'active');
+          addEvent(db, runId, 'RECONCILE_DECISION', {
+            payload: { reason: 'resource_reactivated', kind: res.kind, herdrId: res.herdrId },
+          });
+        });
+      }
+
       return decisions;
     } finally {
       stream?.close();
@@ -1538,7 +1590,10 @@ export class RunnerEngine {
     else status = 'running';
 
     if (run.status !== status && !TERMINAL_RUN.has(run.status)) {
-      updateRunStatus(db, runId, status);
+      // R5-03: a transition must not launder away a persisted run error —
+      // e.g. the aggregate may move needs_attention → integrating while a
+      // failed final verification still demands attention
+      updateRunStatus(db, runId, status, run.error ?? undefined);
       addEvent(db, runId, 'RUN_STATUS_CHANGED', { payload: { from: run.status, to: status } });
     }
   }

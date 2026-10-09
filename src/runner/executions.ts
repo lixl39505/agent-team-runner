@@ -13,6 +13,7 @@ import type { AteamHome } from '../config.ts';
 import { resolveAgentEntry, type AgentEntry, type AteamConfig } from '../config.ts';
 import type { HerdrRuntimeClient } from '../herdr/client.ts';
 import { HerdrError } from '../herdr/types.ts';
+import type { HerdrWorkspace } from '../herdr/types.ts';
 import { agentStartArgs } from '../herdr/agent-args.ts';
 import { buildRolePrompt } from '../results/prompts.ts';
 import { resultPathFor, sha256Hex } from '../results/files.ts';
@@ -107,13 +108,25 @@ export async function ensureTaskWorktree(env: RunnerEnv, task: TaskRecord): Prom
  * worktree create/open to start from the repo PARENT workspace, so the
  * operator-declared runner workspace wins, then a snapshot scan for the
  * workspace whose repo is the run's binding; ledgered task worktrees are
- * the last fallback (they may be refused by the runtime). */
+ * the last fallback (they may be refused by the runtime).
+ * R5-07: an explicitly pinned id must be PROVEN by the authoritative
+ * snapshot (exists + on the run's repo) — a stale or foreign pin would
+ * otherwise misroute every worktree creation. */
 export async function findSourceWorkspaceId(env: RunnerEnv): Promise<string> {
-  const herdrWorkspace = process.env.HERDR_WORKSPACE_ID ?? process.env.ATEAM_SOURCE_WORKSPACE_ID;
-  if (herdrWorkspace) return herdrWorkspace;
   const snap = await env.client.snapshot().catch(() => null);
   const repoRoot = env.contract.project.repoRoot;
-  const parent = snap?.workspaces.find((w) => (w.worktree?.repoRoot ?? w.worktree?.path ?? w.cwd) === repoRoot);
+  const onRepo = (w: HerdrWorkspace): boolean =>
+    (w.worktree?.repoRoot ?? w.worktree?.path ?? w.cwd) === repoRoot;
+  const herdrWorkspace = process.env.HERDR_WORKSPACE_ID ?? process.env.ATEAM_SOURCE_WORKSPACE_ID;
+  if (herdrWorkspace) {
+    const pinned = snap?.workspaces.find((w) => w.workspaceId === herdrWorkspace);
+    if (pinned && onRepo(pinned)) return herdrWorkspace;
+    throw new HerdrError(
+      'herdr_error',
+      `HERDR_WORKSPACE_ID/ATEAM_SOURCE_WORKSPACE_ID ${herdrWorkspace} is not a live workspace on the run repo ${repoRoot} — fix or unset it`,
+    );
+  }
+  const parent = snap?.workspaces.find(onRepo);
   if (parent) return parent.workspaceId;
   const resources = listActiveResources(env.db, env.runId).filter((r) => r.kind === 'workspace');
   const first = resources[0];

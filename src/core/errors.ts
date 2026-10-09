@@ -46,6 +46,15 @@ export class NeedsAttentionError extends AteamError {
   }
 }
 
+/** R5-04: the fencing token was lost to another writer mid-operation. The
+ * dispossessed writer must stop immediately and record nothing — cleanup
+ * steps rethrow this past their audit path so the new owner re-runs them. */
+export class LeaseLostError extends AteamError {
+  constructor(message = 'runner lease lost (fencing token no longer current) — another writer holds this run') {
+    super(message, { exitCode: 1 });
+  }
+}
+
 /** Runtime/Herdr failure. */
 export class RuntimeError extends AteamError {}
 

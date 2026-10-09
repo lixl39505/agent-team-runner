@@ -502,14 +502,16 @@ describe('RunnerEngine — full delivery chain', () => {
   test('clean reclaims verified resources and abandons the run', async () => {
     const fx = track(await makeFixture({}));
     seedRun(fx);
-    // simulate: API reached "integrated", final verification persisted, then
-    // the runner died before cleanup
+    // simulate: every task delivered (WEB/DOCS already reclaimed), API
+    // reached "integrated", final verification persisted, then the runner
+    // died before cleanup
     const ws = await fx.fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: `ateam/${RUN}/task/API` });
     fx.db.run(
       `UPDATE tasks SET status='integrated', branch=?, worktree_path=?, workspace_id=?,
        start_sha='s0', commit_sha='c1', integration_commit='i1' WHERE run_id=? AND task_id='API'`,
       [`ateam/${RUN}/task/API`, ws.worktree.path, ws.workspace.workspaceId, RUN],
     );
+    fx.db.run(`UPDATE tasks SET status='reclaimed' WHERE run_id=? AND task_id IN ('WEB','DOCS')`, [RUN]);
     const { insertResource } = await import('../src/store/resources.ts');
     insertResource(fx.db, { runId: RUN, taskId: 'API', kind: 'workspace', herdrId: ws.workspace.workspaceId, branch: ws.worktree.branch, path: ws.worktree.path });
     const { insertVerification } = await import('../src/store/verifications.ts');
@@ -1749,6 +1751,132 @@ describe('RunnerEngine — full delivery chain', () => {
     expect(getTask(fx.db, RUN, 'API')!.status).toBe('running'); // fresh worker attempt owns the tree again
   }, 30_000);
 
+  test('R5-01: content staged into the index MID-GATE fails the stage-first verification', async () => {
+    const fx = track(await makeFixture({
+      // the worker delivers a legal result AND plants smuggled.txt, which
+      // .gitignore keeps OUT of the stage-first pin; the "verification
+      // command" then force-stages it while the gate is running — exactly
+      // the concurrent-writer window R5-01 closes
+      [wName('API')]: {
+        kind: 'claude', sequence: ['working', 'done'], stepMs: 5,
+        onState: {
+          done: {
+            editFiles: [
+              ['src/api/x.ts', 'export const a = 1;\n'],
+              ['.gitignore', 'smuggled.txt\n'],
+              ['smuggled.txt', 'never verified\n'],
+            ],
+            writeResultFile: workerOk('src/api/x.ts', 'export const a = 1;\n', 'api done'),
+          },
+        },
+      },
+    }, { defaults: { maxWorkerAttempts: 1, maxParallel: 1 } }));
+    fx.contract = validateContract(minimalContract({
+      project: { id: 'demo', repoRoot: fx.repoRoot, baseRef: 'main' },
+      tasks: [{ id: 'API', title: 'api', allowedPaths: ['src/api/**'], verificationCommands: ['git add -f smuggled.txt'] }],
+    }));
+    seedRun(fx);
+    const engine = engineFor(fx);
+    await tickUntil(engine, fx, () => TERMINALS.includes(getRun(fx.db, RUN)!.status));
+
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('failed'); // gate refused → attempts exhausted
+    const { listVerifications } = await import('../src/store/verifications.ts');
+    const gate = listVerifications(fx.db, RUN).find((v) => v.kind === 'task');
+    expect(gate!.ok).toBe(false);
+    const violations = gate!.detail!.violations ?? [];
+    expect(violations.some((v) => v.includes('index changed during verification'))).toBe(true);
+    // the smuggled path violation is caught on the STAGED diff as well
+    expect(violations).toContain('smuggled.txt');
+  }, 30_000);
+
+  test('R5-01: worker edits landing after the gate never ride the delivery commit', async () => {
+    const fx = track(await makeFixture({
+      // both agents pause: the test injects the result, then the late edit,
+      // then the approval — deterministic ordering, no races
+      [wName('API')]: { kind: 'claude', sequence: ['working', 'done'], stepMs: 5, pauseAt: 'working' },
+      [vName('API')]: { kind: 'codex', sequence: ['working', 'done'], stepMs: 5, pauseAt: 'working', onState: { done: { writeResultFile: approvedReview(['src/api/x.ts']) } } },
+      [wName('API', 2)]: workerScript(['src/api/x.ts', 'v2 redo\n'], workerOk('src/api/x.ts', 'v2 redo\n', 'redo')),
+      [vName('API', 2)]: reviewerScript(approvedReview(['src/api/x.ts'])),
+    }));
+    seedRun(fx);
+    const engine = engineFor(fx);
+    await tickUntil(engine, fx, () => fx.fake.agentState(wName('API')) === 'working');
+
+    // the worker delivers its legal result; the gate stages + verifies + commits
+    await fx.fake.performAction(wName('API'), {
+      editFiles: [['src/api/x.ts', 'export const a = 1;\n']],
+      writeResultFile: workerOk('src/api/x.ts', 'export const a = 1;\n', 'api done'),
+    });
+    await tickUntil(engine, fx, () => {
+      const t = getTask(fx.db, RUN, 'API')!;
+      return t.status === 'reviewing' && !!t.commitSha;
+    });
+    const commitSha = getTask(fx.db, RUN, 'API')!.commitSha!;
+
+    // a same-worktree process keeps editing AFTER the commit — unstaged,
+    // never verified (the worker pane is already closed; this is the R5-01
+    // window the commit pin plus drift detection must close)
+    const { writeFile } = await import('node:fs/promises');
+    const apiWorktree = getTask(fx.db, RUN, 'API')!.worktreePath!;
+    await writeFile(join(apiWorktree, 'src/api/late.ts'), 'late\n', 'utf8');
+
+    // the commit content is exactly the verified staged set — no late.ts
+    const show = Bun.spawn(['git', '-C', getTask(fx.db, RUN, 'API')!.worktreePath!, 'show', '--name-only', '--format=', commitSha], {
+      stdout: 'pipe', stderr: 'pipe', stdin: 'ignore',
+    });
+    const files = (await new Response(show.stdout).text()).split('\n').map((l) => l.trim()).filter(Boolean);
+    expect(files).toContain('src/api/x.ts');
+    expect(files).not.toContain('src/api/late.ts');
+
+    // and the leftover late.ts is drift: the approval is demoted, the task
+    // re-enters the worker gate (R4-01 handling on top of the pinned commit)
+    await fx.fake.performAction(vName('API'), { writeResultFile: approvedReview(['src/api/x.ts']) });
+    await tickUntil(engine, fx, () => getTask(fx.db, RUN, 'API')!.attempts >= 2);
+    const { listEvents } = await import('../src/store/events.ts');
+    expect(listEvents(fx.db, RUN).some((e) =>
+      e.eventType === 'RECONCILE_DECISION'
+      && e.taskId === 'API'
+      && (e.payload as { reason?: string }).reason === 'worktree_drifted_after_verification',
+    )).toBe(true);
+  }, 30_000);
+
+  test('R5-03: a dirty integration tree fails the final gate instead of passing over uncommitted content', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    const { currentHead } = await import('../src/core/git.ts');
+    // settle EVERY task as integrated (a pending task would be scheduled and
+    // blow up on the fake commit shas) with a real integration worktree
+    const ws = await fx.fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: `ateam/${RUN}/integration` });
+    insertResource(fx.db, { runId: RUN, kind: 'workspace', herdrId: ws.workspace.workspaceId, branch: ws.worktree.branch, path: ws.worktree.path });
+    fx.db.run(
+      `UPDATE tasks SET status='integrated', branch=?, worktree_path=?, workspace_id=?, start_sha='s0',
+       commit_sha='c1', integration_commit=? WHERE run_id=?`,
+      [ws.worktree.branch, ws.worktree.path, ws.workspace.workspaceId, await currentHead(fx.repoRoot), RUN],
+    );
+    fx.db.run('UPDATE runs SET integration_path=?, integration_workspace_id=?, integration_branch=?, integration_base_sha=? WHERE id=?', [
+      ws.worktree.path, ws.workspace.workspaceId, ws.worktree.branch, await currentHead(ws.worktree.path), RUN,
+    ]);
+
+    // uncommitted content sits in the integration tree BEFORE the gate
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(join(ws.worktree.path, 'uncommitted.txt'), 'never committed\n', 'utf8');
+
+    const engine = engineFor(fx);
+    await engine.tickOnce(); // maybeIntegrate → finalVerification
+
+    // the gate REFUSED the dirty tree: no final flag, a persisted FAILING
+    // record naming the dirt, and the run carries the attention error
+    expect(getRun(fx.db, RUN)!.finalVerified).toBe(false);
+    expect(getRun(fx.db, RUN)!.error).toMatch(/integration final verification failed/);
+    const { latestVerification } = await import('../src/store/verifications.ts');
+    const final = latestVerification(fx.db, RUN, 'final')!;
+    expect(final.ok).toBe(false);
+    expect((final.detail!.violations ?? []).some((v) => v.includes('not clean before verification'))).toBe(true);
+    expect((final.detail!.violations ?? []).some((v) => v.includes('uncommitted.txt'))).toBe(true);
+    // the stale PASS never existed, so nothing was reclaimed either
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('integrated');
+  }, 30_000);
+
   test('R4-04: a failed dependency never schedules downstream — the pending task records why', async () => {
     const workerFail = (why: string) => ({
       status: 'failed', summary: 'gave up', testsRun: [], knownRisks: [], changedPaths: [], blockedReason: why,
@@ -1835,6 +1963,115 @@ describe('RunnerEngine — full delivery chain', () => {
     expect(TERMINALS).not.toContain(getRun(fx.db, RUN)!.status);
   }, 30_000);
 
+  test('R5-02: deletion gate refuses a snapshot with no worktree mapping and an id this run cannot prove', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    const ws = await fx.fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: `ateam/${RUN}/task/API` });
+    insertWorkspaceLedger(fx, ws);
+    fx.db.run(
+      `UPDATE tasks SET status='integrated', branch=?, worktree_path=?, workspace_id=?,
+       start_sha='s0', commit_sha='c1', integration_commit='i1' WHERE run_id=? AND task_id='API'`,
+      [`ateam/${RUN}/task/API`, ws.worktree.path, ws.workspace.workspaceId, RUN],
+    );
+    const { insertVerification } = await import('../src/store/verifications.ts');
+    insertVerification(fx.db, { runId: RUN, kind: 'final', ok: true, detail: { contractRevision: 1, integratedCommits: { API: 'i1' } } });
+    fx.db.run('UPDATE runs SET final_verified=1 WHERE id=?', [RUN]);
+
+    // herdr restarted and the reused id now maps to a workspace it describes
+    // WITHOUT a worktree record — no identity evidence, no force removal
+    const doctored = Object.create(fx.fake) as FakeHerdrClient;
+    doctored.snapshot = async () => {
+      const snap = await fx.fake.snapshot();
+      return {
+        ...snap,
+        workspaces: snap.workspaces.map((w) =>
+          w.workspaceId === ws.workspace.workspaceId ? { workspaceId: w.workspaceId, label: w.label, cwd: w.cwd } : w,
+        ),
+      };
+    };
+    const env = { ...envFor(fx), client: doctored as HerdrRuntimeClient };
+    const { cleanupTaskResources } = await import('../src/runner/cleanup.ts');
+    const outcome = await cleanupTaskResources(env, getTask(fx.db, RUN, 'API')!);
+    expect(outcome).toBeNull();
+    expect(latestCleanupStepStatus(fx, 'remove_worktree')).toBe('failed');
+    expect(fx.fake.worktreeOf(ws.workspace.workspaceId)).not.toBeNull(); // foreign workspace survived
+
+    // no ledger row in THIS run at all (and none in another run): equally
+    // unprovable — refused even though the snapshot "matches" nothing
+    fx.db.run('DELETE FROM herdr_resources WHERE run_id=? AND herdr_id=?', [RUN, ws.workspace.workspaceId]);
+    const outcome2 = await cleanupTaskResources(envFor(fx), getTask(fx.db, RUN, 'API')!);
+    expect(outcome2).toBeNull();
+    expect(fx.fake.worktreeOf(ws.workspace.workspaceId)).not.toBeNull();
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('integrated');
+  }, 30_000);
+
+  test('R5-04: a fence lost DURING remove_worktree records nothing — the new owner re-runs the step', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    const ws = await fx.fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: `ateam/${RUN}/task/API` });
+    insertWorkspaceLedger(fx, ws);
+    fx.db.run(
+      `UPDATE tasks SET status='integrated', branch=?, worktree_path=?, workspace_id=?,
+       start_sha='s0', commit_sha='c1', integration_commit='i1' WHERE run_id=? AND task_id='API'`,
+      [`ateam/${RUN}/task/API`, ws.worktree.path, ws.workspace.workspaceId, RUN],
+    );
+    const { insertVerification } = await import('../src/store/verifications.ts');
+    insertVerification(fx.db, { runId: RUN, kind: 'final', ok: true, detail: { contractRevision: 1, integratedCommits: { API: 'i1' } } });
+    fx.db.run('UPDATE runs SET final_verified=1 WHERE id=?', [RUN]);
+
+    // the removal SUCCEEDS, but the lease is stolen while it runs — the old
+    // writer must record neither ok nor failed, and must not conclude anything
+    const fence = acquireLease(fx.db, RUN)!;
+    const stealing = Object.create(fx.fake) as FakeHerdrClient;
+    stealing.removeWorktree = async (input: { workspaceId: string; force?: boolean }) => {
+      fx.db.run('UPDATE runner_leases SET heartbeat_at = ? WHERE run_id = ?', [new Date(Date.now() - 60_000).toISOString(), RUN]);
+      expect(acquireLease(fx.db, RUN)).not.toBeNull();
+      return fx.fake.removeWorktree(input);
+    };
+    const env = { ...envFor(fx), client: stealing as HerdrRuntimeClient };
+    const { cleanupTaskResources } = await import('../src/runner/cleanup.ts');
+    const { LeaseLostError } = await import('../src/core/errors.ts');
+    await expect(cleanupTaskResources(env, getTask(fx.db, RUN, 'API')!, {
+      ensureLease: () => {
+        if (!heartbeat(fx.db, RUN, fence)) throw new LeaseLostError('runner lease lost mid-clean');
+      },
+    })).rejects.toThrow(LeaseLostError);
+
+    // the irreversible op DID happen, but nothing was concluded on it
+    expect(fx.fake.worktreeOf(ws.workspace.workspaceId)).toBeNull();
+    expect(latestCleanupSteps(fx.db, RUN, 'API').get('remove_worktree')).toBeUndefined();
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('integrated');
+    const { getResourceForRun } = await import('../src/store/resources.ts');
+    expect(getResourceForRun(fx.db, RUN, 'workspace', ws.workspace.workspaceId)!.state).toBe('active');
+
+    // the new owner re-runs the sweep: the already-removed worktree is the
+    // postcondition, the step completes idempotently
+    const outcome = await cleanupTaskResources(envFor(fx), getTask(fx.db, RUN, 'API')!, {
+      ensureLease: () => {},
+    });
+    expect(outcome).toBe('reclaimed');
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('reclaimed');
+  }, 30_000);
+
+  test('R5-02: a resource judged lost that the snapshot shows alive again is re-activated', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    const ws = await fx.fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: `ateam/${RUN}/task/API` });
+    insertWorkspaceLedger(fx, ws);
+    const { markResourceState } = await import('../src/store/resources.ts');
+    markResourceState(fx.db, RUN, 'workspace', ws.workspace.workspaceId, 'lost');
+
+    const engine = engineFor(fx);
+    await engine.reconcileOnce({});
+
+    const { getResourceForRun } = await import('../src/store/resources.ts');
+    expect(getResourceForRun(fx.db, RUN, 'workspace', ws.workspace.workspaceId)!.state).toBe('active');
+    const { listEvents } = await import('../src/store/events.ts');
+    expect(listEvents(fx.db, RUN).some((e) =>
+      e.eventType === 'RECONCILE_DECISION' && (e.payload as { reason?: string }).reason === 'resource_reactivated',
+    )).toBe(true);
+  });
+
   test('R4-07: clean does not terminate a run with live executions', async () => {
     const fx = track(await makeFixture({
       [wName('API')]: { kind: 'claude', sequence: ['working', 'done'], stepMs: 5, pauseAt: 'working' },
@@ -1850,12 +2087,120 @@ describe('RunnerEngine — full delivery chain', () => {
     // R4-07: agents may still be writing — the run stays resumable, NOT abandoned
     expect(getRun(fx.db, RUN)!.status).toBe('planned');
 
-    // once no execution is active, clean finalizes as before
+    // once no execution is active, the in-flight task (status 'running', the
+    // R5-05 unsettled case) can only be settled by an explicit audited
+    // discard — plain clean still refuses to terminate
     const { listExecutions, updateExecution } = await import('../src/store/executions.ts');
     for (const exec of listExecutions(fx.db, RUN)) {
       updateExecution(fx.db, exec.id, { status: 'abandoned' });
     }
-    expect(await cmdClean({ runId: RUN, home: fx.home, json: true, client: fx.fake })).toBe(0);
+    expect(await cmdClean({ runId: RUN, home: fx.home, json: true, client: fx.fake })).toBe(1);
+    expect(TERMINALS).not.toContain(getRun(fx.db, RUN)!.status);
+    expect(await cmdClean({ runId: RUN, home: fx.home, json: true, client: fx.fake, discardWork: true })).toBe(0);
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('discarded');
     expect(getRun(fx.db, RUN)!.status).toBe('abandoned');
+  }, 30_000);
+
+  test('pane-retirement policy: a retained (failed-attempt) pane is retired `gone` with an audit event when its workspace is reclaimed', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    const ws = await fx.fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: `ateam/${RUN}/task/API` });
+    insertWorkspaceLedger(fx, ws);
+    fx.db.run(
+      `UPDATE tasks SET status='integrated', branch=?, worktree_path=?, workspace_id=?,
+       start_sha='s0', commit_sha='c1', integration_commit='i1' WHERE run_id=? AND task_id='API'`,
+      [`ateam/${RUN}/task/API`, ws.worktree.path, ws.workspace.workspaceId, RUN],
+    );
+    // a failed worker attempt whose pane was kept for attach (R2-11) — the
+    // delivery later succeeded via a fresh attempt, the pane is still here
+    const { insertExecution } = await import('../src/store/executions.ts');
+    insertExecution(fx.db, {
+      id: `${RUN}-API-w-dead`, runId: RUN, taskId: 'API', role: 'worker', attemptNo: 1, cycleNo: 0,
+      agentName: wName('API'), agentKind: 'claude', model: null, status: 'completed',
+      promptSentAt: new Date().toISOString(), promptDigest: null, startFailed: false,
+      resultPath: null, resultDigest: 'd0', resultAppliedDigest: 'd0', result: { status: 'failed' },
+      resultReceivedAt: null, nativeSessionRef: null, paneId: `${ws.workspace.workspaceId}:p-dead`,
+      tabId: null, workspaceId: ws.workspace.workspaceId, paneState: 'retained',
+      lastAgentState: null, startedAt: new Date().toISOString(), finishedAt: null,
+    });
+    const { insertVerification } = await import('../src/store/verifications.ts');
+    insertVerification(fx.db, { runId: RUN, kind: 'final', ok: true, detail: { contractRevision: 1, integratedCommits: { API: 'i1' } } });
+    fx.db.run('UPDATE runs SET final_verified=1 WHERE id=?', [RUN]);
+
+    const { cleanupTaskResources } = await import('../src/runner/cleanup.ts');
+    const outcome = await cleanupTaskResources(envFor(fx), getTask(fx.db, RUN, 'API')!);
+    expect(outcome).toBe('reclaimed');
+
+    // the attach surface did not survive the workspace removal — recorded as
+    // `gone` (never a success close) with one audit event naming why
+    const { listExecutions } = await import('../src/store/executions.ts');
+    expect(listExecutions(fx.db, RUN).find((e) => e.id === `${RUN}-API-w-dead`)!.paneState).toBe('gone');
+    const { listEvents } = await import('../src/store/events.ts');
+    const retired = listEvents(fx.db, RUN).filter((e) =>
+      e.eventType === 'RECONCILE_DECISION'
+      && (e.payload as { reason?: string }).reason === 'pane_retired_by_workspace_removal');
+    expect(retired.some((e) => e.executionId === `${RUN}-API-w-dead`)).toBe(true);
+    expect((retired[0]!.payload as { concludedSuccessfully?: boolean }).concludedSuccessfully).toBe(false);
+  }, 30_000);
+
+  test('R5-05: clean refuses to terminate a run whose dispatch intent never became an execution', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    // the crash window R5-05 closes: the worker result was consumed, the
+    // task advanced to reviewing with a pending review dispatch — and no
+    // execution is active. The old "no active executions" check would have
+    // terminated the run here, stranding the review and the worktree.
+    const ws = await fx.fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: `ateam/${RUN}/task/API` });
+    insertWorkspaceLedger(fx, ws);
+    fx.db.run(
+      `UPDATE tasks SET status='reviewing', pending_dispatch='review', branch=?, worktree_path=?, workspace_id=?,
+       start_sha='s0', commit_sha='c1', integration_commit=NULL WHERE run_id=? AND task_id='API'`,
+      [`ateam/${RUN}/task/API`, ws.worktree.path, ws.workspace.workspaceId, RUN],
+    );
+
+    const { cmdClean } = await import('../src/commands/clean.ts');
+    expect(await cmdClean({ runId: RUN, home: fx.home, json: true, client: fx.fake })).toBe(1);
+    // resumable: the run stays visible to the startup/reconcile path that
+    // replays the dispatch intent
+    expect(TERMINALS).not.toContain(getRun(fx.db, RUN)!.status);
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('reviewing');
+    expect((await fx.fake.snapshot()).workspaces.some((w) => w.workspaceId === ws.workspace.workspaceId)).toBe(true);
+    const { branchExists } = await import('../src/core/git.ts');
+    expect(await branchExists(fx.repoRoot, `ateam/${RUN}/task/API`)).toBe(true);
+
+    // explicit operator abort: every non-reclaimed task is settled as an
+    // audited discard, THEN the run may terminate
+    expect(await cmdClean({ runId: RUN, home: fx.home, json: true, client: fx.fake, discardWork: true })).toBe(0);
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('discarded');
+    expect(getTask(fx.db, RUN, 'WEB')!.status).toBe('discarded');
+    expect(getTask(fx.db, RUN, 'DOCS')!.status).toBe('discarded');
+    expect(getRun(fx.db, RUN)!.status).toBe('abandoned');
+    expect((await fx.fake.snapshot()).workspaces.filter((w) => w.workspaceId !== 'w0')).toHaveLength(0);
+    expect(await branchExists(fx.repoRoot, `ateam/${RUN}/task/API`)).toBe(false);
+  }, 30_000);
+
+  test('R5-06: reconcile exit code distinguishes hard failures from deferrals', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    const { cmdReconcile } = await import('../src/commands/reconcile-cli.ts');
+    const { RunnerEngine } = await import('../src/runner/engine.ts');
+    const proto = RunnerEngine.prototype as unknown as { reconcileOnce: unknown };
+    const original = proto.reconcileOnce;
+    // a pass that aborts mid-way is a HARD failure: exit 1, never 0
+    proto.reconcileOnce = async () => Promise.reject(new Error('pass exploded'));
+    try {
+      expect(await cmdReconcile({ runId: RUN, home: fx.home, json: true, dryRun: false, client: fx.fake })).toBe(1);
+    } finally {
+      proto.reconcileOnce = original;
+    }
+    // a runtime that cannot answer snapshot/subscribe DEFERS the judgments:
+    // its own exit state (10), machine-readable in the JSON output
+    const unavailable = stubClient({
+      snapshot: () => Promise.reject(new Error('socket gone')),
+      subscribe: () => Promise.reject(new Error('socket gone')),
+    });
+    expect(await cmdReconcile({ runId: RUN, home: fx.home, json: true, dryRun: false, client: unavailable as HerdrRuntimeClient })).toBe(10);
+    // and a healthy pass with nothing to do is exit 0
+    expect(await cmdReconcile({ runId: RUN, home: fx.home, json: true, dryRun: false, client: fx.fake })).toBe(0);
   }, 30_000);
 });

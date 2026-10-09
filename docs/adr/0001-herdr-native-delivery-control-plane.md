@@ -116,6 +116,13 @@ task branch 和对应 worktree 都是单次交付的临时资源。任务通过 
 把已完成集成但未完成回收的资源视为待清理，而不是创建新的 task attempt；每个回收步骤均须可
 安全重试。
 
+> **决策修订（2026-10-09，review05）——失败/`blocked` pane 的保留边界：** "失败和 `blocked`
+> pane 可 attach" 约束的是 run 的存活阶段（执行、复核、集成、终验）：这些阶段不得关闭未成功
+> 的 pane。终验通过后的回收按上文固定顺序移除 workspace，其 pane 树随之消失——这是回收语义
+> 的固有结果，不构成违规。此刻遗留的未成功 pane 统一退役为 `gone`（绝不记为成功关闭），并逐个
+> 写入审计事件 `pane_retired_by_workspace_removal`（含 execution 与其结论状态）；回收不得因
+> 等待人工检查遗留 pane 而无限期阻塞。
+
 ### Herdr 插件
 
 发布的插件根目录包含 `herdr-plugin.toml`，至少声明：

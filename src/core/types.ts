@@ -94,6 +94,14 @@ export type TaskStatus = (typeof TASK_STATUSES)[number];
  */
 export type PendingDispatch = 'review' | 'worker_retry';
 
+/**
+ * Task states that need no further delivery work (R5-05): the schedule
+ * engine settles on these, and so must any run-finalization decision — a
+ * run with tasks outside this set (or with a pending dispatch intent) still
+ * has delivery or temp-resource work in flight.
+ */
+export const SETTLED_TASK: ReadonlySet<string> = new Set(['integrated', 'reclaimed', 'discarded', 'failed']);
+
 export const EXECUTION_STATUSES = [
   'starting',
   'running',

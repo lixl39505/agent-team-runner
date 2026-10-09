@@ -82,6 +82,16 @@ export function listActiveResources(db: SqliteDb, runId: string): HerdrResourceR
   ).map(toRecord);
 }
 
+/** Every ledger row of a run regardless of state (identity re-checks read
+ * the full history, e.g. re-activating a resource the snapshot shows alive). */
+export function listResources(db: SqliteDb, runId: string): HerdrResourceRecord[] {
+  return (
+    db.query<ResourceRow, [string]>(
+      'SELECT * FROM herdr_resources WHERE run_id = ? ORDER BY id',
+    ).all(runId)
+  ).map(toRecord);
+}
+
 export function getResource(db: SqliteDb, kind: HerdrResourceKind, herdrId: string): HerdrResourceRecord | null {
   const row = db
     .query<ResourceRow, [string, string]>('SELECT * FROM herdr_resources WHERE kind = ? AND herdr_id = ?')

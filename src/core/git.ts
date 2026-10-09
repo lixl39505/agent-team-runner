@@ -45,6 +45,47 @@ export async function changedFiles(repoRoot: string, fromSha: string, toSha = 'H
 }
 
 /**
+ * R5-01: the delivery change set of a STAGE-FIRST gate — the index vs the
+ * base sha, i.e. exactly the content a subsequent commit will carry. Files
+ * edited (but not re-staged) after `stageAll` are invisible here, which is
+ * the point: the gate verifies the tree the commit will contain.
+ */
+export async function stagedChangedFiles(repoRoot: string, fromSha: string): Promise<string[]> {
+  const out = await gitOk(repoRoot, ['diff', '--cached', '--name-only', fromSha]);
+  return out.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
+}
+
+/** R5-01: the index as a tree sha — the immutable content pin a stage-first
+ * gate hands to the commit step. */
+export async function writeTree(repoRoot: string): Promise<string> {
+  return gitOk(repoRoot, ['write-tree']);
+}
+
+/** R5-01: the tree an existing commit points at (`<sha>^{tree}`). */
+export async function commitTree(repoRoot: string, sha: string): Promise<string> {
+  return revParse(repoRoot, `${sha}^{tree}`);
+}
+
+/**
+ * R5-03: every path that makes a worktree "not clean" — any status entry
+ * (staged, unstaged or untracked) outside runner-internal `.ateam/**`
+ * bookkeeping. The final gate requires this set to be empty before and
+ * after the verification commands, so the PASS describes exactly the
+ * committed delivery.
+ */
+export async function worktreeDirtyFiles(repoRoot: string): Promise<string[]> {
+  const status = await gitRaw(repoRoot, ['status', '--porcelain', '-uall']);
+  const files: string[] = [];
+  for (const line of status.split('\n')) {
+    if (!line.trim()) continue;
+    let p = line.slice(3).trim();
+    if (p.includes(' -> ')) p = p.split(' -> ').pop()!.trim();
+    if (p && !matchAny(ATEAM_INTERNAL_PATTERNS, p)) files.push(p);
+  }
+  return files;
+}
+
+/**
  * Worktree-level DELIVERY change set vs a base sha: committed diffs PLUS
  * staged/modified/untracked files (workers edit without committing — the
  * runner commits only after verification passes). Runner-internal
