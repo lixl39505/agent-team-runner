@@ -110,7 +110,11 @@ export class HerdrSocketTransport {
    * herdr 0.9.x (protocol 22) only admits pane-scoped subscriptions — every
    * entry REQUIRES a pane_id and a global subscription is rejected with
    * invalid_request (errors also carry an empty id, which would silently
-   * never match our ack). Callers pass the panes they actually track. */
+   * never match our ack — treated as a refusal below). Callers pass the
+   * panes they actually track. worktree.* types are accepted alongside pane
+   * types (真机 0.9.1 验证：混合订阅正常 ack，worktree 事件按 repo 上下文投递
+   * 到已有 pane 订阅), and only ONE events.subscribe per connection takes
+   * effect — later ones are silently dropped. */
   async subscribe(filter?: { paneId?: string; paneIds?: string[] }, timeoutMs = 15_000): Promise<HerdrEventStream> {
     const panes = filter?.paneId ? [filter.paneId] : (filter?.paneIds ?? []);
     if (panes.length === 0) {
@@ -118,7 +122,13 @@ export class HerdrSocketTransport {
     }
     const socket = await this.connectSocket(timeoutMs);
     const id = `ateam-sub-${++this.seq}`;
-    const types = ['pane.agent_status_changed', 'pane.closed', 'pane.exited'];
+    const types = [
+      'pane.agent_status_changed',
+      'pane.closed',
+      'pane.exited',
+      'worktree.created',
+      'worktree.removed',
+    ];
     const subscriptions = panes.flatMap((p) => types.map((type) => ({ type, pane_id: p })));
     socket.write(`${JSON.stringify({ id, method: 'events.subscribe', params: { subscriptions } })}\n`);
 
@@ -154,10 +164,18 @@ export class HerdrSocketTransport {
 
     const handleLine = (line: string): void => {
       if (!line.trim()) return;
-      let doc: { id?: string; error?: { code?: string; message?: string }; event?: unknown; type?: string; pane_id?: string; workspace_id?: string };
+      let doc: { id?: string | null; error?: { code?: string; message?: string }; event?: string; data?: Record<string, unknown>; type?: string; pane_id?: string; workspace_id?: string };
       try {
         doc = JSON.parse(line);
       } catch {
+        return;
+      }
+      // herdr 0.9.x refuses subscriptions with an error envelope whose id is
+      // EMPTY ("" — it can never match our request id). One subscribe per
+      // connection, so an unattributed error can only be our refusal;
+      // surface it now instead of burning the full ack timeout.
+      if (doc.error && (doc.id === undefined || doc.id === null || doc.id === '')) {
+        onFail?.(new HerdrError('herdr_error', doc.error.message ?? doc.error.code ?? 'events.subscribe', doc.error));
         return;
       }
       if (doc.id === id) {
@@ -170,11 +188,23 @@ export class HerdrSocketTransport {
         onAck?.();
         return;
       }
-      const payload = (doc.event ?? doc) as Record<string, unknown>;
+      // 真机 0.9.1 wire shape（2026-10-09 探针实测）：载荷在 `data` 里，类型名
+      // 有两种写法 —— `event` 字段（pane.agent_status_changed 点号 /
+      // pane_closed 下划线）或 `data.type`（worktree_removed 下划线，无
+      // `event` 时兜底）。归一到 API 的点号名：无点的先取第一个下划线。
+      const payload = (doc.data && typeof doc.data === 'object' ? doc.data : doc) as Record<string, unknown>;
+      let type = String(doc.event ?? payload.type ?? 'unknown');
+      if (!type.includes('.')) type = type.replace('_', '.');
+      // workspace_id sits at data top level for most events, but
+      // worktree.created nests it (data.workspace.workspace_id with
+      // data.worktree.open_workspace_id as a fallback)
+      const nested = (payload.workspace ?? payload.worktree ?? null) as Record<string, unknown> | null;
+      const wsId = [payload.workspace_id, nested?.workspace_id, nested?.open_workspace_id]
+        .find((v): v is string => typeof v === 'string' && v.length > 0);
       const event: HerdrEvent = {
-        type: String(payload.type ?? 'unknown'),
+        type,
         paneId: typeof payload.pane_id === 'string' ? payload.pane_id : undefined,
-        workspaceId: typeof payload.workspace_id === 'string' ? payload.workspace_id : undefined,
+        workspaceId: wsId,
         payload,
       };
       if (waiter) {
