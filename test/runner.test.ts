@@ -20,6 +20,8 @@ import { agentName } from '../src/store/ids.ts';
 import { DEFAULT_CONFIG, type AteamConfig } from '../src/config.ts';
 import type { ExecutionContract } from '../src/core/types.ts';
 import { acquireLease, heartbeat, releaseLease } from '../src/store/lease.ts';
+import { insertResource } from '../src/store/resources.ts';
+import { latestCleanupSteps } from '../src/store/cleanup.ts';
 import { cleanupTempDir, initRepo, makeTempDir, minimalContract } from './helpers.ts';
 
 const RUN = 'r-20261003-run001';
@@ -113,6 +115,20 @@ function envFor(fx: Fixture, runId = RUN) {
 
 function engineFor(fx: Fixture, runId = RUN): RunnerEngine {
   return new RunnerEngine(envFor(fx, runId), { tickMs: 5 });
+}
+
+/** Ledger the workspace a handle points at (what startExecution does). */
+function insertWorkspaceLedger(
+  fx: Fixture,
+  ws: Awaited<ReturnType<FakeHerdrClient['createWorktreeWorkspace']>>,
+  taskId = 'API',
+): void {
+  insertResource(fx.db, { runId: RUN, taskId, kind: 'workspace', herdrId: ws.workspace.workspaceId, branch: ws.worktree.branch, path: ws.worktree.path });
+}
+
+/** Latest recorded status of one cleanup step (test readability helper). */
+function latestCleanupStepStatus(fx: Fixture, step: string): string | undefined {
+  return latestCleanupSteps(fx.db, RUN, 'API').get(step as never)?.status;
 }
 
 /** Minimal HerdrRuntimeClient stub overriding just what a test exercises. */
@@ -565,6 +581,85 @@ describe('RunnerEngine — full delivery chain', () => {
     const { branchExists } = await import('../src/core/git.ts');
     expect(await branchExists(fx.repoRoot, 'users/someone/feature')).toBe(true); // untouched
     expect(getTask(fx.db, RUN, 'API')!.status).toBe('integrated');
+  }, 30_000);
+
+  test('R4-03: cleanup refuses when the herdr id no longer maps to the ledgered workspace (id reuse)', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    const ws = await fx.fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: `ateam/${RUN}/task/API` });
+    insertWorkspaceLedger(fx, ws);
+    fx.db.run(
+      `UPDATE tasks SET status='integrated', branch=?, worktree_path=?, workspace_id=?,
+       start_sha='s0', commit_sha='c1', integration_commit='i1' WHERE run_id=? AND task_id='API'`,
+      [`ateam/${RUN}/task/API`, ws.worktree.path, ws.workspace.workspaceId, RUN],
+    );
+    const { insertVerification } = await import('../src/store/verifications.ts');
+    insertVerification(fx.db, { runId: RUN, kind: 'final', ok: true, detail: { contractRevision: 1, integratedCommits: { API: 'i1' } } });
+    fx.db.run('UPDATE runs SET final_verified=1 WHERE id=?', [RUN]);
+
+    // herdr restarted and REUSED the id for a different workspace (another
+    // path): the ledger row alone must not authorize the force removal
+    const doctored = Object.create(fx.fake) as FakeHerdrClient;
+    doctored.snapshot = async () => {
+      const snap = await fx.fake.snapshot();
+      return {
+        ...snap,
+        workspaces: snap.workspaces.map((w) =>
+          w.workspaceId === ws.workspace.workspaceId
+            ? { ...w, worktree: { ...w.worktree!, path: '/elsewhere/some-other-run', branch: 'main' } }
+            : w,
+        ),
+      };
+    };
+    const env = { ...envFor(fx), client: doctored as HerdrRuntimeClient };
+    const { cleanupTaskResources } = await import('../src/runner/cleanup.ts');
+    const outcome = await cleanupTaskResources(env, getTask(fx.db, RUN, 'API')!);
+    expect(outcome).toBeNull(); // refused at remove_worktree
+    expect(latestCleanupStepStatus(fx, 'remove_worktree')).toBe('failed');
+    // the foreign workspace survived, the branch was never touched
+    expect(fx.fake.worktreeOf(ws.workspace.workspaceId)).not.toBeNull();
+    const { branchExists } = await import('../src/core/git.ts');
+    expect(await branchExists(fx.repoRoot, `ateam/${RUN}/task/API`)).toBe(true);
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('integrated');
+
+    // identity restored (the mapping matches the ledger again) → cleanup proceeds
+    const outcome2 = await cleanupTaskResources(envFor(fx), getTask(fx.db, RUN, 'API')!);
+    expect(outcome2).toBe('reclaimed');
+    expect(fx.fake.worktreeOf(ws.workspace.workspaceId)).toBeNull();
+  }, 30_000);
+
+  test('R4-06: a vanished integration worktree voids the old final PASS for reclamation', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    const ws = await fx.fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: `ateam/${RUN}/task/API` });
+    insertWorkspaceLedger(fx, ws);
+    fx.db.run(
+      `UPDATE tasks SET status='integrated', branch=?, worktree_path=?, workspace_id=?,
+       start_sha='s0', commit_sha='c1', integration_commit='i1' WHERE run_id=? AND task_id='API'`,
+      [`ateam/${RUN}/task/API`, ws.worktree.path, ws.workspace.workspaceId, RUN],
+    );
+    const { insertVerification } = await import('../src/store/verifications.ts');
+    const { currentHead } = await import('../src/core/git.ts');
+    // the PASS binds to the integration HEAD it verified — here the repo
+    // HEAD stands in for it while the tree is "elsewhere"
+    insertVerification(fx.db, {
+      runId: RUN, kind: 'final', ok: true,
+      detail: { contractRevision: 1, headSha: await currentHead(fx.repoRoot), integratedCommits: { API: 'i1' } },
+    });
+    fx.db.run(`UPDATE runs SET final_verified=1, integration_path=? WHERE id=?`, [join(fx.fsRoot, 'integration-lost'), RUN]);
+
+    const { cleanupTaskResources } = await import('../src/runner/cleanup.ts');
+    // the integration tree is gone: the persisted PASS cannot prove the
+    // delivered HEAD, so the task worktree must NOT be reclaimed on it
+    const outcome = await cleanupTaskResources(envFor(fx), getTask(fx.db, RUN, 'API')!);
+    expect(outcome).toBeNull();
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('integrated');
+    expect(fx.fake.worktreeOf(ws.workspace.workspaceId)).not.toBeNull();
+
+    // with the integration tree PRESENT (and the HEAD verified) cleanup proceeds
+    fx.db.run(`UPDATE runs SET integration_path=? WHERE id=?`, [fx.repoRoot, RUN]);
+    const outcome2 = await cleanupTaskResources(envFor(fx), getTask(fx.db, RUN, 'API')!);
+    expect(outcome2).toBe('reclaimed');
   }, 30_000);
 
   test('clean refuses while a live runner holds the lease', async () => {
@@ -1577,5 +1672,190 @@ describe('RunnerEngine — full delivery chain', () => {
     // the real pass applies it
     await engine.reconcileOnce({});
     expect(getTask(fx.db, RUN, 'API')!.status).toBe('reviewing');
+  }, 30_000);
+
+  test('R4-01: content appearing in the worktree after verification re-enters the worker gate instead of being approved', async () => {
+    const injectedReview = {
+      ...approvedReview(['src/api/x.ts']),
+      summary: 'lgtm (but I also touched a file — reviewers must not)',
+    };
+    const fx = track(await makeFixture({
+      ...happyScripts(),
+      [wName('API', 2)]: workerScript(['src/api/x.ts', 'v2 after drift\n'], workerOk('src/api/x.ts', 'v2 after drift\n', 'redo')),
+      // the reviewer approving AND leaving uncommitted delivery content in
+      // the same worktree: exactly the post-verification change R4-01 forbids
+      [vName('API')]: {
+        kind: 'codex',
+        sequence: ['working', 'done'],
+        stepMs: 5,
+        onState: {
+          done: {
+            editFiles: [['src/api/injected.ts', 'tampered after the gate ran\n']],
+            writeResultFile: injectedReview,
+          },
+        },
+      },
+      [vName('API', 2)]: reviewerScript(approvedReview(['src/api/x.ts'])),
+    }));
+    seedRun(fx);
+    const engine = engineFor(fx);
+    await tickUntil(engine, fx, () => TERMINALS.includes(getRun(fx.db, RUN)!.status));
+
+    // the drift was caught: the approval was demoted to a re-verification
+    const { listEvents } = await import('../src/store/events.ts');
+    const decisions = listEvents(fx.db, RUN).filter((e) => e.eventType === 'RECONCILE_DECISION')
+      .filter((e) => (e.payload as { reason?: string }).reason === 'worktree_drifted_after_verification');
+    expect(decisions.some((e) => e.taskId === 'API')).toBe(true);
+    // exactly ONE TASK_APPROVED: the first verdict was demoted, the second earned it
+    expect(listEvents(fx.db, RUN).filter((e) => e.eventType === 'TASK_APPROVED' && e.taskId === 'API')).toHaveLength(1);
+    // the delivery went through the FULL cycle again: worker attempt 2 +
+    // review cycle 2, and only then integration
+    expect(listExecutions(fx.db, RUN).filter((e) => e.taskId === 'API' && e.role === 'worker')).toHaveLength(2);
+    expect(listExecutions(fx.db, RUN).filter((e) => e.taskId === 'API' && e.role === 'reviewer')).toHaveLength(2);
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('reclaimed');
+    expect(getRun(fx.db, RUN)!.status).toBe('done');
+  }, 30_000);
+
+  test('R4-01: a task worktree whose HEAD moved past the verified commit is re-verified before integration', async () => {
+    const fx = track(await makeFixture({
+      ...happyScripts(),
+      [wName('API', 2)]: workerScript(['src/api/x.ts', 'v2 redo\n'], workerOk('src/api/x.ts', 'v2 redo\n', 'redo')),
+      // the reviewer pauses before delivering: its approval is injected manually
+      [vName('API')]: { kind: 'codex', sequence: ['working', 'done'], stepMs: 5, pauseAt: 'working', onState: { done: { writeResultFile: approvedReview(['src/api/x.ts']) } } },
+    }));
+    seedRun(fx);
+    // drive the delivery chain to 'reviewing' with a REAL verified commit
+    const engine = engineFor(fx);
+    await tickUntil(engine, fx, () => {
+      const t = getTask(fx.db, RUN, 'API')!;
+      return t.status === 'reviewing' && !!t.commitSha;
+    }, 2000);
+    const apiTask = getTask(fx.db, RUN, 'API')!;
+    // a same-worktree process commits AFTER the gate verified commitSha
+    const { writeFile } = await import('node:fs/promises');
+    const { stageAll, commit } = await import('../src/core/git.ts');
+    await writeFile(`${apiTask.worktreePath}/src/api/late.ts`, 'committed after verification\n', 'utf8');
+    await stageAll(apiTask.worktreePath!);
+    await commit(apiTask.worktreePath!, 'post-verification commit');
+
+    // the (now drifted) delivery is approved: the verdict must be demoted —
+    // integration never sees the post-verification commit
+    await fx.fake.performAction(vName('API'), { writeResultFile: approvedReview(['src/api/x.ts']) });
+    await tickUntil(engine, fx, () => getTask(fx.db, RUN, 'API')!.attempts >= 2);
+    const { listEvents } = await import('../src/store/events.ts');
+    const decisions = listEvents(fx.db, RUN).filter((e) => e.eventType === 'RECONCILE_DECISION')
+      .filter((e) => (e.payload as { reason?: string }).reason === 'worktree_drifted_after_verification');
+    expect(decisions.some((e) => e.taskId === 'API')).toBe(true);
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('running'); // fresh worker attempt owns the tree again
+  }, 30_000);
+
+  test('R4-04: a failed dependency never schedules downstream — the pending task records why', async () => {
+    const workerFail = (why: string) => ({
+      status: 'failed', summary: 'gave up', testsRun: [], knownRisks: [], changedPaths: [], blockedReason: why,
+    });
+    const fx = track(await makeFixture({
+      [wName('API')]: workerScript(['src/api/x.ts', 'v1\n'], workerFail('cannot do it')),
+      [wName('API', 2)]: workerScript(['src/api/x.ts', 'v2\n'], workerFail('still cannot')),
+      [wName('API', 3)]: workerScript(['src/api/x.ts', 'v3\n'], workerFail('hopeless')),
+      // DOCS must NEVER run — give it a script whose side effect is observable
+      [wName('DOCS')]: workerScript(['docs/z.md', '# should never exist\n'], workerOk('docs/z.md', '# docs\n', 'docs')),
+    }));
+    seedRun(fx);
+    const engine = engineFor(fx);
+    await tickUntil(engine, fx, () => TERMINALS.includes(getRun(fx.db, RUN)!.status));
+
+    expect(getRun(fx.db, RUN)!.status).toBe('failed');
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('failed');
+    const docs = getTask(fx.db, RUN, 'DOCS')!;
+    expect(docs.status).toBe('pending'); // never started…
+    expect(docs.attempts).toBe(0);
+    expect(docs.lastError).toMatch(/dependency API failed/);
+    expect(listExecutions(fx.db, RUN).some((e) => e.taskId === 'DOCS')).toBe(false); // …and no execution exists
+  }, 30_000);
+
+  test('R4-05: reconcile carries the fencing token — a writer that lost the lease stops mid-pass', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    const ws = await fx.fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: `ateam/${RUN}/task/API` });
+    insertWorkspaceLedger(fx, ws);
+    fx.db.run(
+      `UPDATE tasks SET status='integrated', branch=?, worktree_path=?, workspace_id=?,
+       start_sha='s0', commit_sha='c1', integration_commit='i1' WHERE run_id=? AND task_id='API'`,
+      [`ateam/${RUN}/task/API`, ws.worktree.path, ws.workspace.workspaceId, RUN],
+    );
+    const { insertVerification } = await import('../src/store/verifications.ts');
+    insertVerification(fx.db, { runId: RUN, kind: 'final', ok: true, detail: { contractRevision: 1, integratedCommits: { API: 'i1' } } });
+    fx.db.run('UPDATE runs SET final_verified=1 WHERE id=?', [RUN]);
+
+    // the pass's FIRST snapshot is where a second writer steals the lease
+    const fence = acquireLease(fx.db, RUN)!;
+    const stealing = Object.create(fx.fake) as FakeHerdrClient;
+    stealing.snapshot = async () => {
+      fx.db.run('UPDATE runner_leases SET heartbeat_at = ? WHERE run_id = ?', [new Date(Date.now() - 60_000).toISOString(), RUN]);
+      expect(acquireLease(fx.db, RUN)).not.toBeNull(); // the second writer takes over
+      return fx.fake.snapshot();
+    };
+    const env = { ...envFor(fx), client: stealing as HerdrRuntimeClient };
+    const engine = new RunnerEngine(env, { leaseFence: fence });
+
+    await expect(engine.reconcileOnce({})).rejects.toThrow(/lease lost/);
+    // the destruction never finalized: task not reclaimed, branch intact
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('integrated');
+    const { branchExists } = await import('../src/core/git.ts');
+    expect(await branchExists(fx.repoRoot, `ateam/${RUN}/task/API`)).toBe(true);
+  }, 30_000);
+
+  test('R4-05: clean renews the fence between teardown steps and aborts when it is lost', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    const ws = await fx.fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: `ateam/${RUN}/task/API` });
+    insertWorkspaceLedger(fx, ws);
+    fx.db.run(
+      `UPDATE tasks SET status='integrated', branch=?, worktree_path=?, workspace_id=?,
+       start_sha='s0', commit_sha='c1', integration_commit='i1' WHERE run_id=? AND task_id='API'`,
+      [`ateam/${RUN}/task/API`, ws.worktree.path, ws.workspace.workspaceId, RUN],
+    );
+    const { insertVerification } = await import('../src/store/verifications.ts');
+    insertVerification(fx.db, { runId: RUN, kind: 'final', ok: true, detail: { contractRevision: 1, integratedCommits: { API: 'i1' } } });
+    fx.db.run("UPDATE runs SET status='needs_attention', final_verified=1 WHERE id=?", [RUN]);
+
+    const stealing = Object.create(fx.fake) as FakeHerdrClient;
+    stealing.snapshot = async () => {
+      fx.db.run('UPDATE runner_leases SET heartbeat_at = ? WHERE run_id = ?', [new Date(Date.now() - 60_000).toISOString(), RUN]);
+      expect(acquireLease(fx.db, RUN)).not.toBeNull();
+      return fx.fake.snapshot();
+    };
+    const { cmdClean } = await import('../src/commands/clean.ts');
+    await expect(cmdClean({ runId: RUN, home: fx.home, json: false, client: stealing as HerdrRuntimeClient }))
+      .rejects.toThrow(/lease.*lost|lost.*lease/i);
+    // the abort preserved the resumable state: no termination, no branch deletion
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('integrated');
+    const { branchExists } = await import('../src/core/git.ts');
+    expect(await branchExists(fx.repoRoot, `ateam/${RUN}/task/API`)).toBe(true);
+    expect(TERMINALS).not.toContain(getRun(fx.db, RUN)!.status);
+  }, 30_000);
+
+  test('R4-07: clean does not terminate a run with live executions', async () => {
+    const fx = track(await makeFixture({
+      [wName('API')]: { kind: 'claude', sequence: ['working', 'done'], stepMs: 5, pauseAt: 'working' },
+    }));
+    seedRun(fx);
+    // a live worker execution (dispatched, paused mid-work)
+    fx.db.run("UPDATE tasks SET status='running', attempts=1 WHERE run_id=? AND task_id='API'", [RUN]);
+    const { startExecution } = await import('../src/runner/executions.ts');
+    await startExecution(envFor(fx), { role: 'worker', task: getTask(fx.db, RUN, 'API')!, attemptNo: 1, cycleNo: 0, entry: { kind: 'claude' } });
+
+    const { cmdClean } = await import('../src/commands/clean.ts');
+    expect(await cmdClean({ runId: RUN, home: fx.home, json: true, client: fx.fake })).toBe(1);
+    // R4-07: agents may still be writing — the run stays resumable, NOT abandoned
+    expect(getRun(fx.db, RUN)!.status).toBe('planned');
+
+    // once no execution is active, clean finalizes as before
+    const { listExecutions, updateExecution } = await import('../src/store/executions.ts');
+    for (const exec of listExecutions(fx.db, RUN)) {
+      updateExecution(fx.db, exec.id, { status: 'abandoned' });
+    }
+    expect(await cmdClean({ runId: RUN, home: fx.home, json: true, client: fx.fake })).toBe(0);
+    expect(getRun(fx.db, RUN)!.status).toBe('abandoned');
   }, 30_000);
 });

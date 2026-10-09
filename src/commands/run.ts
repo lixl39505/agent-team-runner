@@ -3,11 +3,12 @@
 
 import { openDatabase } from '../store/db.ts';
 import { getRun } from '../store/runs.ts';
+import { listActiveResources } from '../store/resources.ts';
 import { loadHome } from '../config.ts';
 import { RunnerEngine } from '../runner/engine.ts';
 import { AteamError } from '../core/errors.ts';
 import {
-  buildRunnerEnv, createClient, createRunRecord, getRunOrThrow, loadContractFile, probeAgentsOrFailFast, probeOrFailFast, resolveSelfPaneId,
+  buildRunnerEnv, createClient, createRunRecord, getRunOrThrow, loadContractFile, probeAgentsOrFailFast, probeLiveServerOrFailFast, probeOrFailFast, resolveSelfPaneId,
 } from './run-shared.ts';
 import { findClaimableRun } from './submit.ts';
 
@@ -38,6 +39,9 @@ export async function cmdRun(opts: RunCommandOptions): Promise<number> {
     let run;
     if (opts.contract) {
       const contract = await loadContractFile(opts.contract);
+      // R4-08: the swarm entry fails fast on a dead server / missing source
+      // workspace — BEFORE any run record, agent or worktree exists
+      await probeLiveServerOrFailFast(client, { repoRoot: contract.project.repoRoot });
       run = await createRunRecord(db, contract, { status: 'planned' });
     } else if (opts.claim) {
       // plugin action `run --claim`: attach as the Runner for the oldest queued run
@@ -52,6 +56,15 @@ export async function cmdRun(opts: RunCommandOptions): Promise<number> {
     }
 
     if (opts.maxParallel !== undefined) home.config.defaults.maxParallel = opts.maxParallel;
+
+    if (!opts.contract) {
+      // R4-08 (reattach paths): same live-server gate; a run that already
+      // holds ledgered worktree workspaces does not demand a source workspace
+      await probeLiveServerOrFailFast(client, {
+        repoRoot: run.repoRoot,
+        hasLedgeredWorkspace: listActiveResources(db, run.id).some((r) => r.kind === 'workspace'),
+      });
+    }
 
     const env = buildRunnerEnv(home, db, client, run);
     // R2-13: fail fast on the agent CLIs this contract needs, too

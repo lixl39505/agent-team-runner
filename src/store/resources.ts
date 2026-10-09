@@ -51,11 +51,20 @@ export function insertResource(
 ): HerdrResourceRecord {
   // herdr reuses small workspace/pane ids after server restarts — uniqueness
   // is per (run, kind, herdrId) so a new run never collides with an old
-  // run's ledger rows (migration v6)
+  // run's ledger rows (migration v6). R4-03: within one run a REUSED id is a
+  // NEW GENERATION — the row must follow the identity Herdr just reported
+  // (task, branch, path), not keep a stale mapping that cleanup would trust.
   db.run(
     `INSERT INTO herdr_resources (run_id, task_id, execution_id, kind, herdr_id, branch, path, provenance, state, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'active', ?)
-     ON CONFLICT (run_id, kind, herdr_id) DO NOTHING`,
+     ON CONFLICT (run_id, kind, herdr_id) DO UPDATE SET
+       task_id = excluded.task_id,
+       execution_id = excluded.execution_id,
+       branch = excluded.branch,
+       path = excluded.path,
+       state = 'active',
+       reclaimed_at = NULL,
+       created_at = excluded.created_at`,
     [input.runId, input.taskId ?? null, input.executionId ?? null, input.kind, input.herdrId,
       input.branch ?? null, input.path ?? null, nowIso()],
   );

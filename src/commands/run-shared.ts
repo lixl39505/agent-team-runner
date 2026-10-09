@@ -60,6 +60,41 @@ export function createClient(herdrPath?: string): HerdrRuntimeClient {
 }
 
 /**
+ * R4-08: a passing version probe does NOT prove a live server — the CLI
+ * probe only runs `--version` and `api schema`, which succeed on the binary
+ * alone (review 03's real-Herdr e2e saw the probe go green with the server
+ * down, failing only at the first worktree call). Before a run starts, the
+ * session must answer a snapshot; for a fresh contract it must also expose a
+ * source workspace on the bound repo, or worktree creation fails at the
+ * first task with no remediation hint.
+ */
+export async function probeLiveServerOrFailFast(
+  client: HerdrRuntimeClient,
+  opts: { repoRoot?: string; hasLedgeredWorkspace?: boolean } = {},
+): Promise<void> {
+  let snap;
+  try {
+    snap = await client.snapshot();
+  } catch (err) {
+    throw new DoctorError(
+      `herdr server is not reachable (version probe passed, but no live session answered the snapshot: ${(err as Error).message})`,
+      'start the Herdr app/server and keep the session running, then retry; `agent-team doctor --runtime herdr` shows details',
+    );
+  }
+  const repoRoot = opts.repoRoot;
+  if (!repoRoot) return;
+  if (process.env.HERDR_WORKSPACE_ID || process.env.ATEAM_SOURCE_WORKSPACE_ID) return; // explicit source wins
+  if (opts.hasLedgeredWorkspace) return; // reattach: the run already holds worktree workspaces
+  const source = snap.workspaces.find((w) => (w.worktree?.repoRoot ?? w.worktree?.path ?? w.cwd) === repoRoot);
+  if (!source) {
+    throw new DoctorError(
+      `no Herdr workspace is open on the contract repo ${repoRoot} — the first worktree creation would fail`,
+      'open the repository in a Herdr workspace before starting the run, or set HERDR_WORKSPACE_ID / ATEAM_SOURCE_WORKSPACE_ID to the workspace holding it',
+    );
+  }
+}
+
+/**
  * Fail-fast on the agent integrations THIS contract needs (review 02
  * R2-13): every distinct agent kind reachable from the contract's tasks
  * (task-level override, worker/reviewer/integrator roles, cross-kind

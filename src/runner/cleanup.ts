@@ -57,6 +57,12 @@ export interface CleanupOptions {
    * sets this (ADR: 终验与提交持久化后才可回收).
    */
   discardUnverified?: boolean;
+  /**
+   * R4-05: fence renewal between irreversible steps (token-CAS heartbeat).
+   * Called before EVERY cleanup step; throwing aborts the reclamation
+   * mid-sweep so a dispossessed writer never keeps destroying.
+   */
+  ensureLease?: () => void;
 }
 
 /**
@@ -112,12 +118,67 @@ export async function finalPassMatchesDelivery(env: RunnerEnv): Promise<boolean>
   expected.integratedCommits = integratedCommits;
   // the HEAD check applies while the integration worktree still exists;
   // once reclaimed, revision + task set are the remaining bindings
-  if (run.integrationPath && existsSync(run.integrationPath)) {
-    const head = await currentHead(run.integrationPath).catch(() => null);
-    if (!head) return false; // an unreadable tree is not a verified tree
-    expected.headSha = head;
+  if (run.integrationPath) {
+    if (!existsSync(run.integrationPath)) {
+      // R4-06: a MISSING integration tree cannot prove the delivered HEAD.
+      // While integrated tasks still await reclamation the old PASS must not
+      // authorize destroying their worktrees — recover/re-verify the tree
+      // first. After every task is reclaimed the persisted final commit set
+      // is the remaining binding and the check below suffices.
+      const pending = listTasks(env.db, env.runId).some((t) => t.status === 'integrated');
+      if (pending) return false;
+    } else {
+      const head = await currentHead(run.integrationPath).catch(() => null);
+      if (!head) return false; // an unreadable tree is not a verified tree
+      expected.headSha = head;
+    }
   }
   return hasPassingFinalVerification(env.db, env.runId, expected);
+}
+
+/**
+ * R4-03: herdr reuses short workspace ids after server restarts — a ledger
+ * row (or run field) only proves this run ONCE held the id. Before a FORCE
+ * removal the authoritative snapshot must still map the id to the SAME
+ * workspace: the ledgered path/branch and the run's immutable repo binding.
+ * Absent from the snapshot = already gone (the postcondition holds). An
+ * unreachable snapshot = identity cannot be proven = refuse.
+ */
+export async function assertRemovableWorkspace(
+  env: RunnerEnv,
+  workspaceId: string,
+  opts: { taskId?: string | null } = {},
+): Promise<void> {
+  const { db, runId, client } = env;
+  const mine = getResourceForRun(db, runId, 'workspace', workspaceId);
+  if (!mine) {
+    const other = getResource(db, 'workspace', workspaceId);
+    if (other && other.runId !== runId) {
+      throw new Error(`workspace ${workspaceId} is ledgered to run ${other.runId}; refusing to remove it for run ${runId}`);
+    }
+  } else if (opts.taskId && mine.taskId && mine.taskId !== opts.taskId) {
+    throw new Error(`workspace ${workspaceId} is ledgered to task ${mine.taskId}, not ${opts.taskId}; refusing to remove it`);
+  }
+  const snap = await client.snapshot().catch(() => null);
+  if (!snap) {
+    throw new Error(`herdr snapshot unavailable; cannot confirm workspace ${workspaceId} identity before removal (retry when the runtime is reachable)`);
+  }
+  const live = snap.workspaces.find((w) => w.workspaceId === workspaceId);
+  if (!live) return; // already removed — the postcondition holds
+  const repoRoot = getRun(db, runId)?.repoRoot;
+  const mismatches: string[] = [];
+  if (mine?.path && live.worktree?.path && live.worktree.path !== mine.path) {
+    mismatches.push(`path ${live.worktree.path} != ledgered ${mine.path}`);
+  }
+  if (mine?.branch && live.worktree?.branch && live.worktree.branch !== mine.branch) {
+    mismatches.push(`branch ${live.worktree.branch} != ledgered ${mine.branch}`);
+  }
+  if (repoRoot && live.worktree?.repoRoot && live.worktree.repoRoot !== repoRoot) {
+    mismatches.push(`repo root ${live.worktree.repoRoot} != run binding ${repoRoot}`);
+  }
+  if (mismatches.length > 0) {
+    throw new Error(`workspace ${workspaceId} no longer matches its ledger entry (${mismatches.join('; ')}); refusing to remove a workspace this run cannot prove provenance for`);
+  }
 }
 
 /**
@@ -147,7 +208,18 @@ export async function cleanupTaskResources(env: RunnerEnv, task: TaskRecord, opt
     });
   }
 
-  const closePanes = await runStep(env, task, 'close_pane', async () => {
+  // R4-05: every step is preceded by a fence renewal — a long sweep of
+  // Herdr/Git calls must abort the moment another writer holds the lease
+  const fencedStep = (
+    step: CleanupStep,
+    exec: () => Promise<void>,
+    extra: { branch?: string | null; worktreePath?: string | null; workspaceId?: string | null } = {},
+  ): Promise<boolean> => {
+    opts.ensureLease?.();
+    return runStep(env, task, step, exec, extra);
+  };
+
+  const closePanes = await fencedStep('close_pane', async () => {
     for (const exec of listExecutions(db, runId)) {
       if (exec.taskId !== task.taskId || !exec.paneId) continue;
       if (!['open', 'retained'].includes(exec.paneState)) continue;
@@ -164,19 +236,14 @@ export async function cleanupTaskResources(env: RunnerEnv, task: TaskRecord, opt
   });
   if (!closePanes) return null;
 
-  const removeWorktree = await runStep(env, task, 'remove_worktree', async () => {
+  const removeWorktree = await fencedStep('remove_worktree', async () => {
     if (!task.workspaceId) return;
-    // R3-02: a workspace ledgered to ANOTHER run (and not to this one) is
-    // never a removal candidate, whatever a candidate contract revision
-    // pointed at. herdr reuses small ids after restarts, so "another run's
-    // row" alone is not damning — this run must hold its own.
-    const mine = getResourceForRun(db, runId, 'workspace', task.workspaceId);
-    if (!mine) {
-      const other = getResource(db, 'workspace', task.workspaceId);
-      if (other && other.runId !== runId) {
-        throw new Error(`workspace ${task.workspaceId} is ledgered to run ${other.runId}; refusing to remove it for run ${runId}`);
-      }
-    }
+    // R3-02/R4-03: ledger provenance AND the live Herdr mapping must both
+    // describe THIS task's workspace before a force removal — a workspace
+    // ledgered to another run is never a candidate, and herdr reuses short
+    // ids after restarts, so a ledger row alone proves only that this run
+    // ONCE held the id.
+    await assertRemovableWorkspace(env, task.workspaceId, { taskId: task.taskId });
     try {
       await client.removeWorktree({ workspaceId: task.workspaceId, force: true });
     } catch (err) {
@@ -201,7 +268,7 @@ export async function cleanupTaskResources(env: RunnerEnv, task: TaskRecord, opt
     updateExecution(db, exec.id, { paneState: 'gone' });
   }
 
-  const verifyFree = await runStep(env, task, 'verify_branch_free', async () => {
+  const verifyFree = await fencedStep('verify_branch_free', async () => {
     if (!task.branch) return;
     assertRunBranch(runId, task.branch); // R2-04 provenance gate
     if (!(await branchExists(repoRoot, task.branch))) return; // already deleted
@@ -212,7 +279,7 @@ export async function cleanupTaskResources(env: RunnerEnv, task: TaskRecord, opt
   });
   if (!verifyFree) return null;
 
-  const deleteBranch = await runStep(env, task, 'delete_branch', async () => {
+  const deleteBranch = await fencedStep('delete_branch', async () => {
     if (!task.branch) return;
     assertRunBranch(runId, task.branch); // R2-04 provenance gate (defense in depth)
     const deleted = await deleteBranchIfFree(repoRoot, task.branch);
@@ -220,7 +287,7 @@ export async function cleanupTaskResources(env: RunnerEnv, task: TaskRecord, opt
   });
   if (!deleteBranch) return null;
 
-  const finalized = await runStep(env, task, 'finalize', async () => {
+  const finalized = await fencedStep('finalize', async () => {
     // R2-03: an unverified destruction settles as `discarded` — a resource
     // destroyed without final verification is never counted as reclaimed
     updateTask(db, runId, task.taskId, { status: discarded ? 'discarded' : 'reclaimed' });

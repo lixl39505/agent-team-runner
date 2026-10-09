@@ -17,7 +17,7 @@ import { insertVerification } from '../store/verifications.ts';
 import { readResultFile } from '../results/files.ts';
 import { validateRoleResult } from '../results/validate.ts';
 import type { WorkerResult, ReviewerResult, IntegrationResult } from '../results/types.ts';
-import { stageAll, commit, cherryPick, currentHead, hasStagedChanges, revParse, squashSince } from '../core/git.ts';
+import { stageAll, commit, cherryPick, currentHead, hasStagedChanges, revParse, squashSince, worktreeChangedFiles } from '../core/git.ts';
 import { AteamError, type ExitCode } from '../core/errors.ts';
 import type { HerdrEventStream, WorkspaceHandle } from '../herdr/types.ts';
 import type { RunRecord, RunStatus, TaskRecord } from '../core/types.ts';
@@ -28,13 +28,20 @@ import type { RunnerEnv, StartExecutionInput } from './executions.ts';
 import { startExecution, resolveReviewerEntry, closePaneSafe, rebuildRolePrompt, findSourceWorkspaceId } from './executions.ts';
 import { agentStartArgs } from '../herdr/agent-args.ts';
 import { verifyTaskWork } from './phases/verify.ts';
-import { cleanupTaskResources, finalPassMatchesDelivery } from './cleanup.ts';
+import { assertRemovableWorkspace, cleanupTaskResources, finalPassMatchesDelivery } from './cleanup.ts';
 import { topologicalTasks, validateGraph } from '../core/contract.ts';
 
 const TERMINAL_RUN: ReadonlySet<string> = new Set(['done', 'cancelled', 'abandoned', 'failed']);
 
 /** Task states that need no further delivery work. */
 const SETTLED_TASK: ReadonlySet<string> = new Set(['integrated', 'reclaimed', 'discarded', 'failed']);
+
+/** R4-04: a dependency is satisfied only when its delivery is IN the
+ * integration base. `failed`/`discarded` upstreams settle the run but never
+ * unblock downstream work — scheduling them would run agents on a tree
+ * missing the deliveries they build on. */
+const DEP_SATISFIED: ReadonlySet<string> = new Set(['integrated', 'reclaimed']);
+const DEP_DOOMED: ReadonlySet<string> = new Set(['failed', 'discarded']);
 
 export type ReconcileDecisionKind =
   | 'result_recovered'
@@ -59,6 +66,10 @@ export interface RunnerOptions {
   tickMs?: number;
   selfPaneId?: string;
   selfAgentName?: string;
+  /** R4-05: a fencing token acquired OUTSIDE the engine (the reconcile CLI
+   * holds the lease across the whole pass). Without it ensureLease() is a
+   * no-op and long control-plane operations run unguarded. */
+  leaseFence?: string | null;
 }
 
 export class RunnerEngine {
@@ -71,6 +82,7 @@ export class RunnerEngine {
   constructor(env: RunnerEnv, opts: RunnerOptions = {}) {
     this.env = env;
     this.opts = opts;
+    this.leaseFence = opts.leaseFence ?? null;
   }
 
   // ------------------------------------------------------------------ tick
@@ -598,6 +610,41 @@ export class RunnerEngine {
     });
   }
 
+  /**
+   * R4-01: has the task worktree drifted from the VERIFIED commit? The
+   * reviewer's approval and the integration cherry-pick both bind to the
+   * commit the mechanical gate verified (task.commitSha): a later commit,
+   * staged edits or untracked delivery files after it were never validated
+   * against the task's path policy. A drifted worktree must go back through
+   * the worker verification gate, never straight into integration. A missing
+   * worktree is NOT drift — pane-loss recovery owns that case.
+   */
+  private async deliveryDriftedSinceVerification(task: TaskRecord): Promise<boolean> {
+    if (!task.worktreePath || !task.commitSha) return false;
+    if (!existsSync(task.worktreePath)) return false;
+    const head = await currentHead(task.worktreePath).catch(() => null);
+    if (head !== task.commitSha) return true;
+    const files = await worktreeChangedFiles(task.worktreePath, task.commitSha);
+    return files.length > 0;
+  }
+
+  /** R4-01 shared handling: route a drifted delivery back into the worker
+   * verify → review cycle instead of letting it reach integration. */
+  private async redeliverDriftedWork(task: TaskRecord, review: unknown, from: string): Promise<void> {
+    const { db, runId } = this.env;
+    const current = getTask(db, runId, task.taskId)!;
+    updateTask(db, runId, task.taskId, {
+      status: 'changes_requested',
+      pendingDispatch: 'worker_retry',
+      lastError: `worktree changed after the verified commit (${current.commitSha}); re-verification required`,
+    });
+    addEvent(db, runId, 'RECONCILE_DECISION', {
+      taskId: task.taskId,
+      payload: { reason: 'worktree_drifted_after_verification', from, commitSha: current.commitSha },
+    });
+    await this.retryWorker(getTask(db, runId, task.taskId)!, { lastReview: review });
+  }
+
   private async applyWorkerResult(exec: ExecutionRecord, task: TaskRecord, result: WorkerResult): Promise<void> {
     const { db, runId } = this.env;
     switch (result.status) {
@@ -714,6 +761,12 @@ export class RunnerEngine {
       attemptNo: task.attempts,
       cycleNo: cycle,
       entry: reviewerEntry,
+      // R4-01: pin the commit under review — the reviewer is read-only and
+      // the engine enforces it, but the brief states the exact SHA the
+      // verdict binds to
+      notes: task.commitSha
+        ? `Review the verified delivery at commit ${task.commitSha} (the task worktree HEAD). The verdict binds to this SHA; the runner re-checks it on approval.`
+        : undefined,
     });
     // the dispatch is on the ledger — the recovery intent is served (R2-02)
     this.clearPendingDispatch(task.taskId);
@@ -793,6 +846,17 @@ export class RunnerEngine {
     const { db, runId, client, config } = this.env;
     updateTask(db, runId, task.taskId, { review: result });
     if (result.status === 'approved') {
+      // R4-01: approval binds to the VERIFIED commit. Content appearing in
+      // the task worktree after the gate ran (a reviewer-side commit, a
+      // same-worktree process, leftover edits) is unverified — it re-enters
+      // the worker verification + review cycle instead of being approved.
+      if (await this.deliveryDriftedSinceVerification(task)) {
+        updateTask(db, runId, task.taskId, { status: 'changes_requested' });
+        updateExecution(db, exec.id, { status: 'completed', paneState: 'closed_success' });
+        await closePaneSafe(client, exec.paneId);
+        await this.redeliverDriftedWork(task, result, 'reviewer_approval');
+        return;
+      }
       updateTask(db, runId, task.taskId, { status: 'approved' });
       addEvent(db, runId, 'TASK_APPROVED', { taskId: task.taskId, payload: { cycle: exec.cycleNo } });
       updateExecution(db, exec.id, { status: 'completed', paneState: 'closed_success' });
@@ -843,13 +907,22 @@ export class RunnerEngine {
     if (slots <= 0) return;
 
     const statusById = new Map(tasks.map((t) => [t.taskId, t.status]));
-    const depsIntegrated = (task: TaskRecord): boolean =>
-      (task.spec.dependsOn ?? []).every((dep) => SETTLED_TASK.has(statusById.get(dep) ?? ''));
 
     for (const task of tasks) {
       if (slots <= 0) return;
       if (task.status !== 'pending') continue;
-      if (!depsIntegrated(task)) continue;
+      // R4-04: only integrated/reclaimed dependencies unblock a task; a
+      // doomed upstream (failed/discarded) marks WHY the task can never run
+      const deps = task.spec.dependsOn ?? [];
+      const blocker = deps.find((dep) => DEP_DOOMED.has(statusById.get(dep) ?? ''))
+        ?? deps.find((dep) => !DEP_SATISFIED.has(statusById.get(dep) ?? ''));
+      if (blocker !== undefined) {
+        const depStatus = statusById.get(blocker) ?? 'unknown';
+        if (DEP_DOOMED.has(depStatus) && task.lastError !== `dependency ${blocker} ${depStatus} — this task can never run`) {
+          updateTask(db, runId, task.taskId, { lastError: `dependency ${blocker} ${depStatus} — this task can never run` });
+        }
+        continue;
+      }
       if (task.attempts >= config.defaults.maxWorkerAttempts) continue;
       const entry = resolveAgentEntry(config, task.spec.agent, 'worker');
       const attemptNo = task.attempts + 1;
@@ -919,12 +992,18 @@ export class RunnerEngine {
       // R3-06: reclamation is irreversible — renew/verify the fencing token
       // before each task's teardown, never batch it across the whole loop
       this.ensureLease();
-      await cleanupTaskResources(this.env, task);
+      await cleanupTaskResources(this.env, task, {
+        // R4-05: and between the individual teardown steps as well
+        ensureLease: () => this.ensureLease(),
+      });
     }
     // run-level temp resource: the integration worktree itself
     if (run.integrationWorkspaceId && listTasks(db, runId).every((t) => SETTLED_TASK.has(t.status))) {
       this.ensureLease();
       try {
+        // R4-03: the same identity proof as task worktrees — the run field
+        // alone does not survive a herdr id reuse
+        await assertRemovableWorkspace(this.env, run.integrationWorkspaceId);
         await client.removeWorktree({ workspaceId: run.integrationWorkspaceId, force: true });
         markResourceState(db, runId, 'workspace', run.integrationWorkspaceId, 'reclaimed');
         // R3-07: integrator panes lived in the removed workspace — retired
@@ -1038,6 +1117,13 @@ export class RunnerEngine {
 
     // one commit per task chain: retry attempts squash before cherry-picking
     const current = getTask(db, runId, task.taskId)!;
+    // R4-01: the squashed chain must END at the approved, verified commit —
+    // squashSince(startSha..HEAD) would otherwise carry post-approval,
+    // never-verified commits into the delivery
+    if (await this.deliveryDriftedSinceVerification(current)) {
+      await this.redeliverDriftedWork(current, current.review, 'integration');
+      return;
+    }
     if (current.worktreePath && current.startSha) {
       const squashed = await squashSince(current.worktreePath, current.startSha, `ateam(${runId}): task ${task.taskId}`);
       if (squashed !== current.commitSha) {
@@ -1147,13 +1233,20 @@ export class RunnerEngine {
     const apply = async (fn: () => Promise<void> | void): Promise<void> => {
       if (!opts.dryRun) await fn();
     };
+    // R4-03: resources (re-)registered during this pass carry a fresh ledger
+    // generation — the pre-pass snapshot cannot judge them yet
+    const passStartedAt = nowIso();
 
     const run = getRun(db, runId);
     if (!run || TERMINAL_RUN.has(run.status)) return decisions;
 
     if (run.revisionPending) {
       decisions.push({ kind: 'revision_consumed', detail: `revision ${run.contractRevision}` });
-      await apply(() => this.consumeContractRevision());
+      // R4-05: revision application is a delivery write — renew the fence first
+      await apply(async () => {
+        this.ensureLease();
+        await this.consumeContractRevision();
+      });
     }
 
     // ADR recovery order (R2-07): establish the event subscription AND wait
@@ -1236,6 +1329,8 @@ export class RunnerEngine {
                 continue;
               }
             } else {
+              // R4-05: applying a persisted result advances delivery state
+              this.ensureLease();
               const recovered = await this.recoverPersistedResult(exec, task);
               if (recovered) {
                 decisions.push({ kind: 'result_recovered', taskId: exec.taskId, executionId: exec.id, detail: 'persisted result applied' });
@@ -1256,6 +1351,9 @@ export class RunnerEngine {
                 detail: `pane ${exec.paneId} alive but agent ${exec.agentName} is gone`,
               });
               if (opts.dryRun || !task) continue;
+              // R4-05: abandonment + a rebuilt worktree + a fresh attempt are
+              // writes and new resources — the fence must still be ours
+              this.ensureLease();
               updateExecution(db, exec.id, { status: 'abandoned', paneState: 'gone' });
               addEvent(db, runId, 'RECONCILE_DECISION', {
                 executionId: exec.id,
@@ -1285,6 +1383,7 @@ export class RunnerEngine {
             detail: `pane ${exec.paneId ?? '-'} not in snapshot`,
           });
           if (opts.dryRun || !task) continue;
+          this.ensureLease(); // R4-05: same write cluster as the pane-gone path above
           updateExecution(db, exec.id, { status: 'abandoned', paneState: 'gone' });
           addEvent(db, runId, 'RECONCILE_DECISION', {
             executionId: exec.id,
@@ -1301,7 +1400,11 @@ export class RunnerEngine {
         for (const task of listTasks(db, runId).filter((t) => t.status === 'integrated')) {
           decisions.push({ kind: 'cleanup_resumed', taskId: task.taskId });
           await apply(async () => {
-            await cleanupTaskResources(this.env, task);
+            await cleanupTaskResources(this.env, task, {
+              // R4-05: the fence is renewed per cleanup step inside, and
+              // checked once more before the task's first step
+              ensureLease: () => this.ensureLease(),
+            });
           });
         }
       } else if (listTasks(db, runId).some((t) => t.status === 'integrated')) {
@@ -1313,13 +1416,18 @@ export class RunnerEngine {
 
       for (const res of listActiveResources(db, runId)) {
         if (!preExistingResources.has(`${res.kind}:${res.herdrId}`)) continue;
+        if (res.createdAt >= passStartedAt) continue; // re-registered this pass (id reuse) — judged next pass
         if (observedIds.has(res.herdrId)) continue;
         decisions.push({
           kind: res.provenance ? 'resource_lost' : 'resource_orphaned',
           taskId: res.taskId ?? undefined,
           detail: `${res.kind}:${res.herdrId}`,
         });
-        await apply(() => markResourceState(db, runId, res.kind, res.herdrId, res.provenance ? 'lost' : 'orphaned'));
+        // R4-05: state writes are fenced too
+        await apply(() => {
+          this.ensureLease();
+          return markResourceState(db, runId, res.kind, res.herdrId, res.provenance ? 'lost' : 'orphaned');
+        });
       }
 
       return decisions;

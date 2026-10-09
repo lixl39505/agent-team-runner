@@ -24,6 +24,9 @@ export interface ReconcileCommandOptions {
 export interface RunReconcileResult {
   runId: string;
   skipped?: 'live_lease';
+  /** R4-05: the pass aborted mid-way (e.g. the fencing token was lost to
+   * another writer) — surfaced per run instead of killing the whole sweep. */
+  error?: string;
   decisions: ReconcileDecision[];
 }
 
@@ -49,9 +52,13 @@ export async function cmdReconcile(opts: ReconcileCommandOptions): Promise<numbe
         continue;
       }
       try {
-        const engine = new RunnerEngine(buildRunnerEnv(home, db, client, current), {});
+        // R4-05: the engine carries THIS pass's fencing token, so every
+        // control-plane write inside reconcileOnce renews/verifies the lease
+        const engine = new RunnerEngine(buildRunnerEnv(home, db, client, current), { leaseFence: fence });
         const decisions = await engine.reconcileOnce({ dryRun: opts.dryRun });
         results.push({ runId: run.id, decisions });
+      } catch (err) {
+        results.push({ runId: run.id, error: err instanceof Error ? err.message : String(err), decisions: [] });
       } finally {
         releaseLease(db, run.id, fence);
       }
@@ -63,6 +70,10 @@ export async function cmdReconcile(opts: ReconcileCommandOptions): Promise<numbe
       for (const result of results) {
         if (result.skipped) {
           console.log(`${result.runId}: skipped (${result.skipped})`);
+          continue;
+        }
+        if (result.error) {
+          console.log(`${result.runId}: FAILED — ${result.error}`);
           continue;
         }
         console.log(`${result.runId}:`);

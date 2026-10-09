@@ -6,8 +6,8 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { HerdrRuntimeClient } from '../src/herdr/client.ts';
-import type { HerdrProbe } from '../src/herdr/types.ts';
-import { probeOrFailFast, resolveSelfPaneId } from '../src/commands/run-shared.ts';
+import type { HerdrProbe, HerdrSessionSnapshot } from '../src/herdr/types.ts';
+import { probeLiveServerOrFailFast, probeOrFailFast, resolveSelfPaneId } from '../src/commands/run-shared.ts';
 import { cmdRun } from '../src/commands/run.ts';
 import { DoctorError } from '../src/core/errors.ts';
 
@@ -63,6 +63,58 @@ describe('probeOrFailFast', () => {
     const err = await probeOrFailFast(clientWithProbe(new Error('spawn ENOENT'))).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(DoctorError);
     expect((err as DoctorError).remediation).toContain('doctor --runtime herdr');
+  });
+});
+
+describe('probeLiveServerOrFailFast (R4-08)', () => {
+  const emptySnapshot: HerdrSessionSnapshot = { workspaces: [], tabs: [], panes: [], agents: [] };
+
+  function clientWithSnapshot(snapshot: HerdrSessionSnapshot | Error): HerdrRuntimeClient {
+    const base = clientWithProbe(HEALTHY_PROBE);
+    return {
+      ...base,
+      snapshot: async () => {
+        if (snapshot instanceof Error) throw snapshot;
+        return snapshot;
+      },
+    } as HerdrRuntimeClient;
+  }
+
+  test('a dead server fails with remediation even though the version probe passed', async () => {
+    const err = await probeLiveServerOrFailFast(clientWithSnapshot(new Error('herdr api snapshot failed (exit 7)'))).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DoctorError);
+    expect((err as DoctorError).message).toMatch(/not reachable/);
+    expect((err as DoctorError).remediation).toContain('start the Herdr app/server');
+  });
+
+  test('a live server with a workspace on the contract repo passes', async () => {
+    const snap: HerdrSessionSnapshot = {
+      ...emptySnapshot,
+      workspaces: [{ workspaceId: 'w1', worktree: { branch: 'main', path: '/repo', repoRoot: '/repo' } }],
+    };
+    await expect(probeLiveServerOrFailFast(clientWithSnapshot(snap), { repoRoot: '/repo' })).resolves.toBeUndefined();
+  });
+
+  test('no workspace on the contract repo fails with a source-workspace hint', async () => {
+    const err = await probeLiveServerOrFailFast(clientWithSnapshot(emptySnapshot), { repoRoot: '/repo' }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DoctorError);
+    expect((err as DoctorError).message).toMatch(/no Herdr workspace is open/);
+  });
+
+  test('an explicit source workspace env or a ledgered workspace skips the scan', async () => {
+    process.env.HERDR_WORKSPACE_ID = 'w0';
+    try {
+      await expect(probeLiveServerOrFailFast(clientWithSnapshot(emptySnapshot), { repoRoot: '/repo' })).resolves.toBeUndefined();
+    } finally {
+      delete process.env.HERDR_WORKSPACE_ID;
+    }
+    await expect(
+      probeLiveServerOrFailFast(clientWithSnapshot(emptySnapshot), { repoRoot: '/repo', hasLedgeredWorkspace: true }),
+    ).resolves.toBeUndefined();
+  });
+
+  test('without a repo binding only the live-server check applies', async () => {
+    await expect(probeLiveServerOrFailFast(clientWithSnapshot(emptySnapshot))).resolves.toBeUndefined();
   });
 });
 
