@@ -11,6 +11,9 @@ import { insertTask, listTasks, getTask } from '../src/store/tasks.ts';
 import { listExecutions } from '../src/store/executions.ts';
 import { validateContract } from '../src/core/contract.ts';
 import { RunnerEngine } from '../src/runner/engine.ts';
+import { verifyTaskWork } from '../src/runner/phases/verify.ts';
+import { commitVerifiedTree } from '../src/runner/phases/commit.ts';
+import { currentHead, writeTree } from '../src/core/git.ts';
 import { FakeHerdrClient } from '../src/herdr/fake-client.ts';
 import type { FakeAgentScript } from '../src/herdr/fake-client.ts';
 import type { HerdrRuntimeClient } from '../src/herdr/client.ts';
@@ -18,11 +21,11 @@ import type { HerdrEvent, HerdrEventStream } from '../src/herdr/types.ts';
 import { HerdrError } from '../src/herdr/types.ts';
 import { agentName } from '../src/store/ids.ts';
 import { DEFAULT_CONFIG, type AteamConfig } from '../src/config.ts';
-import type { ExecutionContract } from '../src/core/types.ts';
+import type { ExecutionContract, TaskRecord } from '../src/core/types.ts';
 import { acquireLease, heartbeat, releaseLease } from '../src/store/lease.ts';
 import { insertResource } from '../src/store/resources.ts';
 import { latestCleanupSteps } from '../src/store/cleanup.ts';
-import { cleanupTempDir, initRepo, makeTempDir, minimalContract } from './helpers.ts';
+import { cleanupTempDir, initRepo, makeTempDir, minimalContract, writeFileDeep } from './helpers.ts';
 
 const RUN = 'r-20261003-run001';
 const TERMINALS = ['done', 'failed', 'cancelled', 'abandoned'];
@@ -1751,12 +1754,13 @@ describe('RunnerEngine — full delivery chain', () => {
     expect(getTask(fx.db, RUN, 'API')!.status).toBe('running'); // fresh worker attempt owns the tree again
   }, 30_000);
 
-  test('R5-01: content staged into the index MID-GATE fails the stage-first verification', async () => {
+  test('R5-01/R6-04: a verification command cannot smuggle content past the stage-first gate', async () => {
     const fx = track(await makeFixture({
       // the worker delivers a legal result AND plants smuggled.txt, which
       // .gitignore keeps OUT of the stage-first pin; the "verification
-      // command" then force-stages it while the gate is running — exactly
-      // the concurrent-writer window R5-01 closes
+      // command" then tries to force-stage it mid-gate. R6-04: the command
+      // runs in the isolated gate tree, where the never-staged smuggled.txt
+      // does not exist — the smuggle fails and the gate refuses.
       [wName('API')]: {
         kind: 'claude', sequence: ['working', 'done'], stepMs: 5,
         onState: {
@@ -1783,10 +1787,9 @@ describe('RunnerEngine — full delivery chain', () => {
     const { listVerifications } = await import('../src/store/verifications.ts');
     const gate = listVerifications(fx.db, RUN).find((v) => v.kind === 'task');
     expect(gate!.ok).toBe(false);
-    const violations = gate!.detail!.violations ?? [];
-    expect(violations.some((v) => v.includes('index changed during verification'))).toBe(true);
-    // the smuggled path violation is caught on the STAGED diff as well
-    expect(violations).toContain('smuggled.txt');
+    // the smuggle command failed inside the isolated tree: no commit landed
+    expect(gate!.detail!.commands?.[0]?.ok).toBe(false);
+    expect(getTask(fx.db, RUN, 'API')!.commitSha).toBeNull();
   }, 30_000);
 
   test('R5-01: worker edits landing after the gate never ride the delivery commit', async () => {
@@ -2005,6 +2008,42 @@ describe('RunnerEngine — full delivery chain', () => {
     expect(getTask(fx.db, RUN, 'API')!.status).toBe('integrated');
   }, 30_000);
 
+  test('R6-01: a same-run id reuse onto the integration ledger row cannot authorize a task deletion', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    const ws = await fx.fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: `ateam/${RUN}/task/API` });
+    insertWorkspaceLedger(fx, ws);
+    fx.db.run(
+      `UPDATE tasks SET status='integrated', branch=?, worktree_path=?, workspace_id=?,
+       start_sha='s0', commit_sha='c1', integration_commit='i1' WHERE run_id=? AND task_id='API'`,
+      [`ateam/${RUN}/task/API`, ws.worktree.path, ws.workspace.workspaceId, RUN],
+    );
+    const wsId = ws.workspace.workspaceId;
+    const { assertRemovableWorkspace } = await import('../src/runner/cleanup.ts');
+    const env = envFor(fx);
+
+    // sanity: the genuine task generation is removable in principle (the
+    // snapshot matches the ledger)
+    await assertRemovableWorkspace(env, wsId, { taskId: 'API' });
+
+    // herdr restart reuses the SAME id for the run's INTEGRATION workspace:
+    // insertResource's UPSERT re-ledgers the row to the integration
+    // generation (taskId=null, integration path/branch)
+    const integ = await fx.fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: `ateam/${RUN}/integration` });
+    insertResource(fx.db, {
+      runId: RUN, kind: 'workspace', herdrId: wsId,
+      branch: `ateam/${RUN}/integration`, path: integ.worktree.path,
+    });
+    // the review-06 repro: the stale task cleanup must NOT be authorized by
+    // the reused id — a taskId-less row is the integration's, not the task's
+    await expect(assertRemovableWorkspace(env, wsId, { taskId: 'API' })).rejects.toThrow(/integration/);
+
+    // the mirror: an integration removal may not use a TASK-generation row
+    fx.db.run('DELETE FROM herdr_resources WHERE run_id=? AND herdr_id=?', [RUN, wsId]);
+    insertWorkspaceLedger(fx, ws); // re-ledger to the task generation
+    await expect(assertRemovableWorkspace(env, wsId)).rejects.toThrow(/task API/);
+  }, 30_000);
+
   test('R5-04: a fence lost DURING remove_worktree records nothing — the new owner re-runs the step', async () => {
     const fx = track(await makeFixture({}));
     seedRun(fx);
@@ -2051,6 +2090,124 @@ describe('RunnerEngine — full delivery chain', () => {
     });
     expect(outcome).toBe('reclaimed');
     expect(getTask(fx.db, RUN, 'API')!.status).toBe('reclaimed');
+  }, 30_000);
+
+  test('R6-06: a fence lost during a FAILING teardown records no failed audit — the new owner re-runs it', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    const ws = await fx.fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: `ateam/${RUN}/task/API` });
+    insertWorkspaceLedger(fx, ws);
+    fx.db.run(
+      `UPDATE tasks SET status='integrated', branch=?, worktree_path=?, workspace_id=?,
+       start_sha='s0', commit_sha='c1', integration_commit='i1' WHERE run_id=? AND task_id='API'`,
+      [`ateam/${RUN}/task/API`, ws.worktree.path, ws.workspace.workspaceId, RUN],
+    );
+    const { insertVerification } = await import('../src/store/verifications.ts');
+    insertVerification(fx.db, { runId: RUN, kind: 'final', ok: true, detail: { contractRevision: 1, integratedCommits: { API: 'i1' } } });
+    fx.db.run('UPDATE runs SET final_verified=1 WHERE id=?', [RUN]);
+
+    // the removal FAILS, and the lease is stolen while it runs — the old
+    // writer must record neither ok NOR failed: the failure conclusion is
+    // audited too, and a dispossessed writer writes none
+    const fence = acquireLease(fx.db, RUN)!;
+    const failing = Object.create(fx.fake) as FakeHerdrClient;
+    failing.removeWorktree = async (input: { workspaceId: string; force?: boolean }) => {
+      fx.db.run('UPDATE runner_leases SET heartbeat_at = ? WHERE run_id = ?', [new Date(Date.now() - 60_000).toISOString(), RUN]);
+      expect(acquireLease(fx.db, RUN)).not.toBeNull();
+      throw new HerdrError('herdr_error', 'simulated removal failure');
+    };
+    const env = { ...envFor(fx), client: failing as HerdrRuntimeClient };
+    const { cleanupTaskResources } = await import('../src/runner/cleanup.ts');
+    const { LeaseLostError } = await import('../src/core/errors.ts');
+    await expect(cleanupTaskResources(env, getTask(fx.db, RUN, 'API')!, {
+      ensureLease: () => {
+        if (!heartbeat(fx.db, RUN, fence)) throw new LeaseLostError('runner lease lost mid-clean');
+      },
+    })).rejects.toThrow(LeaseLostError);
+
+    // nothing was concluded on the step — no ok, and crucially no FAILED row
+    expect(latestCleanupSteps(fx.db, RUN, 'API').get('remove_worktree')).toBeUndefined();
+    const { listEvents } = await import('../src/store/events.ts');
+    expect(listEvents(fx.db, RUN).some((e) =>
+      e.eventType === 'CLEANUP_STEP_FAILED' && (e.payload as { step?: string }).step === 'remove_worktree',
+    )).toBe(false);
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('integrated');
+
+    // the new owner re-runs the sweep and completes it
+    const outcome = await cleanupTaskResources(envFor(fx), getTask(fx.db, RUN, 'API')!, {
+      ensureLease: () => {},
+    });
+    expect(outcome).toBe('reclaimed');
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('reclaimed');
+  }, 30_000);
+
+  test('R6-05: --discard-work abandons live executions BEFORE destroying their resources, then terminates', async () => {
+    const fx = track(await makeFixture({
+      [wName('API')]: { kind: 'claude', sequence: ['working', 'done'], stepMs: 5, pauseAt: 'working' },
+    }));
+    seedRun(fx);
+    // a live worker execution (dispatched, paused mid-work) on a running task
+    fx.db.run("UPDATE tasks SET status='running', attempts=1 WHERE run_id=? AND task_id='API'", [RUN]);
+    const { startExecution } = await import('../src/runner/executions.ts');
+    await startExecution(envFor(fx), { role: 'worker', task: getTask(fx.db, RUN, 'API')!, attemptNo: 1, cycleNo: 0, entry: { kind: 'claude' } });
+    const workspaceId = getTask(fx.db, RUN, 'API')!.workspaceId!;
+
+    const { cmdClean } = await import('../src/commands/clean.ts');
+    // the review-06 failure mode was: resources destroyed, execution still
+    // active, run left "resumable", next reconcile rebuilding the discarded
+    // work. Now the control state is settled BEFORE the sweep and the run
+    // can terminate in the same pass.
+    expect(await cmdClean({ runId: RUN, home: fx.home, json: true, client: fx.fake, discardWork: true })).toBe(0);
+
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('discarded');
+    const { listExecutions } = await import('../src/store/executions.ts');
+    const execs = listExecutions(fx.db, RUN);
+    expect(execs.every((e) => !['starting', 'running', 'blocked', 'result_pending'].includes(e.status))).toBe(true);
+    // the abandon was audited BEFORE the workspace removal retired the pane
+    const { listEvents } = await import('../src/store/events.ts');
+    expect(listEvents(fx.db, RUN).some((e) =>
+      e.eventType === 'RECONCILE_DECISION'
+      && (e.payload as { reason?: string }).reason === 'execution_abandoned_for_discard',
+    )).toBe(true);
+    expect(listEvents(fx.db, RUN).some((e) =>
+      e.eventType === 'RECONCILE_DECISION'
+      && (e.payload as { reason?: string }).reason === 'pane_retired_by_workspace_removal',
+    )).toBe(true);
+    expect(fx.fake.worktreeOf(workspaceId)).toBeNull();
+    expect(getRun(fx.db, RUN)!.status).toBe('abandoned');
+  }, 30_000);
+
+  test('R6-05: reconcile refuses to rebuild a lost pane for a discarded task', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    // every task settled (discarded) — the schedule pass has nothing to start
+    fx.db.run(
+      "UPDATE tasks SET status='discarded', pending_dispatch=NULL, worktree_path=NULL, branch=NULL, workspace_id=NULL WHERE run_id=?",
+      [RUN],
+    );
+    // a stray execution still active on the discarded task, its pane gone
+    const { insertExecution } = await import('../src/store/executions.ts');
+    insertExecution(fx.db, {
+      id: `${RUN}-API-w-ghost`, runId: RUN, taskId: 'API', role: 'worker', attemptNo: 1, cycleNo: 0,
+      agentName: wName('API'), agentKind: 'claude', model: null, status: 'running',
+      promptSentAt: new Date().toISOString(), promptDigest: 'd0', startFailed: false,
+      resultPath: null, resultDigest: null, resultAppliedDigest: null, result: null,
+      resultReceivedAt: null, nativeSessionRef: null, paneId: 'w0:p-ghost',
+      tabId: null, workspaceId: null, paneState: 'open',
+      lastAgentState: null, startedAt: new Date().toISOString(), finishedAt: null,
+    });
+
+    const engine = engineFor(fx);
+    const decisions = await engine.reconcileOnce({});
+    expect(decisions.some((d) =>
+      d.kind === 'pane_lost_no_attempt' && d.executionId === `${RUN}-API-w-ghost`
+      && d.detail?.includes('recovery refused'),
+    )).toBe(true);
+    // no attempt was built for the settled task: no new worker execution, no
+    // rebuilt worktree, task stays discarded
+    expect(listExecutions(fx.db, RUN).filter((e) => e.role === 'worker')).toHaveLength(1);
+    expect(getTask(fx.db, RUN, 'API')!.attempts).toBe(0);
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('discarded');
   }, 30_000);
 
   test('R5-02: a resource judged lost that the snapshot shows alive again is re-activated', async () => {
@@ -2203,4 +2360,157 @@ describe('RunnerEngine — full delivery chain', () => {
     // and a healthy pass with nothing to do is exit 0
     expect(await cmdReconcile({ runId: RUN, home: fx.home, json: true, dryRun: false, client: fx.fake })).toBe(0);
   }, 30_000);
+});
+
+// Direct gate tests: a standalone repo + task record, no engine — the
+// R6-02/R6-03/R6-04 delivery-boundary cases from review 06.
+describe('verification gate — R6 path/content integrity', () => {
+  interface GateRepo {
+    root: string;
+    base: string;
+    stage: (files: Record<string, string>) => Promise<void>;
+    write: (files: Record<string, string>) => Promise<void>;
+    git: (...args: string[]) => Promise<string>;
+  }
+
+  async function makeGateRepo(): Promise<GateRepo> {
+    const root = await makeTempDir('ateam-gate-');
+    await initRepo(root);
+    const git = async (...args: string[]): Promise<string> => {
+      const proc = Bun.spawn(['git', '-C', root, ...args], { stdout: 'pipe', stderr: 'pipe', stdin: 'ignore' });
+      const code = await proc.exited;
+      const out = await new Response(proc.stdout).text();
+      if (code !== 0) throw new Error(`git ${args.join(' ')} failed: ${await new Response(proc.stderr).text()}`);
+      return out;
+    };
+    const write = async (files: Record<string, string>): Promise<void> => {
+      for (const [name, content] of Object.entries(files)) await writeFileDeep(join(root, name), content);
+    };
+    const stage = async (files: Record<string, string>): Promise<void> => {
+      await write(files);
+      await git('add', '-f', ...Object.keys(files));
+    };
+    return { root, base: await currentHead(root), stage, write, git };
+  }
+
+  function gateTask(repo: GateRepo, spec: Partial<ExecutionContract['tasks'][number]> = {}): TaskRecord {
+    return {
+      runId: RUN,
+      taskId: 'API',
+      spec: {
+        id: 'API',
+        title: 'api',
+        allowedPaths: ['allowed.txt'],
+        verificationCommands: ['git rev-parse HEAD'],
+        ...spec,
+      },
+      status: 'verifying',
+      attempts: 1,
+      reviewCycles: 0,
+      branch: null,
+      worktreePath: repo.root,
+      workspaceId: null,
+      startSha: repo.base,
+      commitSha: null,
+      integrationCommit: null,
+      lastError: null,
+      contractBlock: null,
+      review: null,
+      pendingDispatch: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      finishedAt: null,
+    };
+  }
+
+  test('R6-02: a staged rename fails the gate on its deleted SOURCE, not just its target', async () => {
+    const repo = await makeGateRepo();
+    try {
+      await repo.stage({ 'protected.txt': 'keep me\n' });
+      await repo.git('commit', '-m', 'protected');
+      const base = await currentHead(repo.root);
+      // the worker moves a committed file from outside its scope into the
+      // allowed path
+      await repo.git('mv', 'protected.txt', 'allowed.txt');
+      const outcome = await verifyTaskWork({
+        worktreePath: repo.root,
+        task: gateTask(repo),
+        allowlist: ['git *'],
+        baseSha: base,
+        staged: true,
+      });
+      expect(outcome.ok).toBe(false);
+      expect(outcome.violations).toContain('protected.txt'); // the rename source is judged
+      expect(outcome.diffFiles).toContain('allowed.txt'); // ...and the target still is
+    } finally {
+      await cleanupTempDir(repo.root);
+    }
+  });
+
+  test('R6-03: .ateam content force-staged behind stageAll is refused and cleaned from the index', async () => {
+    const repo = await makeGateRepo();
+    try {
+      const base = repo.base;
+      // the worker pre-stages internal content the stageAll pathspec never touches
+      await repo.stage({ 'allowed.txt': 'legal\n', '.ateam/injected.txt': 'smuggled\n' });
+      const outcome = await verifyTaskWork({
+        worktreePath: repo.root,
+        task: gateTask(repo),
+        allowlist: ['git *'],
+        baseSha: base,
+        staged: true,
+      });
+      expect(outcome.ok).toBe(false);
+      expect(outcome.violations.some((v) => v.includes('.ateam content staged into the index'))).toBe(true);
+      // the index no longer carries it — a commit after the gate cannot either
+      expect((await repo.git('ls-files', '--', '.ateam')).trim()).toBe('');
+      const tree = await writeTree(repo.root);
+      const committed = await commitVerifiedTree(repo.root, tree, 'should be clean');
+      expect(committed).not.toBeNull();
+      const show = Bun.spawn(['git', '-C', repo.root, 'ls-tree', '-r', '--name-only', committed!], { stdout: 'pipe', stderr: 'pipe', stdin: 'ignore' });
+      const files = (await new Response(show.stdout).text()).split('\n').map((l) => l.trim());
+      expect(files).not.toContain('.ateam/injected.txt');
+      expect(files).toContain('allowed.txt');
+    } finally {
+      await cleanupTempDir(repo.root);
+    }
+  });
+
+  test('R6-04: the gate commands read the pinned index tree, not the mutable worktree', async () => {
+    const repo = await makeGateRepo();
+    try {
+      const base = repo.base;
+      // the review-06 repro: index pins value.txt=bad, the worktree is edited
+      // to good, the verification command greps for `good`
+      await repo.stage({ 'value.txt': 'bad\n' });
+      await repo.write({ 'value.txt': 'good\n' });
+
+      const drifted = await verifyTaskWork({
+        worktreePath: repo.root,
+        task: gateTask(repo, { allowedPaths: ['value.txt'], verificationCommands: ['grep -q good value.txt'] }),
+        allowlist: ['git *', 'grep *'],
+        baseSha: base,
+        staged: true,
+      });
+      expect(drifted.ok).toBe(false); // the pinned tree says `bad` — the gate must NOT pass
+      expect(drifted.commands[0]!.ok).toBe(false);
+
+      // the honest case still passes: worktree identical to the pinned index
+      await repo.write({ 'value.txt': 'bad\n' });
+      const honest = await verifyTaskWork({
+        worktreePath: repo.root,
+        task: gateTask(repo, { allowedPaths: ['value.txt'], verificationCommands: ['grep -q bad value.txt'] }),
+        allowlist: ['git *', 'grep *'],
+        baseSha: base,
+        staged: true,
+      });
+      expect(honest.ok).toBe(true);
+      expect(honest.commands[0]!.ok).toBe(true);
+      // and the commit carries exactly the verified tree
+      const sha = await commitVerifiedTree(repo.root, honest.treeSha, 'verified');
+      expect(sha).not.toBeNull();
+    } finally {
+      await cleanupTempDir(repo.root);
+    }
+  });
 });

@@ -3,6 +3,9 @@
 
 import { runArgv, type CommandResult } from './shell.ts';
 import { matchAny, ATEAM_INTERNAL_PATTERNS } from './path-policy.ts';
+import { rm } from 'node:fs/promises';
+import { mkdtemp } from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
 
 async function git(repoRoot: string, args: string[], timeoutMs = 60_000): Promise<CommandResult> {
   return runArgv(['git', '-C', repoRoot, ...args], { timeoutMs });
@@ -38,9 +41,11 @@ export async function isRepo(path: string): Promise<boolean> {
   return res.ok && res.stdout.trim() === 'true';
 }
 
-/** Files changed between two refs (name-only, no renames splitting). */
+/** Files changed between two refs. R6-02: `--no-renames` — rename detection
+ * would report only a rename's TARGET, hiding the deleted source from the
+ * path gate; without it a worker could `git mv` a file out of its scope. */
 export async function changedFiles(repoRoot: string, fromSha: string, toSha = 'HEAD'): Promise<string[]> {
-  const out = await gitOk(repoRoot, ['diff', '--name-only', fromSha, toSha]);
+  const out = await gitOk(repoRoot, ['diff', '--name-only', '--no-renames', fromSha, toSha]);
   return out.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
 }
 
@@ -49,9 +54,11 @@ export async function changedFiles(repoRoot: string, fromSha: string, toSha = 'H
  * base sha, i.e. exactly the content a subsequent commit will carry. Files
  * edited (but not re-staged) after `stageAll` are invisible here, which is
  * the point: the gate verifies the tree the commit will contain.
+ * R6-02: `--no-renames` so a staged rename's deleted source path is listed
+ * too and the path gate judges both ends.
  */
 export async function stagedChangedFiles(repoRoot: string, fromSha: string): Promise<string[]> {
-  const out = await gitOk(repoRoot, ['diff', '--cached', '--name-only', fromSha]);
+  const out = await gitOk(repoRoot, ['diff', '--cached', '--name-only', '--no-renames', fromSha]);
   return out.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
 }
 
@@ -71,18 +78,31 @@ export async function commitTree(repoRoot: string, sha: string): Promise<string>
  * (staged, unstaged or untracked) outside runner-internal `.ateam/**`
  * bookkeeping. The final gate requires this set to be empty before and
  * after the verification commands, so the PASS describes exactly the
- * committed delivery.
+ * committed delivery. R6-02: a rename entry contributes BOTH its source and
+ * its target — the source is a deletion the path gate must see.
  */
 export async function worktreeDirtyFiles(repoRoot: string): Promise<string[]> {
   const status = await gitRaw(repoRoot, ['status', '--porcelain', '-uall']);
   const files: string[] = [];
   for (const line of status.split('\n')) {
     if (!line.trim()) continue;
-    let p = line.slice(3).trim();
-    if (p.includes(' -> ')) p = p.split(' -> ').pop()!.trim();
-    if (p && !matchAny(ATEAM_INTERNAL_PATTERNS, p)) files.push(p);
+    for (const p of porcelainPaths(line)) {
+      if (!matchAny(ATEAM_INTERNAL_PATTERNS, p)) files.push(p);
+    }
   }
   return files;
+}
+
+/** R6-02: the paths a `status --porcelain` line touches — one, or both ends
+ * of a rename (`R  old -> new`). */
+function porcelainPaths(line: string): string[] {
+  const rest = line.slice(3).trim();
+  const arrow = rest.indexOf(' -> ');
+  if (arrow >= 0) {
+    return [rest.slice(0, arrow).trim(), rest.slice(arrow + 4).trim()].filter((p) => p.length > 0);
+  }
+  const p = rest;
+  return p.length > 0 ? [p] : [];
 }
 
 /**
@@ -91,17 +111,16 @@ export async function worktreeDirtyFiles(repoRoot: string): Promise<string[]> {
  * runner commits only after verification passes). Runner-internal
  * `.ateam/**` bookkeeping is excluded (review 02 R2-01): the brief is an
  * untracked internal file, and counting it made "no delivery changes"
- * look like a valid delivery.
+ * look like a valid delivery. R6-02: rename sources are included — both the
+ * status parsing above and `--no-renames` on the diff.
  */
 export async function worktreeChangedFiles(repoRoot: string, fromSha: string): Promise<string[]> {
   const status = await gitRaw(repoRoot, ['status', '--porcelain', '-uall']);
-  const diff = await gitOk(repoRoot, ['diff', '--name-only', fromSha]);
+  const diff = await gitOk(repoRoot, ['diff', '--name-only', '--no-renames', fromSha]);
   const files = new Set<string>();
   for (const line of status.split('\n')) {
     if (!line.trim()) continue;
-    let p = line.slice(3).trim();
-    if (p.includes(' -> ')) p = p.split(' -> ').pop()!.trim();
-    if (p) files.add(p);
+    for (const p of porcelainPaths(line)) files.add(p);
   }
   for (const line of diff.split('\n')) {
     const t = line.trim();
@@ -117,6 +136,60 @@ export async function diffStat(repoRoot: string, fromSha: string, toSha = 'HEAD'
 export async function stageAll(repoRoot: string): Promise<void> {
   // .ateam/** is runner bookkeeping — never part of a delivery commit
   await gitOk(repoRoot, ['add', '-A', '--', '.', ':!.ateam']);
+}
+
+/**
+ * R6-03: index entries under runner-internal `.ateam/**` that DIFFER from
+ * HEAD — content a worker force-staged behind `stageAll`'s pathspec. The
+ * pathspec only constrains what `git add` adds; it never unstages anything.
+ * Measured as a staged diff vs HEAD so a base repo that legitimately tracks
+ * `.ateam` (unchanged in the index) is not a false positive.
+ */
+export async function stagedInternalFiles(repoRoot: string): Promise<string[]> {
+  const out = await gitOk(repoRoot, ['diff', '--cached', '--name-only', '--no-renames', 'HEAD', '--', ATEAM_INTERNAL_PATTERNS[0]!]);
+  return out.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
+}
+
+/** R6-03: restore the index's `.ateam/**` entries to HEAD — a forced add
+ * disappears, a forced modification/deletion reverts. The worktree copy is
+ * untouched; only the delivery index is cleaned. */
+export async function unstageInternalFiles(repoRoot: string): Promise<void> {
+  await gitOk(repoRoot, ['reset', '-q', '--', ATEAM_INTERNAL_PATTERNS[0]!]);
+}
+
+/**
+ * R6-04: materialize a pinned index tree as a DETACHED, disposable worktree
+ * so the verification commands read exactly the content the delivery commit
+ * will carry — never the mutable task worktree a worker may still be
+ * writing to. The checkout hangs off a throwaway commit (dangling once the
+ * worktree is removed), placed as a SIBLING of `anchorPath` so worktrees
+ * never nest. Returns the worktree path.
+ */
+export async function createGateWorktree(anchorPath: string, treeSha: string): Promise<string> {
+  const head = await git(anchorPath, ['rev-parse', '--verify', 'HEAD']);
+  const sha = head.ok
+    ? await gitOk(anchorPath, ['commit-tree', treeSha, '-p', head.stdout.trim(), '-m', 'ateam: verification gate tree'])
+    : await gitOk(anchorPath, ['commit-tree', treeSha, '-m', 'ateam: verification gate tree']);
+  const path = await mkdtemp(join(dirname(anchorPath), `${basename(anchorPath)}.gate-`));
+  try {
+    await gitOk(anchorPath, ['worktree', 'add', '--detach', path, sha]);
+  } catch (err) {
+    await rm(path, { recursive: true, force: true });
+    throw err;
+  }
+  return path;
+}
+
+/** R6-04: drop a gate worktree — the checkout is disposable and its content
+ * was either verified or refused, never delivered. */
+export async function removeGateWorktree(anchorPath: string, path: string): Promise<void> {
+  const res = await git(anchorPath, ['worktree', 'remove', '--force', path]);
+  if (!res.ok) {
+    // a remove that failed (locked admin area, already half-gone) must not
+    // leave a registered worktree behind — prune what the filesystem lost
+    await rm(path, { recursive: true, force: true });
+    await gitOk(anchorPath, ['worktree', 'prune']);
+  }
 }
 
 export async function commit(repoRoot: string, message: string): Promise<string> {

@@ -1,12 +1,22 @@
-// Mechanical verification gate: run each verification command in the
-// worktree (argv, allowlisted), then assert diff scope against the task's
-// path policy and that HEAD did not move unexpectedly.
+// Mechanical verification gate: run each verification command (argv,
+// allowlisted), then assert diff scope against the task's path policy and
+// that HEAD did not move unexpectedly.
 //
 // R5-01 (stage-first, `staged: true`): the task gate stages the delivery
 // BEFORE running commands, measures the diff as index-vs-base and pins the
 // index tree (`write-tree`). The commit step must later prove it carries
 // exactly that tree, so content racing in after the gate can never ride the
 // delivery commit unverified.
+//
+// R6-04 (stage-first): the commands run in a DETACHED, disposable worktree
+// checked out from the pinned index tree — never in the mutable task
+// worktree, where a worker could keep writing content the index never held.
+// What the commands verify IS the tree the commit will carry.
+//
+// R6-03 (stage-first): the FULL index is judged, not just the change set —
+// any `.ateam/**` entry a worker force-staged behind `stageAll`'s pathspec
+// is a violation, and the index is restored to HEAD so the pinned tree (and
+// the delivery commit) can never contain it.
 //
 // R5-03 (`requireClean: true`): the final gate verifies the COMMITTED
 // delivery only — the integration tree must be clean (no staged, unstaged
@@ -18,6 +28,10 @@ import {
   worktreeChangedFiles,
   stagedChangedFiles,
   worktreeDirtyFiles,
+  stagedInternalFiles,
+  unstageInternalFiles,
+  createGateWorktree,
+  removeGateWorktree,
   writeTree,
   currentHead,
   hasStagedChanges,
@@ -79,15 +93,48 @@ export async function verifyTaskWork(
     }
   }
 
+  // R6-03: judge the FULL index before pinning it — `.ateam/**` content a
+  // worker force-staged never enters the gate (and never the commit); the
+  // index is restored to HEAD instead of the entry being quietly filtered
+  // out of the change set below
+  if (opts.staged) {
+    const smuggled = await stagedInternalFiles(worktreePath);
+    if (smuggled.length > 0) {
+      violations.push(`(runner-internal .ateam content staged into the index: ${smuggled.join(', ')})`);
+      await unstageInternalFiles(worktreePath);
+    }
+  }
+
   // R5-01: pin the index tree the gate verifies — the commit step must
   // prove it carries exactly this tree
   const treeSha = opts.staged ? await writeTree(worktreePath) : undefined;
 
-  if (violations.length === 0) {
-    for (const command of task.spec.verificationCommands ?? []) {
-      const res = await runCommand(command, { cwd: worktreePath, allowlist, timeoutMs: opts.timeoutMs });
-      commands.push({ command, ok: res.ok, exitCode: res.exitCode, output: res.stdout + res.stderr });
-      if (!res.ok) break;
+  // R6-04: the commands read an isolated checkout of the PINNED tree, so a
+  // worker editing the (mutable) task worktree after stageAll cannot make
+  // the gate test content the delivery commit will never contain. Failure
+  // to materialize it is fail-closed: the gate refuses rather than falling
+  // back to the racy worktree.
+  let gatePath: string | null = null;
+  if (opts.staged && violations.length === 0) {
+    try {
+      gatePath = await createGateWorktree(worktreePath, treeSha!);
+    } catch (err) {
+      violations.push(`(could not materialize an isolated verification tree: ${String(err).slice(0, 200)})`);
+    }
+  }
+  const commandCwd = gatePath ?? worktreePath;
+
+  try {
+    if (violations.length === 0) {
+      for (const command of task.spec.verificationCommands ?? []) {
+        const res = await runCommand(command, { cwd: commandCwd, allowlist, timeoutMs: opts.timeoutMs });
+        commands.push({ command, ok: res.ok, exitCode: res.exitCode, output: res.stdout + res.stderr });
+        if (!res.ok) break;
+      }
+    }
+  } finally {
+    if (gatePath) {
+      await removeGateWorktree(worktreePath, gatePath).catch(() => { /* disposable litter, never blocks the verdict */ });
     }
   }
 

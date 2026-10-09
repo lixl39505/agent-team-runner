@@ -7,7 +7,7 @@
 
 import { latestCleanupSteps, recordCleanupStep } from '../store/cleanup.ts';
 import { getResource, getResourceForRun, listActiveResources, markResourceState } from '../store/resources.ts';
-import { updateTask, listTasks } from '../store/tasks.ts';
+import { updateTask, listTasks, getTask } from '../store/tasks.ts';
 import { getRun } from '../store/runs.ts';
 import { listExecutions, updateExecution } from '../store/executions.ts';
 import { hasPassingFinalVerification, type FinalVerificationExpectation } from '../store/verifications.ts';
@@ -28,6 +28,8 @@ const LEASE_HEARTBEAT_MS = 10_000;
  * Herdr/Git call that outlives the lease keeps renewing it — and if another
  * writer takes over ANYWAY, the loss is raised when the operation returns:
  * the step records nothing and the new owner re-runs it idempotently.
+ * R6-06: the loss is raised when the operation RETURNS OR THROWS — a failed
+ * operation must not launder a lost lease into "my failure to record".
  */
 async function fencedOperation<T>(ensureLease: (() => void) | undefined, op: () => Promise<T>): Promise<T> {
   if (!ensureLease) return op();
@@ -44,6 +46,9 @@ async function fencedOperation<T>(ensureLease: (() => void) | undefined, op: () 
     const result = await op();
     if (lost) throw lost;
     return result;
+  } catch (err) {
+    if (lost) throw lost; // R6-06: the fence loss wins over the op's own error
+    throw err;
   } finally {
     clearInterval(timer);
   }
@@ -78,6 +83,14 @@ async function runStep(
     // re-runs the step against the authoritative state instead of inheriting
     // a conclusion written by a dispossessed process
     if (err instanceof LeaseLostError) throw err;
+    // R6-06: the FAILURE conclusion is audited too — re-prove the fence
+    // before recording it, or a dispossessed writer and the new owner could
+    // leave contradictory cleanup verdicts behind
+    try {
+      ensureLease?.();
+    } catch (fenceErr) {
+      throw fenceErr instanceof Error ? fenceErr : new Error(String(fenceErr));
+    }
     recordCleanupStep(db, {
       runId, taskId: task.taskId, step, status: 'failed',
       branch: task.branch, worktreePath: task.worktreePath, workspaceId: task.workspaceId,
@@ -180,12 +193,20 @@ export async function finalPassMatchesDelivery(env: RunnerEnv): Promise<boolean>
  * R4-03/R5-02: herdr reuses short workspace ids after server restarts — a
  * ledger row (or run field) only proves this run ONCE held the id. Before a
  * FORCE removal the identity must be PROVEN, never assumed: an ACTIVE,
- * ATeam-provenanced ledger row in THIS run (matching taskId when given) AND
+ * ATeam-provenanced ledger row in THIS run of the CALLER'S OWN GENERATION AND
  * an authoritative snapshot that maps the id to a workspace whose worktree
  * path, branch AND repo root are all present and exactly equal to the
- * ledgered/run-binding values. Any missing field or mismatch = no proof =
+ * ledgered/binding values. Any missing field or mismatch = no proof =
  * refuse, fail-closed. Absent from the snapshot = already gone (the
  * postcondition holds); an unreachable snapshot = refuse.
+ *
+ * R6-01: the generation binding is exact, not "not some other task" — within
+ * one run insertResource follows a REUSED id to its newest identity, so a
+ * task deletion requires the row to be ledgered to THAT task (never null =
+ * the integration) and to the task's own worktree binding, and an
+ * integration deletion requires a task-less row matching the run's
+ * integration binding. A row of the wrong generation is a refusal even when
+ * its path/branch happen to match the live snapshot.
  */
 export async function assertRemovableWorkspace(
   env: RunnerEnv,
@@ -205,8 +226,29 @@ export async function assertRemovableWorkspace(
         : `no active provenanced ledger row for workspace ${workspaceId} in run ${runId}; refusing to force-remove an identity this run cannot prove`,
     );
   }
-  if (opts.taskId && mine.taskId && mine.taskId !== opts.taskId) {
-    throw new Error(`workspace ${workspaceId} is ledgered to task ${mine.taskId}, not ${opts.taskId}; refusing to remove it`);
+  // R6-01: bind the ledger row to the caller's generation and derive the
+  // path/branch the row must carry from that same binding
+  let expectedPath: string | null | undefined;
+  let expectedBranch: string | null | undefined;
+  if (opts.taskId) {
+    if (mine.taskId !== opts.taskId) {
+      throw new Error(
+        mine.taskId === null
+          ? `workspace ${workspaceId} is ledgered to the run integration, not task ${opts.taskId}; refusing to remove it as a task workspace`
+          : `workspace ${workspaceId} is ledgered to task ${mine.taskId}, not ${opts.taskId}; refusing to remove it`,
+      );
+    }
+    const task = getTask(db, runId, opts.taskId);
+    if (!task) throw new Error(`task ${opts.taskId} has no ledger row; refusing to remove workspace ${workspaceId} for it`);
+    expectedPath = task.worktreePath;
+    expectedBranch = task.branch;
+  } else {
+    if (mine.taskId !== null) {
+      throw new Error(`workspace ${workspaceId} is ledgered to task ${mine.taskId}; refusing to remove it as the run integration workspace`);
+    }
+    const run = getRun(db, runId);
+    expectedPath = run?.integrationPath;
+    expectedBranch = run?.integrationBranch;
   }
   const snap = await client.snapshot().catch(() => null);
   if (!snap) {
@@ -216,13 +258,15 @@ export async function assertRemovableWorkspace(
   if (!live) return; // already removed — the postcondition holds
   const repoRoot = getRun(db, runId)?.repoRoot;
   const mismatches: string[] = [];
+  if (!expectedPath) mismatches.push('no worktree path bound for this generation');
+  else if (mine.path !== expectedPath) mismatches.push(`ledger path ${mine.path ?? '-'} != bound ${expectedPath}`);
+  if (!expectedBranch) mismatches.push('no branch bound for this generation');
+  else if (mine.branch !== expectedBranch) mismatches.push(`ledger branch ${mine.branch ?? '-'} != bound ${expectedBranch}`);
   if (!live.worktree?.path || !live.worktree?.branch) {
     mismatches.push('live snapshot provides no worktree path/branch');
   } else {
-    if (!mine.path) mismatches.push('ledger row has no path');
-    else if (live.worktree.path !== mine.path) mismatches.push(`path ${live.worktree.path} != ledgered ${mine.path}`);
-    if (!mine.branch) mismatches.push('ledger row has no branch');
-    else if (live.worktree.branch !== mine.branch) mismatches.push(`branch ${live.worktree.branch} != ledgered ${mine.branch}`);
+    if (!expectedPath || live.worktree.path !== expectedPath) mismatches.push(`path ${live.worktree.path} != bound ${expectedPath ?? '-'}`);
+    if (!expectedBranch || live.worktree.branch !== expectedBranch) mismatches.push(`branch ${live.worktree.branch} != bound ${expectedBranch ?? '-'}`);
   }
   if (!repoRoot) mismatches.push('run row has no repo binding');
   else if (!live.worktree?.repoRoot) mismatches.push('live snapshot provides no repo root');

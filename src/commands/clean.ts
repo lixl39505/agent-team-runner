@@ -13,7 +13,7 @@ import { openDatabase } from '../store/db.ts';
 import { loadHome } from '../config.ts';
 import { getRun, updateRunStatus } from '../store/runs.ts';
 import { listTasks } from '../store/tasks.ts';
-import { listActiveExecutions } from '../store/executions.ts';
+import { listActiveExecutions, updateExecution } from '../store/executions.ts';
 import { addEvent } from '../store/events.ts';
 import { SETTLED_TASK } from '../core/types.ts';
 import { AteamError, LeaseLostError } from '../core/errors.ts';
@@ -67,6 +67,31 @@ export async function cmdClean(opts: CleanCommandOptions): Promise<number> {
       const sweepable = tasks.filter((t) =>
         t.status === 'integrated'
         || (opts.discardWork === true && !['reclaimed', 'discarded'].includes(t.status)));
+      // R6-05: an explicit discard must settle the control state BEFORE any
+      // destruction. An execution left active on a to-be-discarded task would
+      // see its workspace force-removed under it and then — with the run
+      // still "resumable" — be recovered by the next reconcile into a fresh
+      // worktree/attempt for a task that no longer owns delivery work.
+      // Abandoning the ledger row first (the sweep's workspace removal then
+      // retires the pane as `gone`, audited) keeps destruction and the discard
+      // conclusion one forward-moving transition: after the sweep nothing is
+      // active, nothing recoverable, and the run can actually terminate.
+      if (opts.discardWork === true) {
+        const discardable = new Set(
+          tasks.filter((t) => !SETTLED_TASK.has(t.status)).map((t) => t.taskId),
+        );
+        // the abandon writes are delivery-state changes — fenced like the sweep
+        if (!heartbeat(db, run.id, fence)) throw leaseLost();
+        for (const exec of listActiveExecutions(db, run.id)) {
+          if (!discardable.has(exec.taskId)) continue;
+          updateExecution(db, exec.id, { status: 'abandoned' });
+          addEvent(db, run.id, 'RECONCILE_DECISION', {
+            executionId: exec.id,
+            taskId: exec.taskId,
+            payload: { reason: 'execution_abandoned_for_discard', source: 'clean' },
+          });
+        }
+      }
       for (const task of sweepable) {
         // R3-06: reclamation is irreversible — the token-CAS heartbeat both
         // renews the lease and aborts the sweep the moment another writer

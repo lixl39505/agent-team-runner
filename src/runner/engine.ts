@@ -1352,6 +1352,30 @@ export class RunnerEngine {
 
         for (const exec of listActiveExecutions(db, runId)) {
           const task = tasks.find((t) => t.taskId === exec.taskId);
+          // R6-05: a settled task (integrated/reclaimed/discarded/failed)
+          // owns no further delivery work — an execution still active on one
+          // (its workspace may already be reclaimed, or the task was
+          // discarded by `clean --discard-work`) must never be recovered
+          // into a fresh worktree/attempt
+          if (task && SETTLED_TASK.has(task.status)) {
+            decisions.push({
+              kind: 'pane_lost_no_attempt',
+              taskId: exec.taskId,
+              executionId: exec.id,
+              detail: `execution still active on a ${task.status} task; recovery refused`,
+            });
+            if (!opts.dryRun) {
+              // settle the stray ledger row too — an execution left active on
+              // a settled task would block run finalization forever
+              this.ensureLease(); // R4-05: the write is fenced
+              updateExecution(db, exec.id, { status: 'abandoned' });
+              addEvent(db, runId, 'RECONCILE_DECISION', {
+                executionId: exec.id,
+                payload: { reason: 'execution_on_settled_task', taskStatus: task.status },
+              });
+            }
+            continue;
+          }
           // 1) 已落盘结果优先：有效结果存在就补做转换，绝不为此新建 attempt。
           // R2-08: dry-run probes the same condition READ-ONLY — receiving
           // and applying a persisted result is a state change and must not
@@ -1504,6 +1528,17 @@ export class RunnerEngine {
     decisions: ReconcileDecision[],
   ): Promise<void> {
     const { db, runId, client } = this.env;
+    // R6-05 (defense in depth): never rebuild for a task that already
+    // settled — the reconcile loop guards this, but a settled check at the
+    // write site is what survives future callers
+    if (SETTLED_TASK.has(task.status)) {
+      decisions.push({
+        kind: 'pane_lost_no_attempt',
+        taskId: task.taskId,
+        detail: `worktree rebuild refused for a ${task.status} task`,
+      });
+      return;
+    }
     // herdr 0.9.x: rebuilds must start from the repo PARENT workspace
     let source = task.workspaceId ?? '';
     try {
