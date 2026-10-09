@@ -36,3 +36,14 @@ bun src/cli.ts doctor --runtime herdr   # 必须全绿
   `src/herdr/runtime-client.ts`，e2e 首跑如有出入只需调整 argv 表）。
 - `pane report-agent` 的 CLI 包装名（`pane report-agent`）同理。
 - Windows named pipe 的默认路径名（`\\.\pipe\herdr` 为占位，可用 `HERDR_SOCKET_PATH` 覆盖）。
+
+## 事件 wire shape（herdr 0.9.1 / protocol 22，2026-10-09 真机实测）
+
+事件协议的完整约束（CLI 映射、socket/事件 wire shape、幂等键、升级复检清单）统一收敛在
+[docs/herdr-protocol.md](herdr-protocol.md)；真机验证用
+`scripts/herdr-event-probe.ts`（headless server + 任一 workspace 的 root pane）。要点：
+
+- 订阅类型名用点号且被服务端校验；混合订阅（pane + worktree 类型）正常 ack。
+- 事件载荷在 `data` 字段里，类型名点号/下划线混用（`pane_closed`、`worktree_removed`）。
+- 每条连接只有第一个 `events.subscribe` 生效；拒绝订阅的错误信封 `id` 为 `""`。
+- worktree 事件无 `pane_id`，按 repo 上下文投递到已有 pane 订阅。

@@ -76,4 +76,4 @@ bun test                    # 全量（约 120 个用例）
 bun test test/runner.test.ts  # 交付链路集成测试（fake Herdr + 真实 git worktree）
 ```
 
-真实 Herdr 的端到端验证见 [docs/e2e.md](docs/e2e.md)（`ATEAM_HERDR_E2E=1` 门控 + 手动清单）。
+真实 Herdr 的端到端验证见 [docs/e2e.md](docs/e2e.md)（`ATEAM_HERDR_E2E=1` 门控 + 手动清单）；真机协议约束（CLI 映射、事件 wire shape、升级复检清单）见 [docs/herdr-protocol.md](docs/herdr-protocol.md)，复检探针在 `scripts/herdr-event-probe.ts`。
