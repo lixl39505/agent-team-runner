@@ -286,11 +286,30 @@ export function ownershipConflict(a: readonly string[], b: readonly string[]): b
   return false;
 }
 
+/** The path-policy shape any delivery scope carries (a TaskSpec's policy
+ * fields — structurally, nothing more). */
+export interface DeliveryScope {
+  allowedPaths: readonly string[];
+  blockedPaths?: readonly string[];
+}
+
 /** Whether edits under path are allowed for a task given its policy sets. */
-export function isPathAllowed(task: { allowedPaths: readonly string[]; blockedPaths?: readonly string[] }, path: string): boolean {
+export function isPathAllowed(task: DeliveryScope, path: string): boolean {
   if (!matchAny(task.allowedPaths, path)) return false;
   if (task.blockedPaths && task.blockedPaths.length > 0 && matchAny(task.blockedPaths, path)) return false;
   return true;
+}
+
+/**
+ * R7-01: paths outside EVERY delivery scope. A delivery commit — a task's or
+ * the integration's — may only touch paths some task's path policy owns;
+ * anything else is content no contract ever allowed.
+ */
+export function pathsOutsideScopes(
+  scopes: ReadonlyArray<DeliveryScope>,
+  paths: readonly string[],
+): string[] {
+  return paths.filter((p) => !scopes.some((s) => isPathAllowed(s, p)));
 }
 
 /** Paths ATeam itself owns inside a worktree; agents must never touch. */

@@ -8,11 +8,11 @@
 import { latestCleanupSteps, recordCleanupStep } from '../store/cleanup.ts';
 import { getResource, getResourceForRun, listActiveResources, markResourceState } from '../store/resources.ts';
 import { updateTask, listTasks, getTask } from '../store/tasks.ts';
-import { getRun } from '../store/runs.ts';
+import { getRun, updateRunRuntimeState } from '../store/runs.ts';
 import { listExecutions, updateExecution } from '../store/executions.ts';
 import { hasPassingFinalVerification, type FinalVerificationExpectation } from '../store/verifications.ts';
 import { addEvent } from '../store/events.ts';
-import { branchExists, worktreeBranches, deleteBranchIfFree, currentHead } from '../core/git.ts';
+import { branchExists, worktreeBranches, deleteBranchIfFree, currentHead, removeGateWorktree } from '../core/git.ts';
 import { existsSync } from 'node:fs';
 import { HerdrError } from '../herdr/types.ts';
 import { LeaseLostError } from '../core/errors.ts';
@@ -208,6 +208,35 @@ export async function finalPassMatchesDelivery(env: RunnerEnv): Promise<boolean>
  * integration binding. A row of the wrong generation is a refusal even when
  * its path/branch happen to match the live snapshot.
  */
+/**
+ * R7-06: reclaim gate worktrees a crash (or a failed in-gate cleanup) left
+ * registered. The postcondition is "checkout gone, no stale git worktree
+ * registration" — idempotent for rows whose checkout never materialized.
+ * Rows that cannot be reclaimed stay active and are retried by the next
+ * reconcile/clean pass. Returns how many rows were settled.
+ */
+export async function cleanupGateWorktrees(env: RunnerEnv): Promise<number> {
+  const { db, runId } = env;
+  const repoRoot = getRun(db, runId)?.repoRoot;
+  if (!repoRoot) return 0;
+  let swept = 0;
+  for (const res of listActiveResources(db, runId)) {
+    if (res.kind !== 'gate-worktree' || !res.path) continue;
+    try {
+      await removeGateWorktree(repoRoot, res.path);
+      markResourceState(db, runId, 'gate-worktree', res.herdrId, 'reclaimed');
+      addEvent(db, runId, 'RECONCILE_DECISION', {
+        taskId: res.taskId ?? undefined,
+        payload: { reason: 'gate_worktree_reclaimed', path: res.path },
+      });
+      swept += 1;
+    } catch {
+      /* stays active — retried by the next reconcile/clean pass */
+    }
+  }
+  return swept;
+}
+
 export async function assertRemovableWorkspace(
   env: RunnerEnv,
   workspaceId: string,
@@ -273,6 +302,58 @@ export async function assertRemovableWorkspace(
   else if (live.worktree.repoRoot !== repoRoot) mismatches.push(`repo root ${live.worktree.repoRoot} != run binding ${repoRoot}`);
   if (mismatches.length > 0) {
     throw new Error(`workspace ${workspaceId} identity cannot be proven (${mismatches.join('; ')}); refusing to force-remove a workspace this run cannot prove provenance for`);
+  }
+}
+
+/**
+ * R7-04: dispose of the run-level integration workspace — the ONE shared
+ * reclamation step for the engine's cleanup phase and `clean`. Identity is
+ * proven like a task worktree's (R4-03), the removal retires the panes that
+ * lived in the workspace (R3-07) and clears the run fields, and the whole
+ * step is idempotently retryable. Returns true when no integration workspace
+ * remains; false when the removal must be retried (snapshot unavailable,
+ * identity unprovable, herdr error). A lost lease is re-thrown so a
+ * dispossessed writer never keeps destroying.
+ */
+export async function cleanupIntegrationWorkspace(
+  env: RunnerEnv,
+  opts: { ensureLease?: () => void } = {},
+): Promise<boolean> {
+  const { db, runId, client } = env;
+  const workspaceId = getRun(db, runId)?.integrationWorkspaceId;
+  if (!workspaceId) return true;
+  try {
+    opts.ensureLease?.();
+    // R4-03: the same identity proof as task worktrees — the run field
+    // alone does not survive a herdr id reuse
+    await assertRemovableWorkspace(env, workspaceId);
+    await client.removeWorktree({ workspaceId, force: true });
+    // R5-04: the removal may have run long — the state writes below are
+    // its conclusion and need a current fence
+    opts.ensureLease?.();
+    markResourceState(db, runId, 'workspace', workspaceId, 'reclaimed');
+    // R3-07 + pane-retirement policy: integrator panes lived in the removed
+    // workspace — retired as `gone` (never a success close), one audit event
+    // each, mirroring the task-worktree path
+    for (const exec of listExecutions(db, runId)) {
+      if (['open', 'retained'].includes(exec.paneState) && exec.workspaceId === workspaceId) {
+        updateExecution(db, exec.id, { paneState: 'gone' });
+        addEvent(db, runId, 'RECONCILE_DECISION', {
+          executionId: exec.id,
+          payload: {
+            reason: 'pane_retired_by_workspace_removal',
+            workspaceId,
+            concludedSuccessfully: exec.status === 'completed' && !!exec.resultDigest,
+          },
+        });
+      }
+    }
+    updateRunRuntimeState(db, runId, { integrationWorkspaceId: null, integrationPath: null });
+    return true;
+  } catch (err) {
+    if (err instanceof LeaseLostError) throw err;
+    /* retried on the next tick / by clean */
+    return false;
   }
 }
 
@@ -353,6 +434,9 @@ export async function cleanupTaskResources(env: RunnerEnv, task: TaskRecord, opt
   // be current, not the one a long removal left behind
   opts.ensureLease?.();
   for (const res of listActiveResources(db, runId)) {
+    // R7-06: a gate-worktree row closes only via the sweep that actually
+    // removed its checkout — never bulk-marked reclaimed here
+    if (res.kind === 'gate-worktree') continue;
     if (res.taskId === task.taskId || res.herdrId === task.workspaceId) {
       markResourceState(db, runId, res.kind, res.herdrId, 'reclaimed');
     }

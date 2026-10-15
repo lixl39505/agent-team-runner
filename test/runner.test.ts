@@ -4,6 +4,7 @@
 // revise consumption, and the verification/attempt gates.
 
 import { afterAll, describe, expect, test } from 'bun:test';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { openDatabase, type SqliteDb } from '../src/store/db.ts';
 import { insertRun, getRun, appendContractRevision, listRuns } from '../src/store/runs.ts';
@@ -13,6 +14,8 @@ import { validateContract } from '../src/core/contract.ts';
 import { RunnerEngine } from '../src/runner/engine.ts';
 import { verifyTaskWork } from '../src/runner/phases/verify.ts';
 import { commitVerifiedTree } from '../src/runner/phases/commit.ts';
+import { commitIntegrationResolution } from '../src/runner/phases/integrate.ts';
+import { concludeFinalGate } from '../src/runner/phases/final-gate.ts';
 import { currentHead, writeTree } from '../src/core/git.ts';
 import { FakeHerdrClient } from '../src/herdr/fake-client.ts';
 import type { FakeAgentScript } from '../src/herdr/fake-client.ts';
@@ -2210,6 +2213,111 @@ describe('RunnerEngine — full delivery chain', () => {
     expect(getTask(fx.db, RUN, 'API')!.status).toBe('discarded');
   }, 30_000);
 
+  test('R7-03: a failed discard leaves a durable intent — the runner/reconcile finish the sweep', async () => {
+    const fx = track(await makeFixture({
+      [wName('API')]: { kind: 'claude', sequence: ['working', 'done'], stepMs: 5, pauseAt: 'working' },
+    }));
+    seedRun(fx);
+    // WEB/DOCS settled so the schedule pass has nothing else to start
+    fx.db.run("UPDATE tasks SET status='discarded' WHERE task_id IN ('WEB','DOCS')");
+    fx.db.run("UPDATE tasks SET status='running', attempts=1 WHERE run_id=? AND task_id='API'", [RUN]);
+    const { startExecution } = await import('../src/runner/executions.ts');
+    await startExecution(envFor(fx), { role: 'worker', task: getTask(fx.db, RUN, 'API')!, attemptNo: 1, cycleNo: 0, entry: { kind: 'claude' } });
+    const workspaceId = getTask(fx.db, RUN, 'API')!.workspaceId!;
+
+    // the review-07 window: the runtime is unreachable, so clean's sweep
+    // cannot prove the workspace identity — destruction never happens
+    const offline = stubClient({ snapshot: () => Promise.reject(new Error('offline')) });
+    const { cmdClean } = await import('../src/commands/clean.ts');
+    expect(await cmdClean({ runId: RUN, home: fx.home, json: true, client: offline, discardWork: true })).toBe(1);
+
+    // control state IS settled (no active execution) and the run stays
+    // resumable — but now the discard intent is durable on the task row
+    const { listActiveExecutions } = await import('../src/store/executions.ts');
+    expect(listActiveExecutions(fx.db, RUN)).toHaveLength(0);
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('running');
+    expect(getTask(fx.db, RUN, 'API')!.pendingDispatch).toBe('discard');
+
+    // a PLAIN runner tick (no --discard-work anywhere) resumes the intent
+    await engineFor(fx).tickOnce();
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('discarded');
+    expect(getTask(fx.db, RUN, 'API')!.pendingDispatch).toBeNull();
+    expect(fx.fake.worktreeOf(workspaceId)).toBeNull();
+  }, 30_000);
+
+  test('R7-03: reconcile resumes a persisted discard intent for an unverified integrated task', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    // every task settled as discarded so nothing else is schedulable; one
+    // integrated-but-unverified task carries the operator's discard intent
+    // (clean --discard-work died before its sweep could run)
+    fx.db.run("UPDATE tasks SET status='discarded', worktree_path=NULL, branch=NULL, workspace_id=NULL WHERE task_id IN ('WEB','DOCS')");
+    const ws = await fx.fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: `ateam/${RUN}/task/API` });
+    insertWorkspaceLedger(fx, ws);
+    fx.db.run(
+      `UPDATE tasks SET status='integrated', pending_dispatch='discard', branch=?, worktree_path=?, workspace_id=?
+       WHERE run_id=? AND task_id='API'`,
+      [ws.worktree.branch, ws.worktree.path, ws.workspace.workspaceId, RUN],
+    );
+
+    const decisions = await engineFor(fx).reconcileOnce({});
+    expect(decisions.some((d) => d.kind === 'cleanup_resumed' && d.taskId === 'API' && d.detail === 'discard intent resumed')).toBe(true);
+    expect(getTask(fx.db, RUN, 'API')!.status).toBe('discarded');
+    expect(getTask(fx.db, RUN, 'API')!.pendingDispatch).toBeNull();
+    expect(fx.fake.worktreeOf(ws.workspace.workspaceId)).toBeNull();
+  }, 30_000);
+
+  test('R7-04: clean disposes of the integration workspace before terminating', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    // every task reclaimed; the run still holds its integration workspace
+    const handle = await fx.fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: `ateam/${RUN}/integration` });
+    insertResource(fx.db, {
+      runId: RUN, kind: 'workspace', herdrId: handle.workspace.workspaceId,
+      branch: handle.worktree.branch, path: handle.worktree.path,
+    });
+    fx.db.run(
+      'UPDATE runs SET integration_workspace_id=?, integration_path=?, integration_branch=?, status=? WHERE id=?',
+      [handle.workspace.workspaceId, handle.worktree.path, handle.worktree.branch, 'integrating', RUN],
+    );
+    fx.db.run("UPDATE tasks SET status='reclaimed', pending_dispatch=NULL WHERE run_id=?", [RUN]);
+
+    const { cmdClean } = await import('../src/commands/clean.ts');
+    expect(await cmdClean({ runId: RUN, home: fx.home, json: true, client: fx.fake })).toBe(0);
+    const run = getRun(fx.db, RUN)!;
+    expect(run.status).toBe('abandoned');
+    expect(run.integrationWorkspaceId).toBeNull();
+    expect(run.integrationPath).toBeNull();
+    expect(fx.fake.worktreeOf(handle.workspace.workspaceId)).toBeNull();
+    const { getResourceForRun } = await import('../src/store/resources.ts');
+    expect(getResourceForRun(fx.db, RUN, 'workspace', handle.workspace.workspaceId)!.state).toBe('reclaimed');
+  }, 30_000);
+
+  test('R7-04: clean refuses to terminate a run whose integration workspace cannot be removed', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    const handle = await fx.fake.createWorktreeWorkspace({ sourceWorkspaceId: 'w0', branch: `ateam/${RUN}/integration` });
+    insertResource(fx.db, {
+      runId: RUN, kind: 'workspace', herdrId: handle.workspace.workspaceId,
+      branch: handle.worktree.branch, path: handle.worktree.path,
+    });
+    fx.db.run(
+      'UPDATE runs SET integration_workspace_id=?, integration_path=?, integration_branch=?, status=? WHERE id=?',
+      [handle.workspace.workspaceId, handle.worktree.path, handle.worktree.branch, 'integrating', RUN],
+    );
+    fx.db.run("UPDATE tasks SET status='reclaimed', pending_dispatch=NULL WHERE run_id=?", [RUN]);
+
+    // the runtime is unreachable — the identity cannot be proven, so the
+    // workspace must NOT be orphaned by terminating the run
+    const offline = stubClient({ snapshot: () => Promise.reject(new Error('offline')) });
+    const { cmdClean } = await import('../src/commands/clean.ts');
+    expect(await cmdClean({ runId: RUN, home: fx.home, json: true, client: offline })).toBe(1);
+    const run = getRun(fx.db, RUN)!;
+    expect(TERMINALS).not.toContain(run.status);
+    expect(run.integrationWorkspaceId).not.toBeNull();
+    expect(fx.fake.worktreeOf(handle.workspace.workspaceId)).not.toBeNull();
+  }, 30_000);
+
   test('R5-02: a resource judged lost that the snapshot shows alive again is re-activated', async () => {
     const fx = track(await makeFixture({}));
     seedRun(fx);
@@ -2362,9 +2470,40 @@ describe('RunnerEngine — full delivery chain', () => {
   }, 30_000);
 });
 
+  test('R7-06: a crash-left gate worktree is ledgered and reclaimed by the sweep', async () => {
+    const fx = track(await makeFixture({}));
+    seedRun(fx);
+    // simulate a crash AFTER createGateWorktree registered the checkout — no
+    // finally ran; the ledger row is what makes this recoverable
+    const { createGateWorktree } = await import('../src/core/git.ts');
+    const orphan = await createGateWorktree(fx.repoRoot, await writeTree(fx.repoRoot));
+    insertResource(fx.db, { runId: RUN, taskId: 'API', kind: 'gate-worktree', herdrId: orphan, path: orphan });
+    expect(existsSync(orphan)).toBe(true);
+
+    const { cleanupGateWorktrees } = await import('../src/runner/cleanup.ts');
+    expect(await cleanupGateWorktrees(envFor(fx))).toBe(1);
+    const { getResourceForRun } = await import('../src/store/resources.ts');
+    expect(getResourceForRun(fx.db, RUN, 'gate-worktree', orphan)!.state).toBe('reclaimed');
+    expect(existsSync(orphan)).toBe(false);
+    // no stale registration remains in the repo
+    const proc = Bun.spawn(['git', '-C', fx.repoRoot, 'worktree', 'list', '--porcelain'], { stdout: 'pipe', stderr: 'pipe', stdin: 'ignore' });
+    expect(await new Response(proc.stdout).text()).not.toContain('.gate-');
+    // idempotent: a second sweep finds nothing to do
+    expect(await cleanupGateWorktrees(envFor(fx))).toBe(0);
+
+    // and a reconcile pass runs the sweep on its own
+    const orphan2 = await createGateWorktree(fx.repoRoot, await writeTree(fx.repoRoot));
+    insertResource(fx.db, { runId: RUN, taskId: 'API', kind: 'gate-worktree', herdrId: orphan2, path: orphan2 });
+    const decisions = await engineFor(fx).reconcileOnce({});
+    expect(decisions.some((d) => d.kind === 'cleanup_resumed' && d.detail === 'gate worktree sweep')).toBe(true);
+    expect(getResourceForRun(fx.db, RUN, 'gate-worktree', orphan2)!.state).toBe('reclaimed');
+    expect(existsSync(orphan2)).toBe(false);
+  }, 30_000);
+
 // Direct gate tests: a standalone repo + task record, no engine — the
-// R6-02/R6-03/R6-04 delivery-boundary cases from review 06.
-describe('verification gate — R6 path/content integrity', () => {
+// R6-02/R6-03/R6-04 delivery-boundary cases from review 06 and the
+// R7-01/R7-02 commit/gate integrity cases from review 07.
+describe('verification gate — R6/R7 path/content integrity', () => {
   interface GateRepo {
     root: string;
     base: string;
@@ -2509,6 +2648,253 @@ describe('verification gate — R6 path/content integrity', () => {
       // and the commit carries exactly the verified tree
       const sha = await commitVerifiedTree(repo.root, honest.treeSha, 'verified');
       expect(sha).not.toBeNull();
+    } finally {
+      await cleanupTempDir(repo.root);
+    }
+  });
+
+  test('R7-01: the final gate refuses delivery commits that carry .ateam content', async () => {
+    const repo = await makeGateRepo();
+    try {
+      // the review-07 repro: internal content already INSIDE an integration
+      // commit — the worktree is clean, the old filters saw no violation
+      await repo.stage({ 'allowed.txt': 'legal\n', '.ateam/injected.txt': 'smuggled\n' });
+      await repo.git('commit', '-m', 'integration commit');
+      const outcome = await verifyTaskWork({
+        worktreePath: repo.root,
+        task: gateTask(repo, { allowedPaths: ['**'], verificationCommands: [] }),
+        allowlist: [],
+        baseSha: repo.base,
+        requireClean: true,
+      });
+      expect(outcome.ok).toBe(false);
+      expect(outcome.violations.some((v) => v.includes('runner-internal .ateam content'))).toBe(true);
+    } finally {
+      await cleanupTempDir(repo.root);
+    }
+  });
+
+  test('R7-01: the final gate refuses committed paths outside every task policy', async () => {
+    const repo = await makeGateRepo();
+    try {
+      await repo.stage({ 'allowed.txt': 'legal\n', 'elsewhere.txt': 'out of scope\n' });
+      await repo.git('commit', '-m', 'integration commit');
+      const refused = await verifyTaskWork({
+        worktreePath: repo.root,
+        task: gateTask(repo, { allowedPaths: ['**'], verificationCommands: [] }),
+        allowlist: [],
+        baseSha: repo.base,
+        requireClean: true,
+        scopePolicies: [{ allowedPaths: ['allowed.txt'] }],
+      });
+      expect(refused.ok).toBe(false);
+      expect(refused.violations.some((v) => v.includes('outside every task'))).toBe(true);
+      // positive control: the same commit passes when a policy owns the path
+      const allowed = await verifyTaskWork({
+        worktreePath: repo.root,
+        task: gateTask(repo, { allowedPaths: ['**'], verificationCommands: [] }),
+        allowlist: [],
+        baseSha: repo.base,
+        requireClean: true,
+        scopePolicies: [{ allowedPaths: ['allowed.txt', 'elsewhere.txt'] }],
+      });
+      expect(allowed.ok).toBe(true);
+    } finally {
+      await cleanupTempDir(repo.root);
+    }
+  });
+
+  test('R7-01: the integrator commit gate refuses pre-staged .ateam content and out-of-scope resolutions', async () => {
+    // the integrator path force-stages a runner-internal file behind
+    // stageAll's pathspec — exactly the review-07 repro
+    const smuggled = await makeGateRepo();
+    try {
+      await smuggled.stage({ '.ateam/injected.txt': 'smuggled\n', 'allowed.txt': 'resolved\n' });
+      const refused = await commitIntegrationResolution({
+        worktreePath: smuggled.root,
+        baseSha: smuggled.base,
+        message: 'conflict resolution',
+        scopes: [{ allowedPaths: ['allowed.txt'] }],
+      });
+      expect(refused.ok).toBe(false);
+      expect(refused.sha).toBeNull();
+      expect(refused.violations.some((v) => v.includes('.ateam'))).toBe(true);
+      // nothing was committed — the refusal keeps the branch where it was
+      expect(await currentHead(smuggled.root)).toBe(smuggled.base);
+    } finally {
+      await cleanupTempDir(smuggled.root);
+    }
+
+    // a conflict resolution that edits outside every task policy is refused
+    const outside = await makeGateRepo();
+    try {
+      await outside.stage({ 'allowed.txt': 'resolved\n', 'elsewhere.txt': 'edited\n' });
+      const refused = await commitIntegrationResolution({
+        worktreePath: outside.root,
+        baseSha: outside.base,
+        message: 'conflict resolution',
+        scopes: [{ allowedPaths: ['allowed.txt'] }],
+      });
+      expect(refused.ok).toBe(false);
+      expect(refused.sha).toBeNull();
+      expect(refused.violations.some((v) => v.includes('outside every task'))).toBe(true);
+      expect(await currentHead(outside.root)).toBe(outside.base);
+    } finally {
+      await cleanupTempDir(outside.root);
+    }
+
+    // the honest resolution commits
+    const honest = await makeGateRepo();
+    try {
+      await honest.stage({ 'allowed.txt': 'resolved\n' });
+      const okGate = await commitIntegrationResolution({
+        worktreePath: honest.root,
+        baseSha: honest.base,
+        message: 'conflict resolution',
+        scopes: [{ allowedPaths: ['allowed.txt'] }],
+      });
+      expect(okGate.ok).toBe(true);
+      expect(okGate.sha).not.toBeNull();
+      expect(await currentHead(honest.root)).toBe(okGate.sha!);
+    } finally {
+      await cleanupTempDir(honest.root);
+    }
+  });
+
+  test('R7-02: a verification command that rewrites tracked content in the gate tree fails the gate', async () => {
+    const repo = await makeGateRepo();
+    try {
+      // the review-07 repro: index pins value.txt=bad; the command rewrites
+      // it to good INSIDE the gate checkout and asserts the rewrite — the
+      // old gate passed, though the delivery commit carries `bad`
+      await repo.stage({ 'value.txt': 'bad\n' });
+      const rewritten = await verifyTaskWork({
+        worktreePath: repo.root,
+        task: gateTask(repo, { allowedPaths: ['value.txt'], verificationCommands: ['sh -c "printf good > value.txt; grep -q good value.txt"'] }),
+        allowlist: ['git *', 'sh *'],
+        baseSha: repo.base,
+        staged: true,
+      });
+      expect(rewritten.ok).toBe(false);
+      expect(rewritten.commands[0]!.ok).toBe(true); // the command itself succeeded...
+      expect(rewritten.violations.some((v) => v.includes('mutated the isolated verification tree'))).toBe(true);
+      // ...and the delivery still carries exactly the pinned (bad) content
+      const sha = await commitVerifiedTree(repo.root, rewritten.treeSha, 'delivery');
+      expect(sha).not.toBeNull();
+      const show = Bun.spawn(['git', '-C', repo.root, 'show', `${sha!}:value.txt`], { stdout: 'pipe', stderr: 'pipe', stdin: 'ignore' });
+      expect((await new Response(show.stdout).text())).toBe('bad\n');
+    } finally {
+      await cleanupTempDir(repo.root);
+    }
+  });
+
+  test('R7-02: a command emitting untracked output files still passes the gate', async () => {
+    const repo = await makeGateRepo();
+    try {
+      await repo.stage({ 'value.txt': 'bad\n' });
+      const outcome = await verifyTaskWork({
+        worktreePath: repo.root,
+        task: gateTask(repo, { allowedPaths: ['value.txt'], verificationCommands: ['sh -c "printf x > out.txt; grep -q bad value.txt"'] }),
+        allowlist: ['git *', 'sh *'],
+        baseSha: repo.base,
+        staged: true,
+      });
+      // untracked output is not drift — only TRACKED content is judged
+      expect(outcome.ok).toBe(true);
+    } finally {
+      await cleanupTempDir(repo.root);
+    }
+  });
+
+  test('R7-05: the final PASS binds to the HEAD the gate verified, not to a later read', async () => {
+    const repo = await makeGateRepo();
+    try {
+      // a committed, clean delivery the gate passes
+      await repo.stage({ 'allowed.txt': 'delivered\n' });
+      await repo.git('commit', '-m', 'delivery');
+      const outcome = await verifyTaskWork({
+        worktreePath: repo.root,
+        task: gateTask(repo, { allowedPaths: ['**'], verificationCommands: [] }),
+        allowlist: [],
+        baseSha: repo.base,
+        requireClean: true,
+      });
+      expect(outcome.ok).toBe(true);
+
+      // another process commits BETWEEN the gate and the conclusion — the
+      // review-07 race. The conclusion must void the PASS instead of
+      // binding it to the never-verified newer HEAD.
+      await repo.write({ 'allowed.txt': 'tampered\n' });
+      await repo.git('commit', '-am', 'racing writer');
+      const raced = await concludeFinalGate({ worktreePath: repo.root, outcome, integratedCommits: {} });
+      expect(raced.ok).toBe(false);
+      expect(raced.headSha).toBe(outcome.headAfter); // bound to the VERIFIED sha
+      expect(raced.violations.some((v) => v.includes('HEAD moved after the gate ran'))).toBe(true);
+
+      // back at the verified tree, the delivery-chain check applies: the
+      // verified HEAD must still CONTAIN every delivered task commit
+      await repo.git('reset', '--hard', repo.base);
+      const reverted = await verifyTaskWork({
+        worktreePath: repo.root,
+        task: gateTask(repo, { allowedPaths: ['**'], verificationCommands: [], allowNoChanges: true }),
+        allowlist: [],
+        baseSha: repo.base,
+        requireClean: true,
+      });
+      expect(reverted.ok).toBe(true);
+      const dropped = await concludeFinalGate({
+        worktreePath: repo.root,
+        outcome: reverted,
+        integratedCommits: { TASK: outcome.headAfter },
+      });
+      expect(dropped.ok).toBe(false);
+      expect(dropped.violations.some((v) => v.includes('does not contain the delivered commit of TASK'))).toBe(true);
+
+      // a HEAD that does contain the delivery concludes PASS
+      await repo.git('reset', '--hard', outcome.headAfter);
+      const restored = await verifyTaskWork({
+        worktreePath: repo.root,
+        task: gateTask(repo, { allowedPaths: ['**'], verificationCommands: [], allowNoChanges: true }),
+        allowlist: [],
+        baseSha: repo.base,
+        requireClean: true,
+      });
+      expect(restored.ok).toBe(true);
+      const kept = await concludeFinalGate({
+        worktreePath: repo.root,
+        outcome: restored,
+        integratedCommits: { TASK: outcome.headAfter },
+      });
+      expect(kept.ok).toBe(true);
+      expect(kept.headSha).toBe(outcome.headAfter);
+    } finally {
+      await cleanupTempDir(repo.root);
+    }
+  });
+
+  test('R7-06: the gate checkout is ledgered on create and released on cleanup', async () => {
+    const repo = await makeGateRepo();
+    try {
+      await repo.stage({ 'allowed.txt': 'x\n' });
+      const registered: string[] = [];
+      const released: Array<[string, boolean]> = [];
+      const outcome = await verifyTaskWork({
+        worktreePath: repo.root,
+        task: gateTask(repo),
+        allowlist: ['git *'],
+        baseSha: repo.base,
+        staged: true,
+        gateLedger: {
+          register: (p) => registered.push(p),
+          release: (p, removed) => released.push([p, removed]),
+        },
+      });
+      expect(outcome.ok).toBe(true);
+      expect(registered).toHaveLength(1);
+      expect(released).toEqual([[registered[0]!, true]]);
+      // the successful release means no registration is left behind
+      // (the gate checkout prefix is `.gate-`, distinct from the repo dir)
+      expect(await repo.git('worktree', 'list', '--porcelain')).not.toContain('.gate-');
     } finally {
       await cleanupTempDir(repo.root);
     }

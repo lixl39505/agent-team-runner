@@ -93,6 +93,22 @@ export async function worktreeDirtyFiles(repoRoot: string): Promise<string[]> {
   return files;
 }
 
+/**
+ * R7-02: TRACKED files whose content diverged from HEAD (staged or merely
+ * modified) — untracked files a verification command legitimately emits
+ * (build/test output) are not drift. Used to prove the gate checkout is
+ * still exactly the pinned tree after every command.
+ */
+export async function worktreeTrackedDirtyFiles(repoRoot: string): Promise<string[]> {
+  const status = await gitRaw(repoRoot, ['status', '--porcelain', '-uno']);
+  const files: string[] = [];
+  for (const line of status.split('\n')) {
+    if (!line.trim()) continue;
+    files.push(...porcelainPaths(line));
+  }
+  return files;
+}
+
 /** R6-02: the paths a `status --porcelain` line touches — one, or both ends
  * of a rename (`R  old -> new`). */
 function porcelainPaths(line: string): string[] {
@@ -158,19 +174,40 @@ export async function unstageInternalFiles(repoRoot: string): Promise<void> {
 }
 
 /**
+ * R7-01: runner-internal `.ateam/**` paths already carried by COMMITs since
+ * `fromSha` — the final gate judges the full committed delivery, so content
+ * that rode an earlier integration commit is a violation, not something the
+ * worktree-level filters may quietly drop.
+ */
+export async function committedInternalFiles(repoRoot: string, fromSha: string): Promise<string[]> {
+  const out = await gitOk(repoRoot, ['diff', '--name-only', '--no-renames', fromSha, 'HEAD', '--', ATEAM_INTERNAL_PATTERNS[0]!]);
+  return out.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
+}
+
+/**
  * R6-04: materialize a pinned index tree as a DETACHED, disposable worktree
  * so the verification commands read exactly the content the delivery commit
  * will carry — never the mutable task worktree a worker may still be
  * writing to. The checkout hangs off a throwaway commit (dangling once the
  * worktree is removed), placed as a SIBLING of `anchorPath` so worktrees
  * never nest. Returns the worktree path.
+ *
+ * R7-06: `register` persists the path BEFORE `worktree add` registers it —
+ * a crash between the two still leaves a reclaimable ledger row. A creation
+ * failure leaves the row active on purpose: the reclaim sweep removes the
+ * half-made checkout idempotently (the caller has no path to release).
  */
-export async function createGateWorktree(anchorPath: string, treeSha: string): Promise<string> {
+export async function createGateWorktree(
+  anchorPath: string,
+  treeSha: string,
+  register?: (path: string) => void,
+): Promise<string> {
   const head = await git(anchorPath, ['rev-parse', '--verify', 'HEAD']);
   const sha = head.ok
     ? await gitOk(anchorPath, ['commit-tree', treeSha, '-p', head.stdout.trim(), '-m', 'ateam: verification gate tree'])
     : await gitOk(anchorPath, ['commit-tree', treeSha, '-m', 'ateam: verification gate tree']);
   const path = await mkdtemp(join(dirname(anchorPath), `${basename(anchorPath)}.gate-`));
+  register?.(path);
   try {
     await gitOk(anchorPath, ['worktree', 'add', '--detach', path, sha]);
   } catch (err) {
@@ -195,6 +232,16 @@ export async function removeGateWorktree(anchorPath: string, path: string): Prom
 export async function commit(repoRoot: string, message: string): Promise<string> {
   await gitOk(repoRoot, ['commit', '-m', message, '--no-verify']);
   return currentHead(repoRoot);
+}
+
+/**
+ * R7-05: true when `sha` is an ancestor of (or equal to) `descendant` — the
+ * delivery-chain proof that a verified HEAD still CONTAINS a delivered task
+ * commit. Unreadable refs fail closed (false).
+ */
+export async function isAncestor(repoRoot: string, sha: string, descendant: string): Promise<boolean> {
+  const res = await git(repoRoot, ['merge-base', '--is-ancestor', sha, descendant]);
+  return res.ok;
 }
 
 /** Commits between base and HEAD (inclusive count). */

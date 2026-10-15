@@ -12,13 +12,14 @@
 import { openDatabase } from '../store/db.ts';
 import { loadHome } from '../config.ts';
 import { getRun, updateRunStatus } from '../store/runs.ts';
-import { listTasks } from '../store/tasks.ts';
+import { listTasks, updateTask } from '../store/tasks.ts';
 import { listActiveExecutions, updateExecution } from '../store/executions.ts';
+import { listActiveResources } from '../store/resources.ts';
 import { addEvent } from '../store/events.ts';
 import { SETTLED_TASK } from '../core/types.ts';
 import { AteamError, LeaseLostError } from '../core/errors.ts';
 import { buildRunnerEnv, createClient, getRunOrThrow } from './run-shared.ts';
-import { cleanupTaskResources } from '../runner/cleanup.ts';
+import { cleanupGateWorktrees, cleanupIntegrationWorkspace, cleanupTaskResources } from '../runner/cleanup.ts';
 import { acquireLease, heartbeat, releaseLease } from '../store/lease.ts';
 import type { HerdrRuntimeClient } from '../herdr/client.ts';
 
@@ -76,12 +77,22 @@ export async function cmdClean(opts: CleanCommandOptions): Promise<number> {
       // retires the pane as `gone`, audited) keeps destruction and the discard
       // conclusion one forward-moving transition: after the sweep nothing is
       // active, nothing recoverable, and the run can actually terminate.
+      //
+      // R7-03: the destruction intent is also PERSISTED per task before
+      // anything is touched. A sweep that dies midway (runtime snapshot
+      // unavailable, lease lost) leaves the task runnable-looking but with no
+      // active execution — without the durable intent no Runner/reconcile
+      // pass would ever finish the discard. The sweep's own finalize step
+      // clears the intent when the task actually settles.
       if (opts.discardWork === true) {
         const discardable = new Set(
           tasks.filter((t) => !SETTLED_TASK.has(t.status)).map((t) => t.taskId),
         );
-        // the abandon writes are delivery-state changes — fenced like the sweep
+        // the intent/abandon writes are delivery-state changes — fenced like the sweep
         if (!heartbeat(db, run.id, fence)) throw leaseLost();
+        for (const task of sweepable) {
+          updateTask(db, run.id, task.taskId, { pendingDispatch: 'discard' });
+        }
         for (const exec of listActiveExecutions(db, run.id)) {
           if (!discardable.has(exec.taskId)) continue;
           updateExecution(db, exec.id, { status: 'abandoned' });
@@ -122,12 +133,32 @@ export async function cmdClean(opts: CleanCommandOptions): Promise<number> {
       // default startup/reconcile path must stay able to finish it
       const remaining = listTasks(db, run.id);
       const unsettled = remaining.filter((t) => !SETTLED_TASK.has(t.status) || t.pendingDispatch !== null);
+      // R7-06: gate worktrees a crashed verification left registered are
+      // reclaimed with the rest; a row that cannot be reclaimed keeps the
+      // run resumable instead of letting the litter outlive the run
+      if (!heartbeat(db, run.id, fence)) throw leaseLost();
+      await cleanupGateWorktrees(env);
+      const stuckGates = listActiveResources(db, run.id).filter((r) => r.kind === 'gate-worktree');
+      // R7-04: the integration workspace is a run-level temp resource — once
+      // the task sweep is done, clean disposes of it exactly like the
+      // Runner's cleanup phase does, and only its actual disposal lets the
+      // run terminate
+      let integrationCleared = true;
+      if (stillIntegrated === 0 && activeExecutions.length === 0 && unsettled.length === 0) {
+        integrationCleared = await cleanupIntegrationWorkspace(env, {
+          ensureLease: () => {
+            if (!heartbeat(db, run.id, fence)) throw leaseLost();
+          },
+        });
+      }
       // R3-08: with unverified work left behind (and no explicit discard),
       // the run stays RESUMABLE — terminating it here would hide it from the
       // default startup/reconcile path that re-runs the final gate and
       // finishes reclamation. Only a fully settled (or explicitly discarded)
       // run with no live executions is finalized.
-      const terminate = stillIntegrated === 0 && activeExecutions.length === 0 && unsettled.length === 0;
+      const terminate =
+        stillIntegrated === 0 && activeExecutions.length === 0 && unsettled.length === 0
+        && integrationCleared && stuckGates.length === 0;
       if (terminate && !['done', 'cancelled', 'abandoned', 'failed'].includes(run.status)) {
         updateRunStatus(db, run.id, 'abandoned');
         addEvent(db, run.id, 'RUN_STATUS_CHANGED', { payload: { to: 'abandoned', source: 'clean' } });
@@ -141,12 +172,24 @@ export async function cmdClean(opts: CleanCommandOptions): Promise<number> {
           stillIntegrated,
           activeExecutions: activeExecutions.length,
           unsettledTasks: unsettled.map((t) => ({ taskId: t.taskId, status: t.status, pendingDispatch: t.pendingDispatch })),
+          integrationWorkspaceId: getRun(db, run.id)?.integrationWorkspaceId ?? null,
+          stuckGateWorktrees: stuckGates.map((r) => r.path),
           status: getRun(db, run.id)?.status,
         }));
       } else {
         console.log(
           `clean ${run.id}: reclaimed ${reclaimed}, discarded ${discarded}, ${stillIntegrated} still pending, ${activeExecutions.length} active executions, ${unsettled.length} unsettled tasks, run=${getRun(db, run.id)?.status}`,
         );
+        if (!integrationCleared) {
+          console.log(
+            'fix: the integration workspace could not be removed (runtime unreachable or identity unprovable) — the run was left resumable; retry clean or resume the runner to finish the reclamation',
+          );
+        }
+        if (stuckGates.length > 0) {
+          console.log(
+            `fix: ${stuckGates.length} gate worktree(s) could not be reclaimed (${stuckGates.map((r) => r.path).join(', ')}) — the run was left resumable; retry clean`,
+          );
+        }
         if (activeExecutions.length > 0) {
           console.log(
             `fix: ${activeExecutions.length} execution(s) are still active (${activeExecutions.map((e) => `${e.taskId}/${e.role}`).join(', ')}) — stop the runner or let them finish before terminating the run; the run was left resumable`,

@@ -17,7 +17,7 @@ import { insertVerification } from '../store/verifications.ts';
 import { readResultFile } from '../results/files.ts';
 import { validateRoleResult } from '../results/validate.ts';
 import type { WorkerResult, ReviewerResult, IntegrationResult } from '../results/types.ts';
-import { stageAll, commit, cherryPick, currentHead, hasStagedChanges, revParse, squashSince, worktreeChangedFiles } from '../core/git.ts';
+import { stageAll, cherryPick, currentHead, revParse, squashSince, worktreeChangedFiles } from '../core/git.ts';
 import { AteamError, LeaseLostError, type ExitCode } from '../core/errors.ts';
 import type { HerdrEventStream, WorkspaceHandle } from '../herdr/types.ts';
 import { SETTLED_TASK } from '../core/types.ts';
@@ -28,9 +28,11 @@ import { existsSync } from 'node:fs';
 import type { RunnerEnv, StartExecutionInput } from './executions.ts';
 import { startExecution, resolveReviewerEntry, closePaneSafe, rebuildRolePrompt, findSourceWorkspaceId } from './executions.ts';
 import { agentStartArgs } from '../herdr/agent-args.ts';
-import { verifyTaskWork } from './phases/verify.ts';
+import { verifyTaskWork, type GateLedger } from './phases/verify.ts';
 import { commitVerifiedTree } from './phases/commit.ts';
-import { assertRemovableWorkspace, cleanupTaskResources, finalPassMatchesDelivery } from './cleanup.ts';
+import { commitIntegrationResolution } from './phases/integrate.ts';
+import { concludeFinalGate } from './phases/final-gate.ts';
+import { cleanupGateWorktrees, cleanupIntegrationWorkspace, cleanupTaskResources, finalPassMatchesDelivery } from './cleanup.ts';
 import { topologicalTasks, validateGraph } from '../core/contract.ts';
 
 const TERMINAL_RUN: ReadonlySet<string> = new Set(['done', 'cancelled', 'abandoned', 'failed']);
@@ -671,6 +673,28 @@ export class RunnerEngine {
     }
   }
 
+  /** R7-06: ledger callbacks for the verification gate's disposable
+   * checkout — a crash mid-gate leaves a reclaimable row, never unregistered
+   * litter; a failed cleanup keeps the row active for the reclaim sweep. */
+  private gateLedger(taskId: string): GateLedger {
+    const { db, runId } = this.env;
+    return {
+      register: (path) => {
+        insertResource(db, { runId, taskId, kind: 'gate-worktree', herdrId: path, path });
+      },
+      release: (path, removed) => {
+        if (removed) {
+          markResourceState(db, runId, 'gate-worktree', path, 'reclaimed');
+          return;
+        }
+        addEvent(db, runId, 'RECONCILE_DECISION', {
+          taskId,
+          payload: { reason: 'gate_worktree_cleanup_failed', path, reclaimable: true },
+        });
+      },
+    };
+  }
+
   private async verifyAndHandToReview(exec: ExecutionRecord, task: TaskRecord): Promise<void> {
     const { db, runId, client, config, home } = this.env;
     const current = getTask(db, runId, task.taskId)!;
@@ -691,6 +715,7 @@ export class RunnerEngine {
       allowlist: config.verificationAllowlist,
       baseSha: current.startSha ?? 'HEAD',
       staged: true,
+      gateLedger: this.gateLedger(task.taskId),
       logDir: `${home.runsDir}/${runId}/logs`,
     });
     // R2-14: the gate outcome becomes a queryable record (revision, HEAD,
@@ -832,6 +857,35 @@ export class RunnerEngine {
     );
   }
 
+  /**
+   * R7-03: finish an operator-persisted discard (`clean --discard-work`).
+   * The intent lives on the task row; active executions on the task are
+   * settled first (R6-05 order) and the step-wise, retryable sweep then
+   * destroys the resources. Returns true when the task settled — the sweep's
+   * own finalize step cleared the intent; a null outcome keeps it for the
+   * next pass (audited per step, never re-dispatches an agent).
+   */
+  private async resumeDiscardIntent(task: TaskRecord): Promise<boolean> {
+    const { db, runId } = this.env;
+    this.ensureLease();
+    for (const exec of listActiveExecutions(db, runId)) {
+      if (exec.taskId !== task.taskId) continue;
+      updateExecution(db, exec.id, { status: 'abandoned' });
+      addEvent(db, runId, 'RECONCILE_DECISION', {
+        executionId: exec.id,
+        taskId: exec.taskId,
+        payload: { reason: 'execution_abandoned_for_discard', source: 'discard_resume' },
+      });
+    }
+    const current = getTask(db, runId, task.taskId);
+    if (!current) return true;
+    const outcome = await cleanupTaskResources(this.env, current, {
+      discardUnverified: true,
+      ensureLease: () => this.ensureLease(),
+    });
+    return outcome !== null;
+  }
+
   /** R2-02: replay a crash-interrupted follow-up dispatch. Consuming a role
    * result and starting the next role/attempt are two steps; the intent is
    * persisted on the task BEFORE the result is consumed, so a crash between
@@ -842,6 +896,18 @@ export class RunnerEngine {
     for (const task of tasks) {
       const intent: PendingDispatch | null = task.pendingDispatch;
       if (!intent) continue;
+      // R7-03: a persisted discard is settled by destruction, never by a
+      // dispatch — replay it (retryable) instead of mapping it to a role
+      if (intent === 'discard') {
+        const current = getTask(db, runId, task.taskId);
+        if (!current) continue;
+        addEvent(db, runId, 'RECONCILE_DECISION', {
+          taskId: task.taskId,
+          payload: { reason: 'pending_dispatch_resumed', intent },
+        });
+        await this.resumeDiscardIntent(current);
+        continue;
+      }
       const role = intent === 'review' ? 'reviewer' : 'worker';
       if (!active.some((e) => e.taskId === task.taskId && e.role === role)) {
         const current = getTask(db, runId, task.taskId);
@@ -899,11 +965,30 @@ export class RunnerEngine {
     const worktreePath = run.integrationPath;
     if (!worktreePath) throw new AteamError('integration worktree missing for integrator result');
     if (result.status === 'completed') {
-      await stageAll(worktreePath);
-      // crash-safe: reuse HEAD when the resolve commit already landed
-      const sha = (await hasStagedChanges(worktreePath))
-        ? await commit(worktreePath, `ateam(${runId}): integrate task ${task.taskId} (conflicts resolved)`)
-        : await currentHead(worktreePath);
+      // R7-01: the integrator's resolution goes through the same delivery
+      // boundary as the worker gate — a pre-staged `.ateam` file or content
+      // no task's path policy allows refuses the commit instead of riding
+      // the integration branch unjudged
+      const gate = await commitIntegrationResolution({
+        worktreePath,
+        baseSha: run.integrationBaseSha,
+        message: `ateam(${runId}): integrate task ${task.taskId} (conflicts resolved)`,
+        scopes: listTasks(db, runId).map((t) => t.spec),
+      });
+      if (!gate.ok) {
+        addEvent(db, runId, 'RECONCILE_DECISION', {
+          executionId: exec.id,
+          taskId: task.taskId,
+          payload: { reason: 'integration_commit_refused', violations: gate.violations },
+        });
+        updateRunRuntimeState(db, runId, { integrationStalled: true });
+        const detail = gate.violations.join('; ');
+        updateTask(db, runId, task.taskId, { lastError: `integration commit refused: ${detail}` });
+        updateRunStatus(db, runId, 'needs_attention', `integration commit refused: ${detail}`);
+        updateExecution(db, exec.id, { status: 'completed', paneState: 'retained' });
+        return;
+      }
+      const sha = gate.sha!;
       updateTask(db, runId, task.taskId, { status: 'integrated', integrationCommit: sha });
       updateRunRuntimeState(db, runId, { conflictTaskId: null });
       updateExecution(db, exec.id, { status: 'completed', paneState: 'closed_success' });
@@ -1004,7 +1089,11 @@ export class RunnerEngine {
 
   /** Reclaim integrated tasks step by step; done once everything is settled. */
   private async runCleanupPhase(run: RunRecord): Promise<void> {
-    const { db, runId, client } = this.env;
+    const { db, runId } = this.env;
+    // R7-06: gate worktrees a crash left registered are reclaimed alongside
+    // the run's other temp resources
+    this.ensureLease();
+    await cleanupGateWorktrees(this.env);
     const tasks = listTasks(db, runId);
     for (const task of tasks.filter((t) => t.status === 'integrated')) {
       // R3-06: reclamation is irreversible — renew/verify the fencing token
@@ -1015,38 +1104,10 @@ export class RunnerEngine {
         ensureLease: () => this.ensureLease(),
       });
     }
-    // run-level temp resource: the integration worktree itself
+    // run-level temp resource: the integration worktree itself (R7-04: the
+    // same shared step `clean` runs, so both paths reclaim identically)
     if (run.integrationWorkspaceId && listTasks(db, runId).every((t) => SETTLED_TASK.has(t.status))) {
-      this.ensureLease();
-      try {
-        // R4-03: the same identity proof as task worktrees — the run field
-        // alone does not survive a herdr id reuse
-        await assertRemovableWorkspace(this.env, run.integrationWorkspaceId);
-        await client.removeWorktree({ workspaceId: run.integrationWorkspaceId, force: true });
-        // R5-04: the removal may have run long — the state writes below are
-        // its conclusion and need a current fence
-        this.ensureLease();
-        markResourceState(db, runId, 'workspace', run.integrationWorkspaceId, 'reclaimed');
-        // R3-07 + pane-retirement policy: integrator panes lived in the
-        // removed workspace — retired as `gone` (never a success close), one
-        // audit event each, mirroring the task-worktree path
-        for (const exec of listExecutions(db, runId)) {
-          if (['open', 'retained'].includes(exec.paneState) && exec.workspaceId === run.integrationWorkspaceId) {
-            updateExecution(db, exec.id, { paneState: 'gone' });
-            addEvent(db, runId, 'RECONCILE_DECISION', {
-              executionId: exec.id,
-              payload: {
-                reason: 'pane_retired_by_workspace_removal',
-                workspaceId: run.integrationWorkspaceId,
-                concludedSuccessfully: exec.status === 'completed' && !!exec.resultDigest,
-              },
-            });
-          }
-        }
-        updateRunRuntimeState(db, runId, { integrationWorkspaceId: null, integrationPath: null });
-      } catch {
-        /* retried on the next tick / by clean */
-      }
+      await cleanupIntegrationWorkspace(this.env, { ensureLease: () => this.ensureLease() });
     }
     const live = getRun(db, runId)!;
     const remaining = listTasks(db, runId);
@@ -1208,45 +1269,49 @@ export class RunnerEngine {
       // integration tree would make the PASS describe content no commit
       // carries, so the tree must be clean before and after the commands
       requireClean: true,
+      // R7-01: the committed delivery is judged against the contract's full
+      // path ownership — committed internal or out-of-scope content fails
+      scopePolicies: tasks.map((t) => t.spec),
       logDir: `${home.runsDir}/${runId}/logs`,
     });
     // R2-06: renew the lease (token CAS) before the delivery conclusion; a
     // dispossessed runner must not mark the run final-verified
     this.ensureLease();
-    const integrationHead = await currentHead(path).catch(() => null);
-    // R2-14 + R3-04: the final conclusion is persisted as a queryable record
-    // bound to the contract revision, the verified integration HEAD AND the
-    // exact task/commit set it covered — this record (not just the run flag)
-    // is what cleanup eligibility reads, and cleanup re-checks the bindings
-    // before destroying anything
+    // R2-14 + R3-04 + R7-05: the final conclusion is persisted as a
+    // queryable record bound to the contract revision, the HEAD THE GATE
+    // VERIFIED (never a later read) and the exact task/commit set it
+    // covered — this record (not just the run flag) is what cleanup
+    // eligibility reads, and cleanup re-checks the bindings before
+    // destroying anything
     const integratedCommits: Record<string, string> = {};
     for (const t of tasks) {
       if (['integrated', 'reclaimed'].includes(t.status) && t.integrationCommit) {
         integratedCommits[t.taskId] = t.integrationCommit;
       }
     }
+    const conclusion = await concludeFinalGate({ worktreePath: path, outcome, integratedCommits });
     insertVerification(db, {
       runId,
       kind: 'final',
-      ok: outcome.ok,
+      ok: conclusion.ok,
       detail: {
         phase: 'integration_final',
         // the ACCEPTED revision, never run.contractRevision: a pending
         // candidate that was refused must not become a gate's provenance
         contractRevision: run.acceptedRevision,
-        headSha: integrationHead,
+        headSha: conclusion.headSha,
         baseSha: run.integrationBaseSha ?? null,
         integratedCommits,
-        violations: outcome.violations,
+        violations: conclusion.violations,
         diffFiles: outcome.diffFiles,
         commands: outcome.commands.map((c) => ({ command: c.command, ok: c.ok, exitCode: c.exitCode })),
       },
       logPath: outcome.logPath,
     });
-    addEvent(db, runId, outcome.ok ? 'VERIFICATION_PASSED' : 'VERIFICATION_FAILED', {
-      payload: { phase: 'integration_final', violations: outcome.violations, logPath: outcome.logPath },
+    addEvent(db, runId, conclusion.ok ? 'VERIFICATION_PASSED' : 'VERIFICATION_FAILED', {
+      payload: { phase: 'integration_final', violations: conclusion.violations, logPath: outcome.logPath },
     });
-    if (outcome.ok) {
+    if (conclusion.ok) {
       // persisted immediately: cleanup eligibility everywhere keys off this
       // (the verification record above is written FIRST, so the flag can
       // never exist without its durable evidence)
@@ -1472,7 +1537,24 @@ export class RunnerEngine {
         });
       }
 
+      // R7-03: an operator-persisted discard intent is settled by the Runner
+      // OR by reconcile — retried pass after pass until the resources are
+      // actually disposed (the sweep's finalize step clears the intent)
+      for (const task of listTasks(db, runId).filter((t) => t.pendingDispatch === 'discard')) {
+        decisions.push({
+          kind: 'cleanup_resumed',
+          taskId: task.taskId,
+          detail: opts.dryRun ? 'dry-run: discard intent would be swept' : 'discard intent resumed',
+        });
+        await apply(async () => {
+          await this.resumeDiscardIntent(task);
+        });
+      }
+
       for (const res of listActiveResources(db, runId)) {
+        // R7-06: gate worktrees are not herdr resources — the snapshot can
+        // never show them; the dedicated sweep below reclaims their rows
+        if (res.kind === 'gate-worktree') continue;
         if (!preExistingResources.has(`${res.kind}:${res.herdrId}`)) continue;
         if (res.createdAt >= passStartedAt) continue; // re-registered this pass (id reuse) — judged next pass
         if (observedIds.has(res.herdrId)) continue;
@@ -1496,6 +1578,7 @@ export class RunnerEngine {
       for (const res of listResources(db, runId)) {
         // no passStartedAt guard here: insertResource always writes 'active',
         // so a non-active row necessarily predates this pass
+        if (res.kind === 'gate-worktree') continue; // R7-06: not a herdr identity
         if (res.state === 'active' || !observedIds.has(res.herdrId)) continue;
         await apply(() => {
           this.ensureLease();
@@ -1503,6 +1586,18 @@ export class RunnerEngine {
           addEvent(db, runId, 'RECONCILE_DECISION', {
             payload: { reason: 'resource_reactivated', kind: res.kind, herdrId: res.herdrId },
           });
+        });
+      }
+
+      // R7-06: gate worktrees registered by a crashed verification are
+      // reclaimed by the sweep — never judged by the herdr snapshot loops above
+      if (listActiveResources(db, runId).some((r) => r.kind === 'gate-worktree')) {
+        decisions.push({
+          kind: 'cleanup_resumed',
+          detail: opts.dryRun ? 'dry-run: gate worktree sweep would run' : 'gate worktree sweep',
+        });
+        await apply(async () => {
+          await cleanupGateWorktrees(this.env);
         });
       }
 

@@ -91,8 +91,13 @@ export type TaskStatus = (typeof TASK_STATUSES)[number];
  * steps; a crash between them must not strand the task. The intent is
  * written BEFORE the execution is consumed and cleared once the dispatch
  * is on the ledger, so recovery replays it from the task row alone.
+ *
+ * `discard` (R7-03): `clean --discard-work` persists its audited destruction
+ * intent per task BEFORE any resource is touched — a sweep that dies midway
+ * (snapshot unavailable, lease lost) leaves the intent on the task row, and
+ * the Runner/reconcile resume it until every resource is actually disposed.
  */
-export type PendingDispatch = 'review' | 'worker_retry';
+export type PendingDispatch = 'review' | 'worker_retry' | 'discard';
 
 /**
  * Task states that need no further delivery work (R5-05): the schedule
@@ -222,7 +227,13 @@ export interface ExecutionRecord {
   finishedAt: string | null;
 }
 
-export type HerdrResourceKind = 'workspace' | 'tab' | 'pane' | 'worktree';
+/**
+ * Ledger kinds. `workspace`/`tab`/`pane`/`worktree` mirror Herdr-owned
+ * resources; `gate-worktree` (R7-06) is the runner's own temporary
+ * verification checkout — a real git worktree whose registration must stay
+ * reclaimable after a crash, keyed by its absolute path.
+ */
+export type HerdrResourceKind = 'workspace' | 'tab' | 'pane' | 'worktree' | 'gate-worktree';
 
 export type HerdrResourceState = 'active' | 'reclaimed' | 'orphaned' | 'lost';
 

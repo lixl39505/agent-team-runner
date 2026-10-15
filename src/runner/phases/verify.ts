@@ -28,15 +28,18 @@ import {
   worktreeChangedFiles,
   stagedChangedFiles,
   worktreeDirtyFiles,
+  worktreeTrackedDirtyFiles,
   stagedInternalFiles,
   unstageInternalFiles,
+  committedInternalFiles,
+  changedFiles,
   createGateWorktree,
   removeGateWorktree,
   writeTree,
   currentHead,
   hasStagedChanges,
 } from '../../core/git.ts';
-import { isPathAllowed, matchAny, ATEAM_INTERNAL_PATTERNS } from '../../core/path-policy.ts';
+import { isPathAllowed, matchAny, pathsOutsideScopes, ATEAM_INTERNAL_PATTERNS, type DeliveryScope } from '../../core/path-policy.ts';
 import type { TaskRecord } from '../../core/types.ts';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -46,6 +49,18 @@ export interface VerificationCommandResult {
   ok: boolean;
   exitCode: number;
   output: string;
+}
+
+/**
+ * R7-06: ledger callbacks for the disposable gate checkout. `register`
+ * persists the path before git registers the worktree; `release` closes the
+ * row when the checkout was removed — a `removed: false` release leaves the
+ * row active for the reconcile/clean reclaim sweep instead of dropping the
+ * litter silently.
+ */
+export interface GateLedger {
+  register: (path: string) => void;
+  release: (path: string, removed: boolean) => void;
 }
 
 export interface VerificationOutcome {
@@ -60,6 +75,23 @@ export interface VerificationOutcome {
   logPath: string | null;
 }
 
+/**
+ * R7-02: what a verification command changed in the gate checkout, or null
+ * when it still IS the pinned tree — HEAD unmoved, index equal to the pinned
+ * tree, no tracked content modified. Untracked output files a command
+ * legitimately emits are not drift.
+ */
+async function gateDrift(gatePath: string, pinnedTree: string, gateHead: string): Promise<string | null> {
+  const headNow = await currentHead(gatePath).catch(() => null);
+  const treeNow = await writeTree(gatePath).catch(() => null);
+  if (headNow === null || treeNow === null) return 'the gate checkout became unreadable';
+  if (headNow !== gateHead) return `HEAD moved (${gateHead.slice(0, 7)} -> ${headNow.slice(0, 7)})`;
+  if (treeNow !== pinnedTree) return 'the index no longer matches the pinned tree';
+  const tracked = await worktreeTrackedDirtyFiles(gatePath);
+  if (tracked.length > 0) return `tracked content modified (${tracked.join(', ')})`;
+  return null;
+}
+
 /** Run the full mechanical gate for a task inside its worktree. */
 export async function verifyTaskWork(
   opts: {
@@ -72,6 +104,13 @@ export async function verifyTaskWork(
     staged?: boolean;
     /** R5-03: final-gate mode — the tree must be clean before and after. */
     requireClean?: boolean;
+    /** R7-01: final-gate mode — every path in the COMMITTED delivery must be
+     * allowed by at least one of these policies, and committed runner-internal
+     * content is a violation, never a filtered non-entity. */
+    scopePolicies?: ReadonlyArray<DeliveryScope>;
+    /** R7-06: ledger the disposable gate checkout so a crash mid-gate (or a
+     * failed cleanup) leaves a reclaimable row, never unregistered litter. */
+    gateLedger?: GateLedger;
     timeoutMs?: number;
     logDir?: string;
   },
@@ -84,6 +123,21 @@ export async function verifyTaskWork(
   // R5-03: refuse a dirty tree up front — the commands would otherwise run
   // against content no delivery commit carries
   if (opts.requireClean) {
+    // R7-01: the final gate judges the FULL committed delivery — internal
+    // paths that rode an integration commit are a violation (the worktree
+    // filters below must not quietly drop them), and every committed path
+    // must belong to a task's policy
+    const internal = await committedInternalFiles(worktreePath, opts.baseSha);
+    if (internal.length > 0) {
+      violations.push(`(delivery commits carry runner-internal .ateam content: ${internal.join(', ')})`);
+    }
+    if (opts.scopePolicies) {
+      const committed = await changedFiles(worktreePath, opts.baseSha, 'HEAD');
+      const outside = pathsOutsideScopes(opts.scopePolicies, committed);
+      if (outside.length > 0) {
+        violations.push(`(delivery commits touch paths outside every task's path policy: ${outside.join(', ')})`);
+      }
+    }
     const dirty = await worktreeDirtyFiles(worktreePath);
     if (dirty.length > 0) {
       violations.push(`(worktree not clean before verification: ${dirty.join(', ')})`);
@@ -115,10 +169,14 @@ export async function verifyTaskWork(
   // to materialize it is fail-closed: the gate refuses rather than falling
   // back to the racy worktree.
   let gatePath: string | null = null;
+  let gateHead: string | null = null;
   if (opts.staged && violations.length === 0) {
     try {
-      gatePath = await createGateWorktree(worktreePath, treeSha!);
+      gatePath = await createGateWorktree(worktreePath, treeSha!, opts.gateLedger?.register);
+      gateHead = await currentHead(gatePath);
     } catch (err) {
+      // a row `register` already wrote stays active on purpose — the reclaim
+      // sweep clears a never-materialized checkout idempotently
       violations.push(`(could not materialize an isolated verification tree: ${String(err).slice(0, 200)})`);
     }
   }
@@ -130,11 +188,29 @@ export async function verifyTaskWork(
         const res = await runCommand(command, { cwd: commandCwd, allowlist, timeoutMs: opts.timeoutMs });
         commands.push({ command, ok: res.ok, exitCode: res.exitCode, output: res.stdout + res.stderr });
         if (!res.ok) break;
+        // R7-02: the gate checkout must still BE the pinned tree after every
+        // command — one that rewrites tracked content (then asserts the
+        // rewrite) verified content the delivery commit will never carry
+        if (gatePath && gateHead !== null) {
+          const drift = await gateDrift(gatePath, treeSha!, gateHead);
+          if (drift !== null) {
+            violations.push(`(verification commands mutated the isolated verification tree: ${drift})`);
+            break;
+          }
+        }
       }
     }
   } finally {
     if (gatePath) {
-      await removeGateWorktree(worktreePath, gatePath).catch(() => { /* disposable litter, never blocks the verdict */ });
+      // R7-06: a failed cleanup is no longer silent litter — the ledger row
+      // stays active and the reconcile/clean sweep retries the removal
+      let removed = true;
+      try {
+        await removeGateWorktree(worktreePath, gatePath);
+      } catch {
+        removed = false;
+      }
+      opts.gateLedger?.release(gatePath, removed);
     }
   }
 
